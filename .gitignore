@@ -50,7 +50,10 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
-
+*.mp4
+*.ts
+*.flv
+downloads/
 # Translations
 *.pot
 
