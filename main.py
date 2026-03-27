@@ -1946,7 +1946,7 @@ while True:
 
     try:
         url_comments, line_list, url_line_list = [[] for _ in range(3)]
-        with (open(url_config_file, "r", encoding=text_encoding, errors='ignore') as file):
+        with open(url_config_file, "r", encoding=text_encoding, errors='ignore') as file:
             for origin_line in file:
                 if origin_line in line_list:
                     delete_line(url_config_file, origin_line)

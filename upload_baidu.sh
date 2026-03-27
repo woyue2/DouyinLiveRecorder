@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # --- 配置区 ---
-MY_EMAIL="你的邮箱@qq.com"
-DOWNLOAD_DIR="/root/DouyinLiveRecorder/downloads"
-LOG_FILE="/root/DouyinLiveRecorder/upload.log"
+MY_EMAIL="你的邮箱@qq.com"  # TODO: 修改为你的邮箱
+DOWNLOAD_DIR="/home/admin/DouyinLiveRecorder/downloads"
+LOG_FILE="/home/admin/DouyinLiveRecorder/upload.log"
 
 # --- 发信函数 ---
 send_mail() {
@@ -65,6 +65,7 @@ if [[ $SYNC_OUT == *"OK"* ]]; then
     if [ ! -z "$PROCESSED_FILES" ]; then
         send_mail "✅ 文件上传成功通知" "以下文件已成功转码并上传至百度网盘：${PROCESSED_FILES}"
     fi
+    rm -rf ./converted
 elif [[ $SYNC_OUT == *"Error"* ]]; then
     send_mail "❌ 上传过程遇到异常" "bypy 同步时出错，请查看日志文件 upload.log。错误摘要：\n${SYNC_OUT}"
 fi
