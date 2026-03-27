@@ -59,7 +59,7 @@ done
 
 # --- 上传与最终通知 ---
 BYPY_PATH=$(which bypy)
-SYNC_OUT=$($BYPY_PATH --retry 5 --timeout 120 -s 500M syncup . /live_audio --on-dup overwrite 2>&1)
+SYNC_OUT=$($BYPY_PATH --retry 5 --timeout 120 -s 500M syncup "./converted" /live_audio --on-dup overwrite 2>&1)
 
 if [[ $SYNC_OUT == *"OK"* ]]; then
     if [ ! -z "$PROCESSED_FILES" ]; then
