@@ -1,0 +1,6 @@
+1. python 3.11
+2. ffmpeg
+3. 然后启用nohup python main.py >
+4  pip install bypy #百度网盘连接 ，后面上传用
+5. crontab -e 运行 upload_baidu.sh 后台运行> 5分钟一次
+
