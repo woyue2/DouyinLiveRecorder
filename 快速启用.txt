@@ -1,3 +1,8 @@
+ubunntu系统
+install nvm # search online
+nvm install 20
+use npm install opencode # search online
+
 1. python 3.11
 2. ffmpeg
 3. 然后启用nohup python main.py >
