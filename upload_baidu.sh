@@ -57,13 +57,13 @@ find . -not -path "*/converted/*" -type f \( -name "*.ts" -o -name "*.mp3" \) | 
         fi
     else
         # .mp3 → 直接拷贝到 converted 目录统一上传
-        cp "$file" "$convert_dir/"
+        mv "$file" "$convert_dir/"
         PROCESSED_FILES="${PROCESSED_FILES}\n- ${base_name}"
     fi
 done
 
 # --- 上传与最终通知 ---
-BYPY_PATH=$(which bypy)
+BYPY_PATH="python3 -m bypy"
 SYNC_OUT=$($BYPY_PATH --retry 5 --timeout 120 -s 500M syncup "./converted" /live_audio --on-dup overwrite 2>&1)
 
 if [[ $SYNC_OUT == *"OK"* ]]; then

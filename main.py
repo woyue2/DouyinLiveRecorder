@@ -1250,7 +1250,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                 command = [
                                                     "-map", "0:a",
                                                     "-c:a", "libmp3lame",
-                                                    "-ab", "320k",
+                                                    "-q:a", "2",
                                                     "-f", "segment",
                                                     "-segment_time", split_time,
                                                     "-reset_timestamps", "1",
@@ -1274,7 +1274,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                 command = [
                                                     "-map", "0:a",
                                                     "-c:a", "libmp3lame",
-                                                    "-ab", "320k",
+                                                    "-q:a", "2",
                                                     save_file_path,
                                                 ]
 
