@@ -65,6 +65,8 @@ not_record_list = []
 start_display_time = datetime.datetime.now()
 global_proxy = False
 recording_time_list = {}
+batch_start_times = {}
+batch_end_times = {}
 script_path = os.path.split(os.path.realpath(sys.argv[0]))[0]
 config_file = f'{script_path}/config/config.ini'
 url_config_file = f'{script_path}/config/URL_config.ini'
@@ -1090,6 +1092,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         daemon=True
                                     ).start()
                                 start_pushed = False
+                                batch_end_times[record_name] = datetime.datetime.now()
 
                         else:
                             content = f"\r{record_name} 正在直播中..."
@@ -1134,6 +1137,16 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                     full_path = full_path.replace("\\", '/')
                                     if folder_by_author:
                                         full_path = f'{full_path}/{anchor_name}'
+
+                                    now_dt = datetime.datetime.now()
+                                    last_end = batch_end_times.pop(record_name, None)
+                                    if last_end and (now_dt - last_end).total_seconds() >= 1800:
+                                        batch_start_times[record_name] = now_dt.strftime("%Y-%m-%d_%H-%M")
+                                    elif record_name not in batch_start_times:
+                                        batch_start_times[record_name] = now_dt.strftime("%Y-%m-%d_%H-%M")
+                                    batch_time = batch_start_times[record_name]
+                                    full_path = f'{full_path}/{batch_time}'
+
                                     if folder_by_time:
                                         full_path = f'{full_path}/{now[:10]}'
                                     if folder_by_title and port_info.get('title'):
