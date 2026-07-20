@@ -1242,7 +1242,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
 
                                 record_save_type = video_save_type
 
-                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url'):
+                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url') and not only_audio_record and not any(i in video_save_type for i in ['MP3', 'M4A']):
                                     codec = utils.get_query_params(port_info['flv_url'], "codec")
                                     if codec and codec[0] == 'h265':
                                         logger.warning("FLV is not supported for h265 codec, use TS format instead")
@@ -1317,6 +1317,8 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         with max_request_lock:
                                             error_count += 1
                                             error_window.append(1)
+
+                                return
 
                                 if only_flv_record:
                                     logger.info(f"Use Direct Downloader to Download FLV Stream: {record_url}")
