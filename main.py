@@ -21,6 +21,7 @@ import re
 import shutil
 import random
 import uuid
+import csv
 from pathlib import Path
 import urllib.request
 from urllib.error import URLError, HTTPError
@@ -513,6 +514,52 @@ def get_quality_code(qn):
     return QUALITY_MAPPING.get(qn)
 
 
+def normalize_video_save_type(save_type):
+    video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
+    save_type = save_type.strip().upper() if save_type else ''
+    return save_type if save_type in video_save_type_list else ''
+
+
+def contains_url(string):
+    pattern = r"(https?://)?(www\.)?[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+(:\d+)?(/.*)?"
+    return re.search(pattern, string) is not None
+
+
+def parse_url_config_line(line, default_quality):
+    if ',' in line:
+        split_line = next(csv.reader([line], skipinitialspace=True))
+    elif '，' in line:
+        split_line = [i.strip() for i in line.split('，')]
+    else:
+        split_line = [line, '']
+
+    split_line = [i.strip() for i in split_line]
+
+    if len(split_line) == 1:
+        url = split_line[0]
+        quality, name, save_type = default_quality, '', ''
+    elif len(split_line) == 2:
+        if contains_url(split_line[0]):
+            quality = default_quality
+            url = split_line[0]
+            if normalize_video_save_type(split_line[1]):
+                name, save_type = '', split_line[1]
+            else:
+                name, save_type = split_line[1], ''
+        else:
+            quality, url = split_line
+            name, save_type = '', ''
+    else:
+        if contains_url(split_line[0]):
+            quality = default_quality
+            url, name, save_type = split_line[0], split_line[1], split_line[2]
+        else:
+            quality, url, name = split_line[:3]
+            save_type = split_line[3] if len(split_line) > 3 else ''
+
+    return quality, url, name, normalize_video_save_type(save_type)
+
+
 def get_record_headers(platform, live_url):
     live_domain = '/'.join(live_url.split('/')[0:3])
     record_headers = {
@@ -555,7 +602,10 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
             new_record_url = ''
             count_time = time.time()
             retry = 0
-            record_quality_zh, record_url, anchor_name = url_data
+            record_quality_zh, record_url, anchor_name = url_data[:3]
+            configured_anchor_name = anchor_name
+            url_video_save_type = url_data[3] if len(url_data) > 3 else ''
+            config_line = url_data[4] if len(url_data) > 4 else record_url
             record_quality = get_quality_code(record_quality_zh)
             proxy_address = proxy_addr
             platform = '未知平台'
@@ -1065,13 +1115,15 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                             clear_record_info(record_name, record_url)
                             return
 
-                        if not url_data[-1] and run_once is False:
+                        if not configured_anchor_name and run_once is False:
+                            save_type_suffix = f',{url_video_save_type}' if url_video_save_type else ''
                             if new_record_url:
                                 need_update_line_list.append(
-                                    f'{record_url}|{new_record_url},主播: {anchor_name.strip()}')
+                                    f'{config_line}|{new_record_url},主播: {anchor_name.strip()}{save_type_suffix}')
                                 not_record_list.append(new_record_url)
                             else:
-                                need_update_line_list.append(f'{record_url}|{record_url},主播: {anchor_name.strip()}')
+                                need_update_line_list.append(
+                                    f'{config_line}|{record_url},主播: {anchor_name.strip()}{save_type_suffix}')
                             run_once = True
 
                         push_at = datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S')
@@ -1240,9 +1292,9 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                 if platform in only_audio_platform_list:
                                     only_audio_record = True
 
-                                record_save_type = video_save_type
+                                record_save_type = url_video_save_type or video_save_type
 
-                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url') and not only_audio_record and not any(i in video_save_type for i in ['MP3', 'M4A']):
+                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url') and not only_audio_record and not any(i in record_save_type for i in ['MP3', 'M4A']):
                                     codec = utils.get_query_params(port_info['flv_url'], "codec")
                                     if codec and codec[0] == 'h265':
                                         logger.warning("FLV is not supported for h265 codec, use TS format instead")
@@ -1978,23 +2030,7 @@ while True:
                 if is_comment_line:
                     line = line.lstrip('#')
 
-                if re.search('[,，]', line):
-                    split_line = re.split('[,，]', line)
-                else:
-                    split_line = [line, '']
-
-                if len(split_line) == 1:
-                    url = split_line[0]
-                    quality, name = [video_record_quality, '']
-                elif len(split_line) == 2:
-                    if contains_url(split_line[0]):
-                        quality = video_record_quality
-                        url, name = split_line
-                    else:
-                        quality, url = split_line
-                        name = ''
-                else:
-                    quality, url, name = split_line
+                quality, url, name, save_type = parse_url_config_line(line, video_record_quality)
 
                 if quality not in ("原画", "蓝光", "超清", "高清", "标清", "流畅"):
                     quality = '原画'
@@ -2117,7 +2153,7 @@ while True:
                     if is_comment_line:
                         url_comments.append(url)
                     else:
-                        new_line = (quality, url, name)
+                        new_line = (quality, url, name, save_type, line)
                         url_tuples_list.append(new_line)
                 else:
                     if not origin_line.startswith('#'):
