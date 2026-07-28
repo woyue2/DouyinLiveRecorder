@@ -13,8 +13,15 @@ fi
 cd "$DOWNLOAD_DIR" || exit 1
 echo "--- 任务开始: $(date) ---"
 
-# 查找所有 .ts 和 .mp3 文件（支持4层深度：平台/主播/批次/文件）
-find . -path ./converted -prune -o -mindepth 4 -maxdepth 4 -type f \( -name "*.ts" -o -name "*.mp3" \) -print | while read -r file; do
+# 查找所有录制文件（支持4层深度：平台/主播/批次/文件）
+find . -path ./converted -prune -o -mindepth 4 -maxdepth 4 -type f \( \
+    -name "*.ts" -o \
+    -name "*.mkv" -o \
+    -name "*.flv" -o \
+    -name "*.mp4" -o \
+    -name "*.mp3" -o \
+    -name "*.m4a" \
+\) -print | while read -r file; do
     if lsof "$file" > /dev/null 2>&1; then
         continue
     fi
@@ -30,16 +37,8 @@ find . -path ./converted -prune -o -mindepth 4 -maxdepth 4 -type f \( -name "*.t
 
     mkdir -p "./converted/$anchor_name/$batch_dir"
 
-    if [[ "$file" == *.ts ]]; then
-        mp3_file="./converted/$anchor_name/$batch_dir/${base_name_noext}.mp3"
-        ffmpeg -i "$file" -vn -acodec libmp3lame -q:a 2 "$mp3_file" -y -loglevel error
-        if [ $? -eq 0 ]; then
-            rm -f "$file"
-        fi
-    else
-        if cp "$file" "./converted/$anchor_name/$batch_dir/"; then
-            rm -f "$file"
-        fi
+    if cp "$file" "./converted/$anchor_name/$batch_dir/"; then
+        rm -f "$file"
     fi
 done
 
@@ -51,10 +50,11 @@ if [ -d "./converted" ]; then
         for batch_dir in "$anchor_dir"*/; do
             [ -d "$batch_dir" ] || continue
             batch_time=$(basename "$batch_dir")
-            python3 -m bypy --retry 5 --timeout 120 -s 500M syncup "$batch_dir" "/live_audio/$anchor_name/$batch_time" --on-dup overwrite 2>&1
+            if python3 -m bypy --retry 5 --timeout 120 -s 500M syncup "$batch_dir" "/live_audio/$anchor_name/$batch_time" --on-dup overwrite 2>&1; then
+                rm -rf "$batch_dir"
+            fi
         done
     done
-    rm -rf ./converted
 fi
 
 # 清理空文件夹
