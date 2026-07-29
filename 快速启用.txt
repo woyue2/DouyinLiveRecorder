@@ -1,5 +1,8 @@
+ubuntu 22
 1. python 3.11
-2. ffmpeg
+2. ffmpeg 的版本不能是6.1static,  目前使用的是 version 4.4.2
+是sudo apt update && sudo apt install ffmpeg安装的
+pgrep -af ffmpeg 可以看到使用的状态
 3. 然后启用nohup python main.py >
 nohup python3 main.py > output.log 2>&1 &
 4  pip install bypy #百度网盘连接 ，后面上传用
