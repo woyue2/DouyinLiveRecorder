@@ -22,6 +22,7 @@ import shutil
 import random
 import uuid
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import urllib.request
 from urllib.error import URLError, HTTPError
@@ -29,6 +30,13 @@ from typing import Any
 import configparser
 import httpx
 from src import spider, stream
+from src.output_pipeline import (
+    get_working_output_path,
+    get_working_output_files,
+    publish_completed_segments,
+    publish_output_files,
+)
+from src.recording_config import RecordFormat, RecordingConfig, normalize_audio_bitrate
 from src.proxy import ProxyDetector
 from src.utils import logger
 from src import utils
@@ -54,6 +62,9 @@ error_window_size = 10
 error_threshold = 5
 monitoring = 0
 running_list = []
+recording_tasks = {}
+recording_tasks_lock = threading.Lock()
+postprocess_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="postprocess")
 url_tuples_list = []
 url_comments = []
 text_no_repeat_url = []
@@ -109,7 +120,7 @@ def display_info() -> None:
             if create_time_file:
                 print("是否生成时间文件: 是", end=" | ")
             print(f"录制视频质量为: {video_record_quality}", end=" | ")
-            print(f"录制视频格式为: {video_save_type}", end=" | ")
+            print(f"默认录制格式: {video_save_type}", end=" | ")
             print(f"目前瞬时错误数为: {error_count}", end=" | ")
             now = time.strftime("%H:%M:%S", time.localtime())
             print(f"当前时间: {now}")
@@ -126,9 +137,14 @@ def display_info() -> None:
                 no_repeat_recording = list(set(recording))
                 print(f"正在录制{len(no_repeat_recording)}个直播: ")
                 for recording_live in no_repeat_recording:
-                    rt, qa = recording_time_list[recording_live]
+                    record_info = recording_time_list[recording_live]
+                    rt, qa = record_info[:2]
+                    actual_format = record_info[2] if len(record_info) > 2 else "准备中"
                     have_record_time = now_time - rt
-                    print(f"{recording_live}[{qa}] 正在录制中 {str(have_record_time).split('.')[0]}")
+                    print(
+                        f"{recording_live}[{qa}/{actual_format}] "
+                        f"正在录制中 {str(have_record_time).split('.')[0]}"
+                    )
 
                 # print('\n本软件已运行：'+str(now_time - start_display_time).split('.')[0])
                 print("x" * 60)
@@ -193,6 +209,7 @@ def segment_video(converts_file_path: str, segment_save_file_path: str, segment_
                   is_original_delete: bool = True) -> None:
     try:
         if os.path.exists(converts_file_path) and os.path.getsize(converts_file_path) > 0:
+            working_segment_path = get_working_output_path(segment_save_file_path)
             ffmpeg_command = [
                 "ffmpeg",
                 "-i", converts_file_path,
@@ -204,11 +221,12 @@ def segment_video(converts_file_path: str, segment_save_file_path: str, segment_
                 "-segment_format", segment_format,
                 "-reset_timestamps", "1",
                 "-movflags", "+frag_keyframe+empty_moov",
-                segment_save_file_path,
+                working_segment_path,
             ]
             _output = subprocess.check_output(
                 ffmpeg_command, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
             )
+            publish_output_files(working_segment_path)
             if is_original_delete:
                 time.sleep(1)
                 if os.path.exists(converts_file_path):
@@ -219,9 +237,12 @@ def segment_video(converts_file_path: str, segment_save_file_path: str, segment_
         logger.error(f'An unknown error occurred: {e}')
 
 
-def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> None:
+def converts_mp4(converts_file_path: str, is_original_delete: bool = True,
+                 final_path: str | None = None) -> None:
     try:
         if os.path.exists(converts_file_path) and os.path.getsize(converts_file_path) > 0:
+            final_path = final_path or converts_file_path.rsplit('.', maxsplit=1)[0] + ".mp4"
+            working_path = get_working_output_path(final_path)
             if converts_to_h264:
                 color_obj.print_colored("正在转码为MP4格式并重新编码为h264\n", color_obj.YELLOW)
                 ffmpeg_command = [
@@ -231,7 +252,7 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
                     "-crf", "23",
                     "-vf", "format=yuv420p",
                     "-c:a", "copy",
-                    "-f", "mp4", converts_file_path.rsplit('.', maxsplit=1)[0] + ".mp4",
+                    "-f", "mp4", working_path,
                 ]
             else:
                 color_obj.print_colored("正在转码为MP4格式\n", color_obj.YELLOW)
@@ -239,11 +260,12 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
                     "ffmpeg", "-i", converts_file_path,
                     "-c:v", "copy",
                     "-c:a", "copy",
-                    "-f", "mp4", converts_file_path.rsplit('.', maxsplit=1)[0] + ".mp4",
+                    "-f", "mp4", working_path,
                 ]
             _output = subprocess.check_output(
                 ffmpeg_command, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
             )
+            publish_output_files(working_path)
             if is_original_delete:
                 time.sleep(1)
                 if os.path.exists(converts_file_path):
@@ -257,12 +279,15 @@ def converts_mp4(converts_file_path: str, is_original_delete: bool = True) -> No
 def converts_m4a(converts_file_path: str, is_original_delete: bool = True) -> None:
     try:
         if os.path.exists(converts_file_path) and os.path.getsize(converts_file_path) > 0:
+            final_path = converts_file_path.rsplit('.', maxsplit=1)[0] + ".m4a"
+            working_path = get_working_output_path(final_path)
             _output = subprocess.check_output([
                 "ffmpeg", "-i", converts_file_path,
                 "-n", "-vn",
-                "-c:a", "aac", "-bsf:a", "aac_adtstoasc", "-ab", "320k",
-                converts_file_path.rsplit('.', maxsplit=1)[0] + ".m4a",
+                "-c:a", "aac", "-bsf:a", "aac_adtstoasc", "-b:a", audio_bitrate,
+                "-f", "mp4", working_path,
             ], stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type))
+            publish_output_files(working_path)
             if is_original_delete:
                 time.sleep(1)
                 if os.path.exists(converts_file_path):
@@ -385,9 +410,11 @@ def clear_record_info(record_name: str, record_url: str) -> None:
         color_obj.print_colored(f"[{record_name}]已经从录制列表中移除\n", color_obj.YELLOW)
 
 
-def direct_download_stream(source_url: str, save_path: str, record_name: str, live_url: str, platform: str) -> bool:
+def direct_download_stream(source_url: str, save_path: str, record_name: str, live_url: str, platform: str,
+                           stop_event: threading.Event | None = None) -> bool:
+    working_path = get_working_output_path(save_path)
     try:
-        with open(save_path, 'wb') as f:
+        with open(working_path, 'wb') as f:
             client = httpx.Client(timeout=None)
 
             headers = {}
@@ -402,42 +429,54 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
                     return False
 
                 downloaded = 0
+                interrupted = False
                 chunk_size = 1024 * 16
 
                 for chunk in response.iter_bytes(chunk_size):
-                    if live_url in url_comments or exit_recording:
+                    if live_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
                         color_obj.print_colored(f"[{record_name}]录制时已被注释或请求停止,下载中断", color_obj.YELLOW)
                         clear_record_info(record_name, live_url)
-                        return False
+                        interrupted = True
+                        break
 
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                if downloaded:
+                    f.flush()
+                    os.fsync(f.fileno())
+                    publish_output_files(working_path)
                 print()
-                return True
+                return not interrupted
     except Exception as e:
         logger.error(f"FLV下载错误: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
         return False
 
 
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
-                     script_command: str | None = None) -> bool:
-    save_file_path = ffmpeg_command[-1]
+                     script_command: str | None = None, stop_event: threading.Event | None = None,
+                     final_save_file_path: str | None = None) -> bool:
+    working_file_path = ffmpeg_command[-1]
+    save_file_path = final_save_file_path or working_file_path
     process = subprocess.Popen(
         ffmpeg_command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
     )
+    should_convert_to_mp4 = converts_to_mp4 and save_type in {"TS", "FLV"}
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
     subs_thread_name = f'subs_{Path(subs_file_path).name}'
-    if create_time_file and not split_video_by_time and '音频' not in save_type:
+    if create_time_file and not split_video_by_time and not RecordFormat.parse(save_type).audio_only:
         create_var[subs_thread_name] = threading.Thread(
             target=generate_subtitles, args=(record_name, subs_file_path)
         )
         create_var[subs_thread_name].daemon = True
         create_var[subs_thread_name].start()
 
+    stop_requested = False
     while process.poll() is None:
-        if record_url in url_comments or exit_recording:
+        if not should_convert_to_mp4:
+            publish_completed_segments(working_file_path)
+        if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
             color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
             # process.terminate()
@@ -448,38 +487,62 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             else:
                 process.send_signal(signal.SIGINT)
             process.wait()
-            return True
+            stop_requested = True
+            break
         time.sleep(1)
 
     return_code = process.returncode
     stop_time = time.strftime('%Y-%m-%d %H:%M:%S')
-    if return_code == 0:
-        if converts_to_mp4 and save_type == 'TS':
-            if split_video_by_time:
-                file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
-                prefix = os.path.basename(save_file_path).rsplit('_', maxsplit=1)[0]
-                for path in file_paths:
-                    if prefix in path:
-                        threading.Thread(target=converts_mp4, args=(path, delete_origin_file)).start()
-            else:
-                threading.Thread(target=converts_mp4, args=(save_file_path, delete_origin_file)).start()
-        print(f"\n{record_name} {stop_time} 直播录制完成\n")
+    if return_code == 0 or stop_requested:
+        published_files = []
+        if should_convert_to_mp4:
+            conversion_futures = []
+            for source_path in get_working_output_files(working_file_path):
+                source_final_path = source_path.with_suffix("")
+                target_path = source_final_path.with_suffix(".mp4")
+                conversion_futures.append(
+                    (
+                        target_path,
+                        postprocess_executor.submit(
+                            converts_mp4,
+                            str(source_path),
+                            True,
+                            str(target_path),
+                        ),
+                    )
+                )
+            for target_path, future in conversion_futures:
+                future.result()
+                if target_path.exists():
+                    published_files.append(str(target_path))
+        else:
+            published_files = publish_output_files(working_file_path)
+        script_output_path = save_file_path
+        script_save_type = "MP4" if should_convert_to_mp4 else save_type
+        if published_files:
+            script_output_path = (
+                published_files[0]
+                if len(published_files) == 1
+                else os.path.dirname(published_files[0])
+            )
+        status_text = "录制已安全停止" if stop_requested else "直播录制完成"
+        print(f"\n{record_name} {stop_time} {status_text}\n")
 
         if script_command:
             logger.debug("开始执行脚本命令!")
             if "python" in script_command:
                 params = [
                     f'--record_name "{record_name}"',
-                    f'--save_file_path "{save_file_path}"',
-                    f'--save_type {save_type}',
+                    f'--save_file_path "{script_output_path}"',
+                    f'--save_type {script_save_type}',
                     f'--split_video_by_time {split_video_by_time}',
                     f'--converts_to_mp4 {converts_to_mp4}',
                 ]
             else:
                 params = [
                     f'"{record_name.split(" ", maxsplit=1)[-1]}"',
-                    f'"{save_file_path}"',
-                    save_type,
+                    f'"{script_output_path}"',
+                    script_save_type,
                     f'split_video_by_time:{split_video_by_time}',
                     f'converts_to_mp4:{converts_to_mp4}'
                 ]
@@ -491,7 +554,22 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         color_obj.print_colored(f"\n{record_name} {stop_time} 直播录制出错,返回码: {return_code}\n", color_obj.RED)
 
     recording.discard(record_name)
-    return False
+    return stop_requested
+
+
+def run_recording_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
+                             script_command: str | None, stop_event: threading.Event | None) -> bool:
+    final_save_file_path = ffmpeg_command[-1]
+    ffmpeg_command[-1] = get_working_output_path(final_save_file_path)
+    return check_subprocess(
+        record_name,
+        record_url,
+        ffmpeg_command,
+        save_type,
+        script_command,
+        stop_event=stop_event,
+        final_save_file_path=final_save_file_path,
+    )
 
 
 def clean_name(input_text):
@@ -515,9 +593,7 @@ def get_quality_code(qn):
 
 
 def normalize_video_save_type(save_type):
-    video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
-    save_type = save_type.strip().upper() if save_type else ''
-    return save_type if save_type in video_save_type_list else ''
+    return RecordFormat.normalize_optional(save_type)
 
 
 def contains_url(string):
@@ -557,7 +633,10 @@ def parse_url_config_line(line, default_quality):
             quality, url, name = split_line[:3]
             save_type = split_line[3] if len(split_line) > 3 else ''
 
-    return quality, url, name, normalize_video_save_type(save_type)
+    normalized_save_type = normalize_video_save_type(save_type)
+    if save_type and not normalized_save_type:
+        logger.warning(f"URL配置中的录制格式无效，将使用全局默认值: {save_type}")
+    return quality, url, name, normalized_save_type
 
 
 def get_record_headers(platform, live_url):
@@ -591,10 +670,12 @@ def select_source_url(link, stream_info):
     return stream_info.get('record_url')
 
 
-def start_record(url_data: tuple, count_variable: int = -1) -> None:
+def start_record(url_data: tuple, count_variable: int = -1,
+                 stop_event: threading.Event | None = None) -> None:
     global error_count
+    stop_event = stop_event or threading.Event()
 
-    while True:
+    while not stop_event.is_set():
         try:
             record_finished = False
             run_once = False
@@ -626,7 +707,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
 
             # print(f'\r代理地址:{proxy_address}')
             # print(f'\r全局代理:{global_proxy}')
-            while True:
+            while not stop_event.is_set():
                 try:
                     port_info = []
                     if record_url.find("douyin.com/") > -1:
@@ -1292,18 +1373,33 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                 if platform in only_audio_platform_list:
                                     only_audio_record = True
 
-                                record_save_type = url_video_save_type or video_save_type
+                                requested_save_type = url_video_save_type or video_save_type
+                                record_format = RecordFormat.parse(requested_save_type, video_save_type)
 
-                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url') and not only_audio_record and not any(i in record_save_type for i in ['MP3', 'M4A']):
+                                if only_audio_record and not record_format.audio_only:
+                                    logger.warning(
+                                        f"{platform}仅支持音频录制，已将请求格式"
+                                        f"{record_format.name}回退为M4A"
+                                    )
+                                    record_format = RecordFormat.parse("M4A")
+
+                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url') and not record_format.audio_only:
                                     codec = utils.get_query_params(port_info['flv_url'], "codec")
                                     if codec and codec[0] == 'h265':
                                         logger.warning("FLV is not supported for h265 codec, use TS format instead")
-                                        record_save_type = "TS"
+                                        record_format = RecordFormat.parse("TS")
 
-                                if only_audio_record or any(i in record_save_type for i in ['MP3', 'M4A']):
+                                record_save_type = record_format.name
+                                recording_time_list[record_name] = [
+                                    start_record_time,
+                                    record_quality_zh,
+                                    record_save_type,
+                                ]
+
+                                if record_format.audio_only:
                                     try:
                                         now = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-                                        extension = "mp3" if "m4a" not in record_save_type.lower() else "m4a"
+                                        extension = record_format.extension
                                         name_format = "_%03d" if split_video_by_time else ""
                                         save_file_path = (f"{full_path}/{anchor_name}_{title_in_name}{now}"
                                                           f"{name_format}.{extension}")
@@ -1311,11 +1407,11 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         if split_video_by_time:
                                             print(f'\r{anchor_name} 准备开始录制音频: {save_file_path}')
 
-                                            if "MP3" in record_save_type:
+                                            if record_format.name == "MP3":
                                                 command = [
                                                     "-map", "0:a",
                                                     "-c:a", "libmp3lame",
-                                                    "-q:a", "2",
+                                                    "-b:a", audio_bitrate,
                                                     "-f", "segment",
                                                     "-segment_time", split_time,
                                                     "-segment_format", "mp3",
@@ -1327,20 +1423,23 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                     "-map", "0:a",
                                                     "-c:a", "aac",
                                                     "-bsf:a", "aac_adtstoasc",
-                                                    "-ab", "320k",
+                                                    "-b:a", audio_bitrate,
                                                     "-f", "segment",
                                                     "-segment_time", split_time,
-                                                    "-segment_format", 'mpegts',
+                                                    "-segment_format", "mp4",
+                                                    "-segment_format_options",
+                                                    "movflags=+frag_keyframe+empty_moov",
                                                     "-reset_timestamps", "1",
                                                     save_file_path,
                                                 ]
 
                                         else:
-                                            if "MP3" in record_save_type:
+                                            if record_format.name == "MP3":
                                                 command = [
                                                     "-map", "0:a",
                                                     "-c:a", "libmp3lame",
-                                                    "-q:a", "2",
+                                                    "-b:a", audio_bitrate,
+                                                    "-f", "mp3",
                                                     save_file_path,
                                                 ]
 
@@ -1349,18 +1448,20 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                     "-map", "0:a",
                                                     "-c:a", "aac",
                                                     "-bsf:a", "aac_adtstoasc",
-                                                    "-ab", "320k",
+                                                    "-b:a", audio_bitrate,
                                                     "-movflags", "+faststart",
+                                                    "-f", "mp4",
                                                     save_file_path,
                                                 ]
 
                                         ffmpeg_command.extend(command)
-                                        comment_end = check_subprocess(
+                                        comment_end = run_recording_subprocess(
                                             record_name,
                                             record_url,
                                             ffmpeg_command,
                                             record_save_type,
-                                            custom_script
+                                            custom_script,
+                                            stop_event,
                                         )
                                         if comment_end:
                                             return
@@ -1371,7 +1472,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             error_count += 1
                                             error_window.append(1)
 
-                                    return
+                                    record_finished = True
 
                                 if only_flv_record:
                                     logger.info(f"Use Direct Downloader to Download FLV Stream: {record_url}")
@@ -1393,10 +1494,15 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         if flv_url:
                                             recording.add(record_name)
                                             start_record_time = datetime.datetime.now()
-                                            recording_time_list[record_name] = [start_record_time, record_quality_zh]
+                                            recording_time_list[record_name] = [
+                                                start_record_time,
+                                                record_quality_zh,
+                                                "FLV",
+                                            ]
 
                                             download_success = direct_download_stream(
-                                                flv_url, save_file_path, record_name, record_url, platform
+                                                flv_url, save_file_path, record_name, record_url, platform,
+                                                stop_event
                                             )
 
                                             if download_success:
@@ -1449,12 +1555,13 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             ]
                                         ffmpeg_command.extend(command)
 
-                                        comment_end = check_subprocess(
+                                        comment_end = run_recording_subprocess(
                                             record_name,
                                             record_url,
                                             ffmpeg_command,
                                             record_save_type,
-                                            custom_script
+                                            custom_script,
+                                            stop_event,
                                         )
                                         if comment_end:
                                             return
@@ -1464,32 +1571,6 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                         with max_request_lock:
                                             error_count += 1
                                             error_window.append(1)
-
-                                    try:
-                                        if converts_to_mp4:
-                                            seg_file_path = f"{full_path}/{anchor_name}_{title_in_name}{now}_%03d.mp4"
-                                            if split_video_by_time:
-                                                segment_video(
-                                                    save_file_path, seg_file_path,
-                                                    segment_format='mp4', segment_time=split_time,
-                                                    is_original_delete=delete_origin_file
-                                                )
-                                            else:
-                                                threading.Thread(
-                                                    target=converts_mp4,
-                                                    args=(save_file_path, delete_origin_file)
-                                                ).start()
-
-                                        else:
-                                            seg_file_path = f"{full_path}/{anchor_name}_{title_in_name}{now}_%03d.flv"
-                                            if split_video_by_time:
-                                                segment_video(
-                                                    save_file_path, seg_file_path,
-                                                    segment_format='flv', segment_time=split_time,
-                                                    is_original_delete=delete_origin_file
-                                                )
-                                    except Exception as e:
-                                        logger.error(f"转码失败: {e} ")
 
                                 elif record_save_type == "MKV":
                                     filename = anchor_name + f'_{title_in_name}' + now + ".mkv"
@@ -1523,12 +1604,13 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             ]
                                         ffmpeg_command.extend(command)
 
-                                        comment_end = check_subprocess(
+                                        comment_end = run_recording_subprocess(
                                             record_name,
                                             record_url,
                                             ffmpeg_command,
                                             record_save_type,
-                                            custom_script
+                                            custom_script,
+                                            stop_event,
                                         )
                                         if comment_end:
                                             return
@@ -1570,12 +1652,13 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             ]
 
                                         ffmpeg_command.extend(command)
-                                        comment_end = check_subprocess(
+                                        comment_end = run_recording_subprocess(
                                             record_name,
                                             record_url,
                                             ffmpeg_command,
                                             record_save_type,
-                                            custom_script
+                                            custom_script,
+                                            stop_event,
                                         )
                                         if comment_end:
                                             return
@@ -1606,12 +1689,13 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             ]
 
                                             ffmpeg_command.extend(command)
-                                            comment_end = check_subprocess(
+                                            comment_end = run_recording_subprocess(
                                                 record_name,
                                                 record_url,
                                                 ffmpeg_command,
                                                 record_save_type,
-                                                custom_script
+                                                custom_script,
+                                                stop_event,
                                             )
                                             if comment_end:
                                                 if converts_to_mp4:
@@ -1620,10 +1704,11 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                     for path in file_paths:
                                                         if prefix in path:
                                                             try:
-                                                                threading.Thread(
-                                                                    target=converts_mp4,
-                                                                    args=(path, delete_origin_file)
-                                                                ).start()
+                                                                postprocess_executor.submit(
+                                                                    converts_mp4,
+                                                                    path,
+                                                                    delete_origin_file,
+                                                                )
                                                             except subprocess.CalledProcessError as e:
                                                                 logger.error(f"转码失败: {e} ")
                                                 return
@@ -1650,17 +1735,20 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             ]
 
                                             ffmpeg_command.extend(command)
-                                            comment_end = check_subprocess(
+                                            comment_end = run_recording_subprocess(
                                                 record_name,
                                                 record_url,
                                                 ffmpeg_command,
                                                 record_save_type,
-                                                custom_script
+                                                custom_script,
+                                                stop_event,
                                             )
                                             if comment_end:
-                                                threading.Thread(
-                                                    target=converts_mp4, args=(save_file_path, delete_origin_file)
-                                                ).start()
+                                                postprocess_executor.submit(
+                                                    converts_mp4,
+                                                    save_file_path,
+                                                    delete_origin_file,
+                                                )
                                                 return
 
                                         except subprocess.CalledProcessError as e:
@@ -1698,11 +1786,11 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                     x = num
 
                 # 这里是正常循环
-                while x:
+                while x and not stop_event.is_set():
                     x = x - 1
                     if loop_time:
                         print(f'\r{anchor_name}循环等待{x}秒 ', end="")
-                    time.sleep(1)
+                    stop_event.wait(1)
                 if loop_time:
                     print('\r检测直播间中...', end="")
         except Exception as e:
@@ -1711,6 +1799,78 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                 error_count += 1
                 error_window.append(1)
             time.sleep(2)
+
+
+class RecordingTask:
+    def __init__(self, config_value: RecordingConfig, sequence: int):
+        self.config = config_value
+        self.sequence = sequence
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"record-{sequence}",
+            daemon=True,
+        )
+
+    def _run(self) -> None:
+        global monitoring
+        try:
+            start_record(
+                (
+                    self.config.quality,
+                    self.config.url,
+                    self.config.anchor_name,
+                    self.config.requested_format,
+                    self.config.source_line,
+                ),
+                self.sequence,
+                self.stop_event,
+            )
+        finally:
+            with recording_tasks_lock:
+                if recording_tasks.get(self.config.url) is self:
+                    recording_tasks.pop(self.config.url, None)
+                if self.config.url in running_list:
+                    running_list.remove(self.config.url)
+                monitoring = len(recording_tasks)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
+
+
+def reconcile_recording_tasks(config_values: list[RecordingConfig]) -> None:
+    global monitoring
+    desired = {item.url: item for item in config_values}
+    tasks_to_start = []
+
+    with recording_tasks_lock:
+        for url, task in list(recording_tasks.items()):
+            new_config = desired.get(url)
+            if new_config is None or new_config.fingerprint != task.config.fingerprint:
+                task.request_stop()
+
+        for config_value in config_values:
+            existing = recording_tasks.get(config_value.url)
+            if existing is not None:
+                continue
+
+            sequence = len(recording_tasks) + 1
+            task = RecordingTask(config_value, sequence)
+            recording_tasks[config_value.url] = task
+            if config_value.url not in running_list:
+                running_list.append(config_value.url)
+            tasks_to_start.append(task)
+
+        monitoring = len(recording_tasks)
+
+    for task in tasks_to_start:
+        print(f"\r{'新增' if not first_start else '传入'}地址: {task.config.url}")
+        task.start()
+        if local_delay_default:
+            time.sleep(local_delay_default)
 
 
 def backup_file(file_path: str, backup_dir_path: str, limit_counts: int = 6) -> None:
@@ -1771,10 +1931,9 @@ def check_ffmpeg_existence() -> bool:
         logger.error(e)
     except FileNotFoundError:
         pass
-    finally:
-        if check_ffmpeg():
-            time.sleep(1)
-            return True
+    if check_ffmpeg():
+        time.sleep(1)
+        return True
     return False
 
 
@@ -1874,6 +2033,9 @@ while True:
     filename_by_title = options.get(read_config_value(config, '录制设置', '保存文件名是否包含标题', "否"), False)
     clean_emoji = options.get(read_config_value(config, '录制设置', '是否去除名称中的表情符号', "是"), True)
     video_save_type = read_config_value(config, '录制设置', '视频保存格式ts|mkv|flv|mp4|mp3音频|m4a音频', "ts")
+    audio_bitrate = normalize_audio_bitrate(
+        read_config_value(config, '录制设置', '音频录制码率(kbps)', 96)
+    )
     video_record_quality = read_config_value(config, '录制设置', '原画|超清|高清|标清|流畅', "原画")
     use_proxy = options.get(read_config_value(config, '录制设置', '是否使用代理ip(是/否)', "是"), False)
     proxy_addr_bak = read_config_value(config, '录制设置', '代理地址', "")
@@ -2173,24 +2335,13 @@ while True:
                     new_word = replace_words[1]
                 update_file(url_config_file, old_str=replace_words[0], new_str=new_word, start_str=start_with)
 
-        text_no_repeat_url = list(set(url_tuples_list))
-
-        if len(text_no_repeat_url) > 0:
-            for url_tuple in text_no_repeat_url:
-                monitoring = len(running_list)
-
-                if url_tuple[1] in not_record_list:
-                    continue
-
-                if url_tuple[1] not in running_list:
-                    print(f"\r{'新增' if not first_start else '传入'}地址: {url_tuple[1]}")
-                    monitoring += 1
-                    args = [url_tuple, monitoring]
-                    create_var[f'thread_{monitoring}'] = threading.Thread(target=start_record, args=args)
-                    create_var[f'thread_{monitoring}'].daemon = True
-                    create_var[f'thread_{monitoring}'].start()
-                    running_list.append(url_tuple[1])
-                    time.sleep(local_delay_default)
+        text_no_repeat_url = list(dict.fromkeys(url_tuples_list))
+        desired_recording_configs = [
+            RecordingConfig.from_tuple(url_tuple)
+            for url_tuple in text_no_repeat_url
+            if url_tuple[1] not in not_record_list
+        ]
+        reconcile_recording_tasks(desired_recording_configs)
         url_tuples_list = []
         first_start = False
 

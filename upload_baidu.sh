@@ -4,57 +4,47 @@
 MY_EMAIL="你的邮箱@qq.com"  # TODO: 修改为你的邮箱
 DOWNLOAD_DIR="/home/ubuntu/DouyinLiveRecorder-main/downloads"
 LOG_FILE="/home/ubuntu/DouyinLiveRecorder-main/upload.log"
+LOCK_FILE="/tmp/douyin_live_recorder_upload.lock"
 
-# 1. 防重运行锁
-if pidof -x $(basename "$0") -o %PPID >/dev/null; then
+# 使用内核文件锁保证定时任务不会重叠运行
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "--- 已有上传任务运行，本次跳过: $(date) ---"
     exit 1
 fi
 
 cd "$DOWNLOAD_DIR" || exit 1
 echo "--- 任务开始: $(date) ---"
 
-# 查找所有录制文件（支持4层深度：平台/主播/批次/文件）
-find . -path ./converted -prune -o -mindepth 4 -maxdepth 4 -type f \( \
+# 查找所有已经正式发布的录制文件；*.part 不会匹配这些扩展名
+find . -path ./converted -prune -o -type f \( \
     -name "*.ts" -o \
     -name "*.mkv" -o \
     -name "*.flv" -o \
     -name "*.mp4" -o \
     -name "*.mp3" -o \
     -name "*.m4a" \
-\) -print | while read -r file; do
+\) -print0 | while IFS= read -r -d '' file; do
     if lsof "$file" > /dev/null 2>&1; then
         continue
     fi
 
-    # 路径解析: ./<平台>/<主播>/<批次时间>/<文件名>
-    file_dir=$(dirname "$file")         # ./<平台>/<主播>/<批次时间>
-    batch_dir=$(basename "$file_dir")   # 批次时间
-    anchor_dir=$(dirname "$file_dir")   # ./<平台>/<主播>
-    anchor_name=$(basename "$anchor_dir") # 主播名
+    # 保留平台、主播、批次以及可选日期/标题目录，避免不同来源互相覆盖
+    file_dir=$(dirname "$file")
+    target_dir="./converted/${file_dir#./}"
+    mkdir -p "$target_dir"
 
-    base_name=$(basename "$file")
-    base_name_noext="${base_name%.*}"
-
-    mkdir -p "./converted/$anchor_name/$batch_dir"
-
-    if cp "$file" "./converted/$anchor_name/$batch_dir/"; then
+    if cp "$file" "$target_dir/"; then
         rm -f "$file"
     fi
 done
 
-# 按主播+批次目录分别上传
+# 单个排他任务同步整个待上传树，成功后统一清理
 if [ -d "./converted" ]; then
-    for anchor_dir in ./converted/*/; do
-        [ -d "$anchor_dir" ] || continue
-        anchor_name=$(basename "$anchor_dir")
-        for batch_dir in "$anchor_dir"*/; do
-            [ -d "$batch_dir" ] || continue
-            batch_time=$(basename "$batch_dir")
-            if python3 -m bypy --retry 5 --timeout 120 -s 500M syncup "$batch_dir" "/live_audio/$anchor_name/$batch_time" --on-dup overwrite 2>&1; then
-                rm -rf "$batch_dir"
-            fi
-        done
-    done
+    if python3 -m bypy --retry 5 --timeout 120 -s 500M \
+        syncup "./converted" "/live_audio" --on-dup overwrite 2>&1; then
+        rm -rf "./converted"
+    fi
 fi
 
 # 清理空文件夹
