@@ -1370,7 +1370,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                             error_count += 1
                                             error_window.append(1)
 
-                                return
+                                    return
 
                                 if only_flv_record:
                                     logger.info(f"Use Direct Downloader to Download FLV Stream: {record_url}")
