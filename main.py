@@ -1318,6 +1318,7 @@ def start_record(url_data: tuple, count_variable: int = -1) -> None:
                                                     "-q:a", "2",
                                                     "-f", "segment",
                                                     "-segment_time", split_time,
+                                                    "-segment_format", "mp3",
                                                     "-reset_timestamps", "1",
                                                     save_file_path,
                                                 ]
