@@ -36,7 +36,15 @@ from src.output_pipeline import (
     publish_completed_segments,
     publish_output_files,
 )
+from src.ffmpeg_diagnostics import (
+    copy_ffmpeg_output,
+    describe_return_code,
+    get_ffmpeg_input_url,
+    get_ffmpeg_log_path,
+    write_ffmpeg_log_header,
+)
 from src.recording_config import RecordFormat, RecordingConfig, normalize_audio_bitrate
+from src.stream_selection import is_flv_preferred_platform, select_source_url
 from src.proxy import ProxyDetector
 from src.utils import logger
 from src import utils
@@ -511,9 +519,33 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                      final_save_file_path: str | None = None) -> bool:
     working_file_path = ffmpeg_command[-1]
     save_file_path = final_save_file_path or working_file_path
-    process = subprocess.Popen(
-        ffmpeg_command, stdin=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=get_startup_info(os_type)
+    actual_input_url = get_ffmpeg_input_url(ffmpeg_command)
+    ffmpeg_log_path = get_ffmpeg_log_path(save_file_path)
+    ffmpeg_log_file = open(ffmpeg_log_path, "w", encoding="utf-8", buffering=1)
+    write_ffmpeg_log_header(
+        ffmpeg_log_file,
+        record_name,
+        ffmpeg_command,
     )
+    logger.debug(f"FFmpeg输入源: {actual_input_url}")
+    logger.debug(f"FFmpeg完整日志: {ffmpeg_log_path}")
+    process = subprocess.Popen(
+        ffmpeg_command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        startupinfo=get_startup_info(os_type),
+    )
+    if process.stdout is None:
+        ffmpeg_log_file.close()
+        raise RuntimeError("无法读取FFmpeg输出")
+    ffmpeg_output_thread = threading.Thread(
+        target=copy_ffmpeg_output,
+        args=(process.stdout, ffmpeg_log_file),
+        name=f"ffmpeg-log-{Path(save_file_path).stem}",
+        daemon=True,
+    )
+    ffmpeg_output_thread.start()
     should_convert_to_mp4 = converts_to_mp4 and save_type in {"TS", "FLV"}
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
@@ -545,6 +577,11 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         time.sleep(1)
 
     return_code = process.returncode
+    ffmpeg_output_thread.join(timeout=5)
+    ffmpeg_log_file.write(
+        f"\nreturn_code: {describe_return_code(return_code)}\n"
+    )
+    ffmpeg_log_file.close()
     stop_time = time.strftime('%Y-%m-%d %H:%M:%S')
     if return_code == 0 or stop_requested:
         published_files = []
@@ -604,7 +641,16 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             logger.debug("脚本命令执行结束!")
 
     else:
-        color_obj.print_colored(f"\n{record_name} {stop_time} 直播录制出错,返回码: {return_code}\n", color_obj.RED)
+        return_code_text = describe_return_code(return_code)
+        logger.error(
+            f"{record_name} FFmpeg录制失败，返回码: {return_code_text}，"
+            f"完整日志: {ffmpeg_log_path}"
+        )
+        color_obj.print_colored(
+            f"\n{record_name} {stop_time} 直播录制出错,"
+            f"返回码: {return_code_text}\n完整日志: {ffmpeg_log_path}\n",
+            color_obj.RED,
+        )
 
     recording.discard(record_name)
     return stop_requested
@@ -706,21 +752,6 @@ def get_record_headers(platform, live_url):
         'Blued直播': 'referer:https://app.blued.cn'
     }
     return record_headers.get(platform)
-
-
-def is_flv_preferred_platform(link):
-    return any(i in link for i in ["douyin", "tiktok"])
-
-
-def select_source_url(link, stream_info):
-    if is_flv_preferred_platform(link):
-        codec = utils.get_query_params(stream_info.get('flv_url'), "codec")
-        if codec and codec[0] == 'h265':
-            logger.warning("FLV is not supported for h265 codec, use HLS source instead")
-        else:
-            return stream_info.get('flv_url')
-
-    return stream_info.get('record_url')
 
 
 def start_record(url_data: tuple, count_variable: int = -1,
@@ -1303,7 +1334,22 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                 time.sleep(push_check_seconds)
                                 continue
 
-                            real_url = select_source_url(record_url, port_info)
+                            requested_save_type = url_video_save_type or video_save_type
+                            requested_record_format = RecordFormat.parse(
+                                requested_save_type,
+                                video_save_type,
+                            )
+                            prefer_hls = requested_record_format.name in {"TS", "MP4"}
+                            real_url = select_source_url(
+                                record_url,
+                                port_info,
+                                prefer_hls=prefer_hls,
+                            )
+                            if prefer_hls and real_url == port_info.get("m3u8_url"):
+                                logger.debug(
+                                    f"{platform}使用HLS源录制"
+                                    f"{requested_record_format.name}，避免FLV输入兼容性问题"
+                                )
                             full_path = f'{default_path}/{platform}'
                             if real_url:
                                 now = datetime.datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1373,9 +1419,8 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                 ffmpeg_command = [
                                     'ffmpeg', "-y",
-                                    "-v", "verbose",
                                     "-rw_timeout", rw_timeout,
-                                    "-loglevel", "error",
+                                    "-loglevel", "verbose",
                                     "-hide_banner",
                                     "-user_agent", user_agent,
                                     "-protocol_whitelist", "rtmp,crypto,file,http,https,tcp,tls,udp,rtp,httpproxy",
@@ -1383,13 +1428,13 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                     "-analyzeduration", analyzeduration,
                                     "-probesize", probesize,
                                     "-fflags", "+discardcorrupt",
+                                    "-reconnect", "1",
+                                    "-reconnect_streamed", "1",
+                                    "-reconnect_delay_max", "60",
                                     "-re", "-i", real_url,
                                     "-bufsize", bufsize,
                                     "-sn", "-dn",
-                                    "-reconnect_delay_max", "60",
-                                    "-reconnect_streamed", "-reconnect_at_eof",
                                     "-max_muxing_queue_size", max_muxing_queue_size,
-                                    "-correct_ts_overflow", "1",
                                     "-avoid_negative_ts", "1"
                                 ]
 
@@ -1426,8 +1471,7 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                 if platform in only_audio_platform_list:
                                     only_audio_record = True
 
-                                requested_save_type = url_video_save_type or video_save_type
-                                record_format = RecordFormat.parse(requested_save_type, video_save_type)
+                                record_format = requested_record_format
 
                                 if only_audio_record and not record_format.audio_only:
                                     logger.warning(
@@ -1797,6 +1841,8 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                 count_time = time.time()
 
                 except Exception as e:
+                    recording.discard(record_name)
+                    recording_time_list.pop(record_name, None)
                     logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
                     with max_request_lock:
                         error_count += 1
@@ -1831,6 +1877,8 @@ def start_record(url_data: tuple, count_variable: int = -1,
                 if loop_time:
                     print('\r检测直播间中...', end="")
         except Exception as e:
+            recording.discard(record_name)
+            recording_time_list.pop(record_name, None)
             logger.error(f"错误信息: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
             with max_request_lock:
                 error_count += 1
