@@ -411,12 +411,13 @@ def clear_record_info(record_name: str, record_url: str) -> None:
 
 
 def direct_download_stream(source_url: str, save_path: str, record_name: str, live_url: str, platform: str,
-                           stop_event: threading.Event | None = None) -> bool:
+                           stop_event: threading.Event | None = None,
+                           segment_time: str | None = None) -> bool:
     working_path = get_working_output_path(save_path)
+    ffmpeg_process = None
+    output_file = None
     try:
-        with open(working_path, 'wb') as f:
-            client = httpx.Client(timeout=None)
-
+        with httpx.Client(timeout=None) as client:
             headers = {}
             header_params = get_record_headers(platform, live_url)
             if header_params:
@@ -428,9 +429,36 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
                     logger.error(f"请求直播流失败，状态码: {response.status_code}")
                     return False
 
+                if segment_time:
+                    ffmpeg_process = subprocess.Popen(
+                        [
+                            "ffmpeg", "-y",
+                            "-hide_banner", "-loglevel", "error",
+                            "-f", "flv", "-i", "pipe:0",
+                            "-map", "0",
+                            "-c:v", "copy",
+                            "-c:a", "copy",
+                            "-f", "segment",
+                            "-segment_time", segment_time,
+                            "-segment_format", "flv",
+                            "-reset_timestamps", "1",
+                            working_path,
+                        ],
+                        stdin=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        startupinfo=get_startup_info(os_type),
+                    )
+                    if ffmpeg_process.stdin is None:
+                        raise RuntimeError("无法打开 FFmpeg 标准输入")
+                    output_stream = ffmpeg_process.stdin
+                else:
+                    output_file = open(working_path, 'wb')
+                    output_stream = output_file
+
                 downloaded = 0
                 interrupted = False
                 chunk_size = 1024 * 16
+                last_publish_time = time.monotonic()
 
                 for chunk in response.iter_bytes(chunk_size):
                     if live_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
@@ -440,17 +468,42 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
                         break
 
                     if chunk:
-                        f.write(chunk)
+                        output_stream.write(chunk)
                         downloaded += len(chunk)
+                        if segment_time and time.monotonic() - last_publish_time >= 1:
+                            publish_completed_segments(working_path)
+                            last_publish_time = time.monotonic()
+
+                output_stream.flush()
+                if ffmpeg_process:
+                    output_stream.close()
+                    return_code = ffmpeg_process.wait()
+                    if return_code != 0:
+                        logger.error(f"FLV分段失败，FFmpeg返回码: {return_code}")
+                        return False
+                else:
+                    os.fsync(output_file.fileno())
+                    output_file.close()
+                    output_file = None
+
                 if downloaded:
-                    f.flush()
-                    os.fsync(f.fileno())
                     publish_output_files(working_path)
                 print()
                 return not interrupted
     except Exception as e:
         logger.error(f"FLV下载错误: {e} 发生错误的行数: {e.__traceback__.tb_lineno}")
         return False
+    finally:
+        if output_file and not output_file.closed:
+            output_file.close()
+        if ffmpeg_process:
+            if ffmpeg_process.stdin and not ffmpeg_process.stdin.closed:
+                try:
+                    ffmpeg_process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if ffmpeg_process.poll() is None:
+                ffmpeg_process.wait()
 
 
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
@@ -1476,13 +1529,14 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                 if only_flv_record:
                                     logger.info(f"Use Direct Downloader to Download FLV Stream: {record_url}")
-                                    filename = anchor_name + f'_{title_in_name}' + now + '.flv'
+                                    segment_suffix = "_%03d" if split_video_by_time else ""
+                                    filename = anchor_name + f'_{title_in_name}' + now + segment_suffix + '.flv'
                                     save_file_path = f'{full_path}/{filename}'
                                     print(f'{rec_info}/{filename}')
 
                                     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
                                     subs_thread_name = f'subs_{Path(subs_file_path).name}'
-                                    if create_time_file:
+                                    if create_time_file and not split_video_by_time:
                                         create_var[subs_thread_name] = threading.Thread(
                                             target=generate_subtitles, args=(record_name, subs_file_path)
                                         )
@@ -1502,7 +1556,8 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                             download_success = direct_download_stream(
                                                 flv_url, save_file_path, record_name, record_url, platform,
-                                                stop_event
+                                                stop_event,
+                                                split_time if split_video_by_time else None,
                                             )
 
                                             if download_success:
@@ -1698,19 +1753,6 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                                 stop_event,
                                             )
                                             if comment_end:
-                                                if converts_to_mp4:
-                                                    file_paths = utils.get_file_paths(os.path.dirname(save_file_path))
-                                                    prefix = os.path.basename(save_file_path).rsplit('_', maxsplit=1)[0]
-                                                    for path in file_paths:
-                                                        if prefix in path:
-                                                            try:
-                                                                postprocess_executor.submit(
-                                                                    converts_mp4,
-                                                                    path,
-                                                                    delete_origin_file,
-                                                                )
-                                                            except subprocess.CalledProcessError as e:
-                                                                logger.error(f"转码失败: {e} ")
                                                 return
 
                                         except subprocess.CalledProcessError as e:
@@ -1744,11 +1786,6 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                                 stop_event,
                                             )
                                             if comment_end:
-                                                postprocess_executor.submit(
-                                                    converts_mp4,
-                                                    save_file_path,
-                                                    delete_origin_file,
-                                                )
                                                 return
 
                                         except subprocess.CalledProcessError as e:

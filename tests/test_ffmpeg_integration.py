@@ -124,6 +124,78 @@ class FFmpegOutputIntegrationTests(unittest.TestCase):
     def test_segmented_m4a_part_publish_and_container(self):
         self.assert_format("M4A", expected_codec="aac", expected_container="mp4")
 
+    def test_direct_flv_stream_can_be_segmented_through_stdin(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "source.flv"
+            working_pattern = Path(temp_dir) / "record_%03d.flv.part"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=160x90:rate=25",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=1000:sample_rate=44100",
+                    "-t",
+                    "2.2",
+                    "-c:v",
+                    "flv1",
+                    "-g",
+                    "25",
+                    "-c:a",
+                    "aac",
+                    "-f",
+                    "flv",
+                    str(source_path),
+                ],
+                check=True,
+            )
+
+            process = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "flv",
+                    "-i",
+                    "pipe:0",
+                    "-map",
+                    "0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    "1",
+                    "-segment_format",
+                    "flv",
+                    "-reset_timestamps",
+                    "1",
+                    str(working_pattern),
+                ],
+                stdin=subprocess.PIPE,
+            )
+            process.communicate(input=source_path.read_bytes())
+
+            self.assertEqual(process.returncode, 0)
+            working_files = output_pipeline.get_working_output_files(str(working_pattern))
+            self.assertGreaterEqual(len(working_files), 2)
+
+            published = output_pipeline.publish_output_files(str(working_pattern))
+            self.assertEqual(len(published), len(working_files))
+            for published_file in map(Path, published):
+                self.assertIn("flv", self.probe(published_file)["format"]["format_name"])
+
 
 if __name__ == "__main__":
     unittest.main()
