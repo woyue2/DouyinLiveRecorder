@@ -516,7 +516,8 @@ def direct_download_stream(source_url: str, save_path: str, record_name: str, li
 
 def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
                      script_command: str | None = None, stop_event: threading.Event | None = None,
-                     final_save_file_path: str | None = None) -> bool:
+                     final_save_file_path: str | None = None,
+                     extra_working_paths: list[str] | None = None) -> bool:
     working_file_path = ffmpeg_command[-1]
     save_file_path = final_save_file_path or working_file_path
     actual_input_url = get_ffmpeg_input_url(ffmpeg_command)
@@ -561,6 +562,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     while process.poll() is None:
         if not should_convert_to_mp4:
             publish_completed_segments(working_file_path)
+            for extra_working in (extra_working_paths or []):
+                publish_completed_segments(extra_working)
         if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
             color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
@@ -607,6 +610,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     published_files.append(str(target_path))
         else:
             published_files = publish_output_files(working_file_path)
+            for extra_working in (extra_working_paths or []):
+                published_files.extend(publish_output_files(extra_working))
         script_output_path = save_file_path
         script_save_type = "MP4" if should_convert_to_mp4 else save_type
         if published_files:
@@ -617,7 +622,7 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             )
         status_text = "录制已安全停止" if stop_requested else "直播录制完成"
         print(f"\n{record_name} {stop_time} {status_text}\n")
-
+# 原自带是否执行脚本命令
         if script_command:
             logger.debug("开始执行脚本命令!")
             if "python" in script_command:
@@ -657,9 +662,19 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
 
 
 def run_recording_subprocess(record_name: str, record_url: str, ffmpeg_command: list, save_type: str,
-                             script_command: str | None, stop_event: threading.Event | None) -> bool:
+                             script_command: str | None, stop_event: threading.Event | None,
+                             extra_output_paths: list[str] | None = None) -> bool:
     final_save_file_path = ffmpeg_command[-1]
     ffmpeg_command[-1] = get_working_output_path(final_save_file_path)
+    # 额外输出路径(双输出场景)也需替换为 .part 临时文件,录制结束后由 check_subprocess 统一 publish
+    extra_working_paths: list[str] = []
+    for extra in (extra_output_paths or []):
+        working_extra = get_working_output_path(extra)
+        for i, arg in enumerate(ffmpeg_command):
+            if arg == extra:
+                ffmpeg_command[i] = working_extra
+                break
+        extra_working_paths.append(working_extra)
     return check_subprocess(
         record_name,
         record_url,
@@ -668,6 +683,7 @@ def run_recording_subprocess(record_name: str, record_url: str, ffmpeg_command: 
         script_command,
         stop_event=stop_event,
         final_save_file_path=final_save_file_path,
+        extra_working_paths=extra_working_paths or None,
     )
 
 
@@ -692,7 +708,19 @@ def get_quality_code(qn):
 
 
 def normalize_video_save_type(save_type):
-    return RecordFormat.normalize_optional(save_type)
+    """标准化录制格式字段,支持 | 分隔的多格式。
+
+    单格式时退化为原行为(返回 "TS"/"MP3" 等);
+    多格式时返回 "TS|MP3" 形式的字符串;空值或全部无效返回空串。
+    """
+    if not save_type:
+        return ""
+    parts: list[str] = []
+    for s in save_type.split("|"):
+        n = RecordFormat.normalize_optional(s)
+        if n and n not in parts:
+            parts.append(n)
+    return "|".join(parts)
 
 
 def contains_url(string):
@@ -1471,29 +1499,50 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                 if platform in only_audio_platform_list:
                                     only_audio_record = True
 
-                                record_format = requested_record_format
+                                # 多格式解析(| 分隔,目前仅支持 {TS, MP3} 组合为双输出)
+                                record_formats = RecordFormat.parse_multiple(
+                                    requested_save_type, video_save_type
+                                )
+                                format_names = {f.name for f in record_formats}
+                                is_ts_mp3_dual = format_names == {"TS", "MP3"}
+                                record_format = record_formats[0]
 
-                                if only_audio_record and not record_format.audio_only:
-                                    logger.warning(
-                                        f"{platform}仅支持音频录制，已将请求格式"
-                                        f"{record_format.name}回退为M4A"
-                                    )
-                                    record_format = RecordFormat.parse("M4A")
+                                # 平台回退(A 方案):强制走平台原生格式,忽略 TS+MP3 配置
+                                if only_audio_record:
+                                    if is_ts_mp3_dual or not record_format.audio_only:
+                                        requested_label = (
+                                            "|".join(format_names)
+                                            if is_ts_mp3_dual
+                                            else record_format.name
+                                        )
+                                        logger.warning(
+                                            f"{platform}仅支持音频录制，已将请求格式"
+                                            f"{requested_label}回退为M4A"
+                                        )
+                                        record_format = RecordFormat.parse("M4A")
+                                    is_ts_mp3_dual = False
 
-                                if is_flv_preferred_platform(record_url) and port_info.get('flv_url') and not record_format.audio_only:
+                                if (is_flv_preferred_platform(record_url)
+                                        and port_info.get('flv_url')
+                                        and not record_format.audio_only):
                                     codec = utils.get_query_params(port_info['flv_url'], "codec")
                                     if codec and codec[0] == 'h265':
-                                        logger.warning("FLV is not supported for h265 codec, use TS format instead")
+                                        logger.warning(
+                                            "FLV is not supported for h265 codec, use TS format instead"
+                                        )
+                                        is_ts_mp3_dual = False
                                         record_format = RecordFormat.parse("TS")
 
-                                record_save_type = record_format.name
+                                record_save_type = (
+                                    "TS|MP3" if is_ts_mp3_dual else record_format.name
+                                )
                                 recording_time_list[record_name] = [
                                     start_record_time,
                                     record_quality_zh,
                                     record_save_type,
                                 ]
 
-                                if record_format.audio_only:
+                                if record_format.audio_only and not is_ts_mp3_dual:
                                     try:
                                         now = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
                                         extension = record_format.extension
@@ -1571,7 +1620,66 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                     record_finished = True
 
-                                if only_flv_record:
+                                if is_ts_mp3_dual and not only_flv_record:
+                                    # TS + MP3 单进程双输出:源只拉一次,TS 流拷贝,MP3 重编码音频
+                                    base_name = f"{anchor_name}_{title_in_name}{now}"
+                                    if split_video_by_time:
+                                        ts_path = f"{full_path}/{base_name}_%03d.ts"
+                                        mp3_path = f"{full_path}/{base_name}_%03d.mp3"
+                                        ts_seg_opt = [
+                                            "-f", "segment",
+                                            "-segment_time", split_time,
+                                            "-segment_format", "mpegts",
+                                            "-reset_timestamps", "1",
+                                        ]
+                                        mp3_seg_opt = [
+                                            "-f", "segment",
+                                            "-segment_time", split_time,
+                                            "-segment_format", "mp3",
+                                            "-reset_timestamps", "1",
+                                        ]
+                                    else:
+                                        ts_path = f"{full_path}/{base_name}.ts"
+                                        mp3_path = f"{full_path}/{base_name}.mp3"
+                                        ts_seg_opt = ["-f", "mpegts"]
+                                        mp3_seg_opt = ["-f", "mp3"]
+
+                                    print(f'{rec_info}/{base_name}.ts + {base_name}.mp3')
+                                    # mp3 在前(额外输出),ts 在后(主输出,作为命令最后一个参数)
+                                    command = (
+                                        ["-map", "0:a",
+                                         "-c:a", "libmp3lame",
+                                         "-b:a", audio_bitrate]
+                                        + mp3_seg_opt + [mp3_path]
+                                        + ["-map", "0",
+                                           "-c:v", "copy",
+                                           "-c:a", "copy"]
+                                        + ts_seg_opt + [ts_path]
+                                    )
+                                    ffmpeg_command.extend(command)
+                                    try:
+                                        comment_end = run_recording_subprocess(
+                                            record_name,
+                                            record_url,
+                                            ffmpeg_command,
+                                            record_save_type,
+                                            custom_script,
+                                            stop_event,
+                                            extra_output_paths=[mp3_path],
+                                        )
+                                        if comment_end:
+                                            return
+                                    except subprocess.CalledProcessError as e:
+                                        logger.error(
+                                            f"错误信息: {e} 发生错误的行数: "
+                                            f"{e.__traceback__.tb_lineno}"
+                                        )
+                                        with max_request_lock:
+                                            error_count += 1
+                                            error_window.append(1)
+                                    record_finished = True
+
+                                elif only_flv_record:
                                     logger.info(f"Use Direct Downloader to Download FLV Stream: {record_url}")
                                     segment_suffix = "_%03d" if split_video_by_time else ""
                                     filename = anchor_name + f'_{title_in_name}' + now + segment_suffix + '.flv'
@@ -2240,8 +2348,10 @@ while True:
     picarto_cookie = read_config_value(config, 'Cookie', 'picarto_cookie', '')
 
     video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
-    if video_save_type and video_save_type.upper() in video_save_type_list:
-        video_save_type = video_save_type.upper()
+    # 支持 | 分隔的多格式(如 ts|MP3);单格式时退化为原白名单校验
+    normalized_multi = normalize_video_save_type(video_save_type)
+    if normalized_multi and ("|" in normalized_multi or normalized_multi in video_save_type_list):
+        video_save_type = normalized_multi
     else:
         video_save_type = "TS"
 

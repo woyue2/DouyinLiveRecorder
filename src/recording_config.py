@@ -52,6 +52,23 @@ class RecordFormat:
     def normalize_optional(cls, value: str) -> str:
         return _FORMAT_ALIASES.get((value or "").strip().upper(), "")
 
+    @classmethod
+    def parse_multiple(cls, value: str, default: str = "TS") -> list["RecordFormat"]:
+        """解析 | 分隔的多格式字符串,返回去重后的格式列表。
+
+        空值或全部无效时返回单个默认格式,保证向后兼容。
+        """
+        if not value or not value.strip():
+            return [cls.parse(default)]
+        seen: set[str] = set()
+        result: list[RecordFormat] = []
+        for part in value.split("|"):
+            normalized = _FORMAT_ALIASES.get(part.strip().upper())
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                result.append(cls.parse(normalized))
+        return result or [cls.parse(default)]
+
 
 @dataclass(frozen=True)
 class RecordingConfig:
