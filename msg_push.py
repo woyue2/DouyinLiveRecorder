@@ -10,6 +10,7 @@ Copyright (c) 2023-2024 by Hmily, All Rights Reserved.
 from typing import Dict, Any
 import json
 import base64
+import re
 import urllib.request
 import urllib.error
 import smtplib
@@ -22,11 +23,27 @@ opener = urllib.request.build_opener(no_proxy_handler)
 headers: Dict[str, str] = {'Content-Type': 'application/json'}
 
 
+def _safe_push_error(error: Exception, max_length: int = 200) -> str:
+    """Return a short diagnostic without exposing webhook URLs or credentials."""
+    message = str(error).replace('\r', ' ').replace('\n', ' ').strip()
+    message = re.sub(r'https?://[^\s]+', '[已隐藏URL]', message, flags=re.IGNORECASE)
+    message = re.sub(
+        r'(?i)\b(access_token|token|key|secret)=([^&\s,;]+)',
+        r'\1=[已隐藏]',
+        message,
+    )
+    if not message:
+        message = "无详细信息"
+    if len(message) > max_length:
+        message = message[:max_length - 3] + "..."
+    return f"{type(error).__name__}: {message}"
+
+
 def dingtalk(url: str, content: str, number: str = None, is_atall: bool = False) -> Dict[str, Any]:
     success = []
     error = []
     api_list = url.replace('，', ',').split(',') if url.strip() else []
-    for api in api_list:
+    for api_index, api in enumerate(api_list, start=1):
         json_data = {
             'msgtype': 'text',
             'text': {
@@ -49,10 +66,13 @@ def dingtalk(url: str, content: str, number: str = None, is_atall: bool = False)
                 success.append(api)
             else:
                 error.append(api)
-                print(f'钉钉推送失败, 推送地址：{api}, {json_data["errmsg"]}')
+                print(f'钉钉推送失败, 第{api_index}个推送地址, {json_data["errmsg"]}')
         except Exception as e:
             error.append(api)
-            print(f'钉钉推送失败, 推送地址：{api}, 错误信息:{e}')
+            print(
+                f'钉钉推送失败, 第{api_index}个推送地址, '
+                f'错误信息:{_safe_push_error(e)}'
+            )
     return {"success": success, "error": error}
 
 

@@ -35,6 +35,28 @@ class UploadScriptTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.script)
 
+    def test_sends_upload_lifecycle_notifications(self):
+        for message in (
+            "[直播录制] 开始上传",
+            "[直播录制] 上传成功",
+            "[直播录制] 上传失败",
+        ):
+            self.assertIn(message, self.script)
+        self.assertIn("文件：$pending_file_summary", self.script)
+
+    def test_notification_lists_at_most_ten_pending_files(self):
+        self.assertIn("pending_files=()", self.script)
+        self.assertIn('pending_files+=("${pending_file#./converted/}")', self.script)
+        self.assertIn("local max_display_count=10", self.script)
+        self.assertIn("...另有 ", self.script)
+
+    def test_notification_failure_does_not_fail_upload_task(self):
+        notification_function = self.script.split(
+            "notify_upload() {", maxsplit=1
+        )[1].split("\n}", maxsplit=1)[0]
+        self.assertIn('python3 "$SCRIPT_DIR/upload_notify.py"', notification_function)
+        self.assertIn("return 0", notification_function)
+
 
 if __name__ == "__main__":
     unittest.main()

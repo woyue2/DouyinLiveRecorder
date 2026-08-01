@@ -5,9 +5,47 @@ MY_EMAIL="你的邮箱@qq.com"  # TODO: 修改为你的邮箱
 DOWNLOAD_DIR="/home/ubuntu/DouyinLiveRecorder-main/downloads"
 LOG_FILE="/home/ubuntu/DouyinLiveRecorder-main/upload.log"
 LOCK_FILE="/tmp/douyin_live_recorder_upload.lock"
+SCRIPT_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &&
+    pwd
+)"
 
 log_message() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*"
+}
+
+notify_upload() {
+    local message="$1"
+
+    if python3 "$SCRIPT_DIR/upload_notify.py" "$message"; then
+        log_message "[通知成功] $message"
+    else
+        log_message "[通知失败] $message"
+    fi
+
+    # 通知属于尽力而为的附加功能，不能改变上传任务的结果
+    return 0
+}
+
+format_pending_files() {
+    local max_display_count=10
+    local display_count=${#pending_files[@]}
+    local file_summary=""
+    local index
+
+    if [ "$display_count" -gt "$max_display_count" ]; then
+        display_count=$max_display_count
+    fi
+
+    for ((index = 0; index < display_count; index++)); do
+        file_summary+=$'\n- '"${pending_files[$index]}"
+    done
+
+    if [ "${#pending_files[@]}" -gt "$max_display_count" ]; then
+        file_summary+=$'\n- ...另有 '"$((${#pending_files[@]} - max_display_count))"$' 个文件'
+    fi
+
+    printf '%s' "$file_summary"
 }
 
 # 使用内核文件锁保证定时任务不会重叠运行
@@ -87,9 +125,11 @@ log_message \
 
 # 单个排他任务同步整个待上传树，成功后统一清理
 pending_count=0
+pending_files=()
 if [ -d "./converted" ]; then
     while IFS= read -r -d '' pending_file; do
         pending_count=$((pending_count + 1))
+        pending_files+=("${pending_file#./converted/}")
         log_message "[待上传文件] $pending_file"
     done < <(find ./converted -type f \( \
         -name "*.ts" -o \
@@ -104,7 +144,11 @@ fi
 if [ "$pending_count" -eq 0 ]; then
     log_message "[本轮无待上传文件]"
 else
+    pending_file_summary="$(format_pending_files)"
     log_message "[开始上传] 共 $pending_count 个文件"
+    notify_upload \
+        "[直播录制] 开始上传，共 $pending_count 个文件
+文件：$pending_file_summary"
     if python3 -m bypy --retry 5 --timeout 120 -s 500M \
         syncup "./converted" "/live_audio" --on-dup overwrite 2>&1; then
         while IFS= read -r -d '' uploaded_file; do
@@ -112,6 +156,9 @@ else
         done < <(find ./converted -type f -print0)
         rm -rf -- "./converted"
         log_message "[上传完成] 已清理本轮 $pending_count 个待上传文件"
+        notify_upload \
+            "[直播录制] 上传成功，共 $pending_count 个文件
+文件：$pending_file_summary"
     else
         upload_return_code=$?
         log_message \
@@ -119,6 +166,9 @@ else
         while IFS= read -r -d '' retained_file; do
             log_message "[失败保留] $retained_file"
         done < <(find ./converted -type f -print0)
+        notify_upload \
+            "[直播录制] 上传失败，返回码 $upload_return_code；$pending_count 个文件已保留，稍后自动重试
+文件：$pending_file_summary"
     fi
 fi
 
