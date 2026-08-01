@@ -80,6 +80,9 @@ create_var = locals()
 first_start = True
 exit_recording = False
 need_update_line_list = []
+# need_update_line_list 中 "旧行|新行" 的内部字段分隔符,使用 ASCII Unit Separator
+# 避免与 TS|MP3 多格式的 | 分隔符冲突导致 URL_config 被错误替换
+_CONFIG_UPDATE_SEP = "\x1f"
 first_run = True
 not_record_list = []
 start_display_time = datetime.datetime.now()
@@ -1312,11 +1315,11 @@ def start_record(url_data: tuple, count_variable: int = -1,
                             save_type_suffix = f',{url_video_save_type}' if url_video_save_type else ''
                             if new_record_url:
                                 need_update_line_list.append(
-                                    f'{config_line}|{new_record_url},主播: {anchor_name.strip()}{save_type_suffix}')
+                                    f'{config_line}{_CONFIG_UPDATE_SEP}{new_record_url},主播: {anchor_name.strip()}{save_type_suffix}')
                                 not_record_list.append(new_record_url)
                             else:
                                 need_update_line_list.append(
-                                    f'{config_line}|{record_url},主播: {anchor_name.strip()}{save_type_suffix}')
+                                    f'{config_line}{_CONFIG_UPDATE_SEP}{record_url},主播: {anchor_name.strip()}{save_type_suffix}')
                             run_once = True
 
                         push_at = datetime.datetime.today().strftime('%Y-%m-%d %H:%M:%S')
@@ -2520,7 +2523,11 @@ while True:
 
         while len(need_update_line_list):
             a = need_update_line_list.pop()
-            replace_words = a.split('|')
+            replace_words = a.split(_CONFIG_UPDATE_SEP, maxsplit=1)
+            if len(replace_words) != 2:
+                logger.warning(
+                    f"URL_config 更新条目格式异常,已跳过: {a!r}")
+                continue
             if replace_words[0] != replace_words[1]:
                 if replace_words[1].startswith("#"):
                     start_with = '#'
