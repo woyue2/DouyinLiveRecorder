@@ -141,6 +141,40 @@ if [ -d "./converted" ]; then
     \) -print0)
 fi
 
+# bypy 在部分分片上传失败时退出码仍可能为 0（曾导致误删本地副本），
+# 所以成败不能只看退出码：还要检查输出中的失败标记，并在清理前逐目录核对远端文件大小。
+# 核对通过后才删除本地 ./converted，防止再次出现静默丢数据。
+verify_remote_sizes() {
+    local remote_root="/live_audio"
+    local list_output=""
+    local last_dir=""
+    local local_file rel remote_dir fname local_size remote_size
+    local ok=0
+
+    while IFS= read -r -d '' local_file; do
+        rel="${local_file#./converted/}"
+        remote_dir="$remote_root/$(dirname "$rel")"
+        fname="$(basename "$rel")"
+        local_size="$(stat -c %s "$local_file")"
+
+        if [ "$remote_dir" != "$last_dir" ]; then
+            last_dir="$remote_dir"
+            list_output="$(python3 -m bypy list "$remote_dir" 2>/dev/null)"
+        fi
+
+        remote_size="$(printf '%s\n' "$list_output" |
+            awk -v n="$fname" '$1=="F" && $2==n {print $3; exit}')"
+
+        if [ -z "$remote_size" ] || [ "$remote_size" != "$local_size" ]; then
+            log_message \
+                "[核对失败] $rel 远端缺失或大小不符 (本地=$local_size 远端=${remote_size:-缺失})"
+            ok=1
+        fi
+    done < <(find ./converted -type f -print0)
+
+    return "$ok"
+}
+
 if [ "$pending_count" -eq 0 ]; then
     log_message "[本轮无待上传文件]"
 else
@@ -149,8 +183,12 @@ else
     notify_upload \
         "[直播录制] 开始上传，共 $pending_count 个文件
 文件：$pending_file_summary"
-    if python3 -m bypy --retry 5 --timeout 120 -s 500M \
-        syncup "./converted" "/live_audio" --on-dup overwrite 2>&1; then
+    upload_log_tmp="$(mktemp)"
+    # 分片降到 20M：单个分片失败只需重传 20M，秒级失败，不再每次重传 500M 浪费约 18 分钟
+    if python3 -m bypy --retry 5 --timeout 120 -s 20M \
+        syncup "./converted" "/live_audio" --on-dup overwrite >"$upload_log_tmp" 2>&1 \
+        && ! grep -qE "Maximum number|Error [0-9]" "$upload_log_tmp" \
+        && verify_remote_sizes; then
         while IFS= read -r -d '' uploaded_file; do
             log_message "[上传成功] $uploaded_file"
         done < <(find ./converted -type f -print0)
@@ -170,6 +208,7 @@ else
             "[直播录制] 上传失败，返回码 $upload_return_code；$pending_count 个文件已保留，稍后自动重试
 文件：$pending_file_summary"
     fi
+    rm -f -- "$upload_log_tmp"
 fi
 
 # 清理空文件夹
