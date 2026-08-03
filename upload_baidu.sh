@@ -9,11 +9,11 @@
 DOWNLOAD_DIR="/home/ubuntu/DouyinLiveRecorder-main/downloads"
 LOCK_FILE="/tmp/douyin_live_recorder_upload.lock"
 REMOTE_ROOT="/live_audio"
-BYPY_SLICE_SIZE="1G"
+BYPY_SLICE_SIZE="1536M"
 BYPY_RETRY_COUNT=1
 BYPY_TIMEOUT=120
-# Files at or above this limit would enter bypy's currently denied tmpfile API.
-NORMAL_UPLOAD_LIMIT_BYTES=1073741824
+# Files at or above 1.5 GiB would enter bypy's currently denied tmpfile API.
+NORMAL_UPLOAD_LIMIT_BYTES=1610612736
 
 SCRIPT_DIR="$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &&
@@ -241,7 +241,7 @@ for ((index = 0; index < pending_count; index++)); do
     if [ "$local_size" -ge "$NORMAL_UPLOAD_LIMIT_BYTES" ]; then
         process_exit_code=2
         error_category="requires_denied_slice_api"
-        error_message="文件达到 1GiB，会进入已确认返回 31064 的 tmpfile 分片接口；已跳过并保留"
+        error_message="文件达到 1.5GiB，会进入已确认返回 31064 的 tmpfile 分片接口；已跳过并保留"
         printf '%s\n' "$error_message" >"$running_log"
     else
         python3 -m bypy -v \

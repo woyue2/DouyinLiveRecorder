@@ -10,8 +10,8 @@ class UploadScriptTests(unittest.TestCase):
         )
 
     def test_avoids_the_denied_slicing_path_for_current_files(self):
-        self.assertIn('BYPY_SLICE_SIZE="1G"', self.script)
-        self.assertIn("NORMAL_UPLOAD_LIMIT_BYTES=1073741824", self.script)
+        self.assertIn('BYPY_SLICE_SIZE="1536M"', self.script)
+        self.assertIn("NORMAL_UPLOAD_LIMIT_BYTES=1610612736", self.script)
         self.assertIn('if [ "$local_size" -ge "$NORMAL_UPLOAD_LIMIT_BYTES" ]', self.script)
 
     def test_uses_non_blocking_file_lock(self):
