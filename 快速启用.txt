@@ -1,11 +1,47 @@
-ubuntu 22
-1. python 3.11
-2. ffmpeg 的版本不能是6.1static,  目前使用的是 version 4.4.2
-是sudo apt update && sudo apt install ffmpeg安装的
-pgrep -af ffmpeg 可以看到使用的状态
-3. 然后启用nohup python main.py >
-nohup python3 main.py > output.log 2>&1 &
-4  pip install bypy #百度网盘连接 ，后面上传用
-5. crontab -e 运行 upload_baidu.sh 后台运行> 5分钟一次
+Ubuntu 22.04 快速启用
 
-优化MP3大小的话 格式改为 vbr质量模式 ，而不是320kb 128kb
+1. Python
+建议使用 Python 3.11。
+
+2. FFmpeg
+不要使用 6.1 static，目前使用 apt 安装的 FFmpeg 4.4.2：
+sudo apt update && sudo apt install ffmpeg
+
+查看正在运行的 FFmpeg：
+pgrep -af ffmpeg
+
+3. 启动录制主程序
+cd /home/ubuntu/DouyinLiveRecorder-main
+
+# 先确认没有重复运行的 main.py
+pgrep -af 'python3.*main.py'
+
+# -u 让日志及时写入；>> 追加日志，重启时不清空历史 output.log
+nohup python3 -u main.py >> output.log 2>&1 &
+
+# output.log 是录制主程序的人工日志
+tail -f /home/ubuntu/DouyinLiveRecorder-main/output.log
+
+4. 安装百度网盘客户端
+python3 -m pip install --user bypy
+
+5. 定时执行逐文件上传
+执行 crontab -e，加入以下内容（每 5 分钟运行一次）：
+*/5 * * * * /bin/bash /home/ubuntu/DouyinLiveRecorder-main/upload_baidu.sh >> /home/ubuntu/DouyinLiveRecorder-main/upload.log 2>&1
+
+上传日志用途：
+- upload.log：给人看的任务、队列、逐文件结果和钉钉通知汇总。
+- upload_logs/upload_history.sqlite3：完整的结构化永久记录。
+- upload_logs/ai_latest.json：给 AI 快速排查的最新报告。
+- upload_logs/ai_<run_id>.json：每轮永久 AI 报告。
+- upload_logs/bypy_*.success.log：永久成功原始明细。
+- upload_logs/bypy_*.failed.log：永久失败原始明细。
+
+查看上传人工日志：
+tail -f /home/ubuntu/DouyinLiveRecorder-main/upload.log
+
+输出最新 AI 报告：
+python3 /home/ubuntu/DouyinLiveRecorder-main/upload_log_db.py --db /home/ubuntu/DouyinLiveRecorder-main/upload_logs/upload_history.sqlite3 ai-report
+
+6. MP3 大小优化
+使用 VBR 质量模式，不使用固定 320kbps 或 128kbps。
