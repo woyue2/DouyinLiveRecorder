@@ -70,6 +70,10 @@ class UploadScriptTests(unittest.TestCase):
         self.assertIn("上传完成", self.script)
         self.assertIn("上传异常", self.script)
         self.assertIn("local max_display_count=10", self.script)
+        self.assertIn("待上传文件：${pending_summary}", self.script)
+        self.assertIn("成功文件：${success_summary}", self.script)
+        self.assertIn("失败文件：${failure_summary}", self.script)
+        self.assertIn('success_files+=("$relative_file")', self.script)
 
     def test_notification_failure_does_not_fail_upload_task(self):
         function = self.script.split("notify_upload() {", 1)[1].split("\n}", 1)[0]

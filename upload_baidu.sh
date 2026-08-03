@@ -49,20 +49,21 @@ notify_upload() {
     return 0
 }
 
-format_failure_files() {
+format_notification_files() {
     local max_display_count=10
-    local display_count=${#failed_files[@]}
+    local display_count=$#
     local result=""
     local index
+    local files=("$@")
 
     if [ "$display_count" -gt "$max_display_count" ]; then
         display_count=$max_display_count
     fi
     for ((index = 0; index < display_count; index++)); do
-        result+=$'\n- '"${failed_files[$index]}"
+        result+=$'\n- '"${files[$index]}"
     done
-    if [ "${#failed_files[@]}" -gt "$max_display_count" ]; then
-        result+=$'\n- ...另有 '"$((${#failed_files[@]} - max_display_count))"$' 个文件'
+    if [ "${#files[@]}" -gt "$max_display_count" ]; then
+        result+=$'\n- ...另有 '"$((${#files[@]} - max_display_count))"$' 个文件'
     fi
     printf '%s' "$result"
 }
@@ -192,6 +193,7 @@ fi
 
 success_count=0
 failed_count=0
+success_files=()
 failed_files=()
 
 if [ "$pending_count" -eq 0 ]; then
@@ -202,7 +204,9 @@ if [ "$pending_count" -eq 0 ]; then
 fi
 
 log_message "[上传队列] 文件=$pending_count 总字节=$pending_bytes 分片阈值=$BYPY_SLICE_SIZE"
-notify_upload "[直播录制] 开始逐文件上传：$pending_count 个文件，总计 $pending_bytes 字节"
+pending_summary="$(format_notification_files "${pending_relative_files[@]}")"
+notify_upload "[直播录制] 开始逐文件上传：$pending_count 个文件，总计 $pending_bytes 字节
+待上传文件：${pending_summary}"
 
 for ((index = 0; index < pending_count; index++)); do
     sequence=$((index + 1))
@@ -308,6 +312,7 @@ for ((index = 0; index < pending_count; index++)); do
         if rm -f -- "$local_file"; then
             mv -- "$running_log" "$success_log"
             success_count=$((success_count + 1))
+            success_files+=("$relative_file")
             elapsed=$(($(date +%s) - file_started_epoch))
             route_note="普通上传"
             [ "$rapidupload_fallback" -eq 1 ] && route_note="秒传失败后回退普通上传"
@@ -361,17 +366,26 @@ fi
 elapsed_total=$(($(date +%s) - RUN_STARTED_EPOCH))
 if [ "$failed_count" -eq 0 ]; then
     run_status="success"
+    success_summary="$(format_notification_files "${success_files[@]}")"
     log_message "[任务完成] 成功=$success_count 失败=0 耗时=${elapsed_total}s"
-    notify_upload "[直播录制] 上传完成：成功 $success_count，失败 0，耗时 ${elapsed_total}s"
+    notify_upload "[直播录制] 上传完成：成功 $success_count，失败 0，耗时 ${elapsed_total}s
+成功文件：${success_summary}"
 else
     if [ "$success_count" -gt 0 ]; then
         run_status="partial"
     else
         run_status="failed"
     fi
-    failure_summary="$(format_failure_files)"
+    failure_summary="$(format_notification_files "${failed_files[@]}")"
+    if [ "$success_count" -gt 0 ]; then
+        success_summary="$(format_notification_files "${success_files[@]}")"
+        success_section=$'\n成功文件：'"$success_summary"
+    else
+        success_section=$'\n成功文件：无'
+    fi
     log_message "[任务完成] 状态=$run_status 成功=$success_count 失败=$failed_count 耗时=${elapsed_total}s；失败文件均已保留"
-    notify_upload "[直播录制] 上传异常：成功 $success_count，失败 $failed_count，失败文件已保留${failure_summary}"
+    notify_upload "[直播录制] 上传异常：成功 $success_count，失败 $failed_count，失败文件已保留${success_section}
+失败文件：${failure_summary}"
 fi
 
 finish_run_record "$run_status"
