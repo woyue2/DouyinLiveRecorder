@@ -1,0 +1,17 @@
+Loading Hash Cache File '/home/ubuntu/.bypy/bypy.hashcache.json'...
+Hash Cache File loaded.
+<E> [22:00:03] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [22:00:03] Function: _get_file_info_act
+<E> [22:00:03] Website parameters: {'method': 'list', 'path': '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-05_21-57', 'by': 'name', 'order': 'asc', 'limit': '0-1000'}
+<E> [22:00:03] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=list&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%90%88%E5%AE%B6%E6%AC%A2%E4%B9%90%E4%B9%90%E4%B9%90%2F2026-08-05_21-57&by=name&order=asc&limit=0-1000&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [22:00:03] HTTP Response Status Code: 404
+<E> [22:00:03] Error JSON returned:{'error_code': 31066, 'error_msg': 'file does not exist', 'request_id': 419224654050950912}
+Error code: 31066
+Error Description: file does not exist
+<E> [22:00:03] Website returned: {"error_code":31066,"error_msg":"file does not exist","request_id":419224654050950912}
+'./converted/抖音直播/合家欢乐乐乐/2026-08-05_21-57/合家欢乐乐乐_2026-08-05_21-57-03_000.ts' ==> '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-05_21-57/合家欢乐乐乐_2026-08-05_21-57-03_000.ts' OK.
+Skip saving Hash Cache since it has not been updated.
+
+===== REMOTE SIZE VERIFICATION =====
+/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-05_21-57/合家欢乐乐乐_2026-08-05_21-57-03_000.ts ($s):
+232556
