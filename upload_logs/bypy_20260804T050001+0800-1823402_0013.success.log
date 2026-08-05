@@ -1,0 +1,18 @@
+Loading Hash Cache File '/home/ubuntu/.bypy/bypy.hashcache.json'...
+Hash Cache File loaded.
+<E> [06:01:57] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [06:01:57] Function: _rapidupload_file_act
+<E> [06:01:57] Website parameters: {'method': 'rapidupload', 'path': '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_004.ts', 'content-length': 1057283612, 'content-md5': '744db449bva4ae2fcf8ac84eddbbaa5e', 'slice-md5': '94fdfa9051a524dbac218edc03b8b38c', 'content-crc32': '0x599340b5', 'ondup': 'overwrite'}
+<E> [06:01:57] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=rapidupload&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%90%88%E5%AE%B6%E6%AC%A2%E4%B9%90%E4%B9%90%E4%B9%90%2F2026-08-03_23-50%2F%E5%90%88%E5%AE%B6%E6%AC%A2%E4%B9%90%E4%B9%90%E4%B9%90_2026-08-03_23-50-17_004.ts&content-length=1057283612&content-md5=744db449bva4ae2fcf8ac84eddbbaa5e&slice-md5=94fdfa9051a524dbac218edc03b8b38c&content-crc32=0x599340b5&ondup=overwrite&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [06:01:57] HTTP Response Status Code: 400
+<E> [06:01:57] Error JSON returned:{'error_code': 31023, 'error_msg': 'param error', 'request_id': 380600654633294166}
+Error code: 31023
+Error Description: param error
+<E> [06:01:57] Website returned: {"error_code":31023,"error_msg":"param error","request_id":380600654633294166}
+'./converted/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_004.ts' ==> '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_004.ts' OK.
+Saving Hash Cache...
+Hash Cache saved.
+
+===== REMOTE SIZE VERIFICATION =====
+/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_004.ts ($s):
+1057283612

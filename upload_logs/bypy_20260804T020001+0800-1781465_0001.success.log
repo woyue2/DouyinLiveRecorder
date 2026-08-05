@@ -1,0 +1,27 @@
+Loading Hash Cache File '/home/ubuntu/.bypy/bypy.hashcache.json'...
+Hash Cache File loaded.
+<E> [02:00:03] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [02:00:03] Function: _get_file_info_act
+<E> [02:00:03] Website parameters: {'method': 'list', 'path': '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50', 'by': 'name', 'order': 'asc', 'limit': '0-1000'}
+<E> [02:00:03] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=list&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%90%88%E5%AE%B6%E6%AC%A2%E4%B9%90%E4%B9%90%E4%B9%90%2F2026-08-03_23-50&by=name&order=asc&limit=0-1000&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [02:00:03] HTTP Response Status Code: 404
+<E> [02:00:03] Error JSON returned:{'error_code': 31066, 'error_msg': 'file does not exist', 'request_id': 376704524436468429}
+Error code: 31066
+Error Description: file does not exist
+<E> [02:00:03] Website returned: {"error_code":31066,"error_msg":"file does not exist","request_id":376704524436468429}
+<E> [02:00:14] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [02:00:14] Function: _rapidupload_file_act
+<E> [02:00:14] Website parameters: {'method': 'rapidupload', 'path': '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_000.ts', 'content-length': 1221973680, 'content-md5': 'b096c8703r303f185ea2948415400c42', 'slice-md5': '04cb4b264df97013ac1e0e2d04e079d3', 'content-crc32': '0xbe6386d4', 'ondup': 'overwrite'}
+<E> [02:00:14] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=rapidupload&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%90%88%E5%AE%B6%E6%AC%A2%E4%B9%90%E4%B9%90%E4%B9%90%2F2026-08-03_23-50%2F%E5%90%88%E5%AE%B6%E6%AC%A2%E4%B9%90%E4%B9%90%E4%B9%90_2026-08-03_23-50-17_000.ts&content-length=1221973680&content-md5=b096c8703r303f185ea2948415400c42&slice-md5=04cb4b264df97013ac1e0e2d04e079d3&content-crc32=0xbe6386d4&ondup=overwrite&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [02:00:14] HTTP Response Status Code: 400
+<E> [02:00:14] Error JSON returned:{'error_code': 31023, 'error_msg': 'param error', 'request_id': 376707566460201519}
+Error code: 31023
+Error Description: param error
+<E> [02:00:14] Website returned: {"error_code":31023,"error_msg":"param error","request_id":376707566460201519}
+'./converted/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_000.ts' ==> '/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_000.ts' OK.
+Saving Hash Cache...
+Hash Cache saved.
+
+===== REMOTE SIZE VERIFICATION =====
+/apps/bypy/live_audio/抖音直播/合家欢乐乐乐/2026-08-03_23-50/合家欢乐乐乐_2026-08-03_23-50-17_000.ts ($s):
+1221973680

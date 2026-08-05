@@ -24,11 +24,9 @@ def write_ffmpeg_log_header(
     log_file: TextIO,
     record_name: str,
     command: list[str],
-    input_url: str | None = None,
 ) -> None:
-    input_url = input_url or get_ffmpeg_input_url(command)
     log_file.write(f"record_name: {record_name}\n")
-    log_file.write(f"input_url: {input_url}\n")
+    log_file.write(f"input_url: {get_ffmpeg_input_url(command)}\n")
     log_file.write(
         "command_json: "
         + json.dumps(command, ensure_ascii=False)
@@ -58,4 +56,3 @@ def describe_return_code(return_code: int | None) -> str:
     except ValueError:
         signal_name = "UNKNOWN"
     return f"{return_code} (signal {signal_number}: {signal_name})"
-

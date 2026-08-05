@@ -1,0 +1,27 @@
+Loading Hash Cache File '/home/ubuntu/.bypy/bypy.hashcache.json'...
+Hash Cache File loaded.
+<E> [23:40:03] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [23:40:03] Function: _get_file_info_act
+<E> [23:40:03] Website parameters: {'method': 'list', 'path': '/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-04_23-07', 'by': 'name', 'order': 'asc', 'limit': '0-1000'}
+<E> [23:40:03] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=list&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%88%9D%E6%81%8B%E5%B0%8F%E5%A8%9C%2F2026-08-04_23-07&by=name&order=asc&limit=0-1000&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [23:40:03] HTTP Response Status Code: 404
+<E> [23:40:03] Error JSON returned:{'error_code': 31066, 'error_msg': 'file does not exist', 'request_id': 397642469589115559}
+Error code: 31066
+Error Description: file does not exist
+<E> [23:40:03] Website returned: {"error_code":31066,"error_msg":"file does not exist","request_id":397642469589115559}
+<E> [23:40:03] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [23:40:03] Function: _rapidupload_file_act
+<E> [23:40:03] Website parameters: {'method': 'rapidupload', 'path': '/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-04_23-07/初恋小娜_2026-08-04_23-07-08_000.mp3', 'content-length': 21601941, 'content-md5': '1f00b3f9bg56b8c8173164be4030885e', 'slice-md5': 'e252f7d33136aef350cccb6f7900d89c', 'content-crc32': '0xef7a849b', 'ondup': 'overwrite'}
+<E> [23:40:03] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=rapidupload&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%88%9D%E6%81%8B%E5%B0%8F%E5%A8%9C%2F2026-08-04_23-07%2F%E5%88%9D%E6%81%8B%E5%B0%8F%E5%A8%9C_2026-08-04_23-07-08_000.mp3&content-length=21601941&content-md5=1f00b3f9bg56b8c8173164be4030885e&slice-md5=e252f7d33136aef350cccb6f7900d89c&content-crc32=0xef7a849b&ondup=overwrite&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [23:40:03] HTTP Response Status Code: 400
+<E> [23:40:03] Error JSON returned:{'error_code': 31023, 'error_msg': 'param error', 'request_id': 397642653846168310}
+Error code: 31023
+Error Description: param error
+<E> [23:40:03] Website returned: {"error_code":31023,"error_msg":"param error","request_id":397642653846168310}
+'./converted/抖音直播/初恋小娜/2026-08-04_23-07/初恋小娜_2026-08-04_23-07-08_000.mp3' ==> '/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-04_23-07/初恋小娜_2026-08-04_23-07-08_000.mp3' OK.
+Saving Hash Cache...
+Hash Cache saved.
+
+===== REMOTE SIZE VERIFICATION =====
+/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-04_23-07/初恋小娜_2026-08-04_23-07-08_000.mp3 ($s):
+21601941

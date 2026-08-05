@@ -1,0 +1,18 @@
+Loading Hash Cache File '/home/ubuntu/.bypy/bypy.hashcache.json'...
+Hash Cache File loaded.
+<E> [21:40:02] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [21:40:02] Function: _rapidupload_file_act
+<E> [21:40:02] Website parameters: {'method': 'rapidupload', 'path': '/apps/bypy/live_audio/抖音直播/袁大帅哥布林族长/2026-08-04_20-01/袁大帅哥布林族长_2026-08-04_20-01-24_002.mp3', 'content-length': 21602128, 'content-md5': 'fedf989c4m9698552656086ab9557a1a', 'slice-md5': 'ca8320414ecdf08c2a2ac5fc66ccae82', 'content-crc32': '0x96d79394', 'ondup': 'overwrite'}
+<E> [21:40:02] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=rapidupload&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E8%A2%81%E5%A4%A7%E5%B8%85%E5%93%A5%E5%B8%83%E6%9E%97%E6%97%8F%E9%95%BF%2F2026-08-04_20-01%2F%E8%A2%81%E5%A4%A7%E5%B8%85%E5%93%A5%E5%B8%83%E6%9E%97%E6%97%8F%E9%95%BF_2026-08-04_20-01-24_002.mp3&content-length=21602128&content-md5=fedf989c4m9698552656086ab9557a1a&slice-md5=ca8320414ecdf08c2a2ac5fc66ccae82&content-crc32=0x96d79394&ondup=overwrite&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [21:40:02] HTTP Response Status Code: 400
+<E> [21:40:02] Error JSON returned:{'error_code': 31023, 'error_msg': 'param error', 'request_id': 395709714124052046}
+Error code: 31023
+Error Description: param error
+<E> [21:40:02] Website returned: {"error_code":31023,"error_msg":"param error","request_id":395709714124052046}
+'./converted/抖音直播/袁大帅哥布林族长/2026-08-04_20-01/袁大帅哥布林族长_2026-08-04_20-01-24_002.mp3' ==> '/apps/bypy/live_audio/抖音直播/袁大帅哥布林族长/2026-08-04_20-01/袁大帅哥布林族长_2026-08-04_20-01-24_002.mp3' OK.
+Saving Hash Cache...
+Hash Cache saved.
+
+===== REMOTE SIZE VERIFICATION =====
+/apps/bypy/live_audio/抖音直播/袁大帅哥布林族长/2026-08-04_20-01/袁大帅哥布林族长_2026-08-04_20-01-24_002.mp3 ($s):
+21602128

@@ -1,0 +1,17 @@
+Loading Hash Cache File '/home/ubuntu/.bypy/bypy.hashcache.json'...
+Hash Cache File loaded.
+<E> [10:52:14] Error accessing 'https://pcs.baidu.com/rest/2.0/pcs/file'
+<E> [10:52:14] Function: _rapidupload_file_act
+<E> [10:52:14] Website parameters: {'method': 'rapidupload', 'path': '/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-02_22-09/初恋小娜_2026-08-02_22-09-03_000.ts', 'content-length': 410501948, 'content-md5': 'c0dc2ba94g261a228aaba7cc803b269e', 'slice-md5': '2d1c78ee3c14db8aa66b02160c6bf3d0', 'content-crc32': '0x95578b00', 'ondup': 'overwrite'}
+<E> [10:52:14] Full URL: https://pcs.baidu.com/rest/2.0/pcs/file?method=rapidupload&path=%2Fapps%2Fbypy%2Flive_audio%2F%E6%8A%96%E9%9F%B3%E7%9B%B4%E6%92%AD%2F%E5%88%9D%E6%81%8B%E5%B0%8F%E5%A8%9C%2F2026-08-02_22-09%2F%E5%88%9D%E6%81%8B%E5%B0%8F%E5%A8%9C_2026-08-02_22-09-03_000.ts&content-length=410501948&content-md5=c0dc2ba94g261a228aaba7cc803b269e&slice-md5=2d1c78ee3c14db8aa66b02160c6bf3d0&content-crc32=0x95578b00&ondup=overwrite&access_token=121.d403970e490643084cf5224da8cdb0f2.YmjUg0li9919F7wU_5t3TOCy8c_4qXnj146-VTS.3TvMbw
+<E> [10:52:14] HTTP Response Status Code: 400
+<E> [10:52:14] Error JSON returned:{'error_code': 31023, 'error_msg': 'param error', 'request_id': 362083112983426358}
+Error code: 31023
+Error Description: param error
+<E> [10:52:14] Website returned: {"error_code":31023,"error_msg":"param error","request_id":362083112983426358}
+'./converted/抖音直播/初恋小娜/2026-08-02_22-09/初恋小娜_2026-08-02_22-09-03_000.ts' ==> '/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-02_22-09/初恋小娜_2026-08-02_22-09-03_000.ts' OK.
+Skip saving Hash Cache since it has not been updated.
+
+===== REMOTE SIZE VERIFICATION =====
+/apps/bypy/live_audio/抖音直播/初恋小娜/2026-08-02_22-09/初恋小娜_2026-08-02_22-09-03_000.ts ($s):
+410501948
