@@ -86,7 +86,6 @@ ipython_config.py
 
 # DouyinLiveRecord
 backup_config/
-logs/
 node/
 node-v*.zip
 
