@@ -35,6 +35,7 @@ class FFmpegCommandOptionsTests(unittest.TestCase):
         input_index = command.index("-i")
         for option in (
             "-reconnect",
+            "-reconnect_at_eof",
             "-reconnect_streamed",
         ):
             option_index = command.index(option)
@@ -42,7 +43,6 @@ class FFmpegCommandOptionsTests(unittest.TestCase):
             self.assertEqual(command[option_index + 1], "1")
 
         self.assertLess(command.index("-reconnect_delay_max"), input_index)
-        self.assertNotIn("-reconnect_at_eof", command)
         self.assertNotIn("-correct_ts_overflow", command)
 
 
