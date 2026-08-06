@@ -462,6 +462,56 @@ def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
         logger.error(f"转写通知发送失败 {mp3_name}: {e}")
 
 
+_TRANSCRIBE_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus")
+
+
+def is_transcribable_audio(file_path: str) -> bool:
+    """判断文件是否为可转写音频（mp3/wav/m4a 等纯音频格式）。"""
+    return Path(file_path).suffix.lower() in _TRANSCRIBE_AUDIO_EXTS
+
+
+def save_type_produces_audio(save_type: str) -> bool:
+    """保存格式是否包含纯音频输出（MP3/M4A 等），用于决定是否触发转写。"""
+    return any(record_format.audio_only for record_format in RecordFormat.parse_multiple(save_type))
+
+
+def submit_transcribe(published_files: list, record_name: str) -> None:
+    """将已发布的音频文件逐个提交转写。submit 前同步创建 .transcribing 占位，
+    防止 upload_baidu.sh 在转写排队时抢先上传删除音频。"""
+    for published in published_files:
+        if not is_transcribable_audio(published):
+            continue
+        placeholder = published + ".transcribing"
+        if os.path.exists(placeholder):
+            continue
+        try:
+            Path(placeholder).touch()
+            transcribe_executor.submit(transcribe_and_notify, published, record_name)
+        except OSError as e:
+            logger.warning(f"创建转写占位失败 {placeholder}: {e}")
+
+
+def cleanup_stale_transcribe_placeholders(save_root: str) -> None:
+    """启动时清理残留的 *.transcribing 占位文件，避免程序崩溃后对应音频被永久跳过上传。"""
+    removed = 0
+    try:
+        for root, _dirs, files in os.walk(save_root):
+            for name in files:
+                if not name.endswith(".transcribing"):
+                    continue
+                placeholder = os.path.join(root, name)
+                try:
+                    os.remove(placeholder)
+                    removed += 1
+                    logger.info(f"清理残留转写占位文件: {placeholder}")
+                except OSError as e:
+                    logger.warning(f"清理转写占位失败 {placeholder}: {e}")
+    except Exception as e:
+        logger.error(f"清理转写占位文件异常: {e}")
+    if removed:
+        logger.info(f"共清理 {removed} 个残留转写占位文件")
+
+
 def clear_record_info(record_name: str, record_url: str) -> None:
     global monitoring
     recording.discard(record_name)
@@ -601,6 +651,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     )
     ffmpeg_output_thread.start()
     should_convert_to_mp4 = converts_to_mp4 and save_type in {"TS", "FLV"}
+    # 该 URL 登记了"转MD"且保存格式含纯音频输出(MP3/M4A/WAV 等)→ 每个分段完成后即触发转写
+    should_transcribe = record_url in transcribe_urls and save_type_produces_audio(save_type)
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
     subs_thread_name = f'subs_{Path(subs_file_path).name}'
@@ -614,9 +666,11 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     stop_requested = False
     while process.poll() is None:
         if not should_convert_to_mp4:
-            publish_completed_segments(working_file_path)
+            completed_segments = publish_completed_segments(working_file_path)
             for extra_working in (extra_working_paths or []):
-                publish_completed_segments(extra_working)
+                completed_segments.extend(publish_completed_segments(extra_working))
+            if should_transcribe:
+                submit_transcribe(completed_segments, record_name)
         if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
             color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
@@ -675,17 +729,9 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             )
         status_text = "录制已安全停止" if stop_requested else "直播录制完成"
         print(f"\n{record_name} {stop_time} {status_text}\n")
-        # 转写触发：该 URL 登记了"转MD"且本次为 MP3 录制 → 异步转写
-        # 先同步创建占位文件，防止 upload_baidu.sh 在转写排队时抢先上传删除 mp3
-        if record_url in transcribe_urls and "MP3" in (save_type or ""):
-            for published in published_files:
-                if published.lower().endswith(".mp3"):
-                    placeholder = published + ".transcribing"
-                    try:
-                        Path(placeholder).touch()
-                        transcribe_executor.submit(transcribe_and_notify, published, record_name)
-                    except OSError as e:
-                        logger.warning(f"创建转写占位失败 {placeholder}: {e}")
+        # 转写触发：录制结束时最后一段(.part)发布后统一提交转写
+        if should_transcribe:
+            submit_transcribe(published_files, record_name)
 # 原自带是否执行脚本命令
         if script_command:
             logger.debug("开始执行脚本命令!")
@@ -1527,6 +1573,7 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                     "-fflags", "+discardcorrupt",
                                     "-reconnect", "1",
                                     "-reconnect_streamed", "1",
+                                    "-reconnect_at_eof", "1",
                                     "-reconnect_delay_max", "60",
                                     "-re", "-i", real_url,
                                     "-bufsize", bufsize,
@@ -2616,6 +2663,7 @@ while True:
         logger.error(f"错误信息: {err} 发生错误的行数: {err.__traceback__.tb_lineno}")
 
     if first_run:
+        cleanup_stale_transcribe_placeholders(video_save_path or default_path)
         t = threading.Thread(target=display_info, args=(), daemon=True)
         t.start()
         t2 = threading.Thread(target=adjust_max_request, args=(), daemon=True)
