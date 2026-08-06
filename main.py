@@ -78,6 +78,10 @@ running_list = []
 recording_tasks = {}
 recording_tasks_lock = threading.Lock()
 postprocess_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="postprocess")
+# 转写专用单线程池：避免与 mp4 转换争抢线程，且防止并发两个 SenseVoice 撑爆 2G 内存
+transcribe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcribe")
+# 需要转写为 md 的直播 URL 集合，由 URL_config.ini 第4列"转MD"在配置加载时登记
+transcribe_urls: set[str] = set()
 url_tuples_list = []
 url_comments = []
 text_no_repeat_url = []
@@ -417,6 +421,47 @@ def run_script(command: str) -> None:
         logger.error('Please add `#!/bin/bash` at the beginning of your bash script file.')
 
 
+# 转写封装脚本路径（从 config.ini [录制设置] mp3转写md脚本路径 读取）：mp3→txt→md 一体化
+transcribe_script = ""
+
+
+def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
+    """异步转写 mp3→md 并发通知。调用方需在 submit 前同步创建占位文件
+    xxx.mp3.transcribing 防止 cron 抢先上传删除 mp3；本函数结束时（成败都）删除占位。"""
+    placeholder = mp3_path + ".transcribing"
+    mp3_name = Path(mp3_path).name
+    if not transcribe_script:
+        logger.error(f"转写跳过 {mp3_name}：未配置 config.ini [录制设置] mp3转写md脚本路径")
+        try:
+            if os.path.exists(placeholder):
+                os.remove(placeholder)
+        except OSError:
+            pass
+        return
+    try:
+        result = subprocess.run(
+            ["bash", transcribe_script, mp3_path],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if result.returncode == 0:
+            content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
+        else:
+            err = (result.stderr or f"退出码 {result.returncode}").strip()[:200]
+            content = f"[直播转写] {record_name} 转写失败：{mp3_name} 错误：{err}"
+    except Exception as e:
+        content = f"[直播转写] {record_name} 转写异常：{mp3_name} {type(e).__name__}: {e}"
+    finally:
+        try:
+            if os.path.exists(placeholder):
+                os.remove(placeholder)
+        except OSError:
+            pass
+    try:
+        push_message(record_name, "", content)
+    except Exception as e:
+        logger.error(f"转写通知发送失败 {mp3_name}: {e}")
+
+
 def clear_record_info(record_name: str, record_url: str) -> None:
     global monitoring
     recording.discard(record_name)
@@ -630,6 +675,17 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             )
         status_text = "录制已安全停止" if stop_requested else "直播录制完成"
         print(f"\n{record_name} {stop_time} {status_text}\n")
+        # 转写触发：该 URL 登记了"转MD"且本次为 MP3 录制 → 异步转写
+        # 先同步创建占位文件，防止 upload_baidu.sh 在转写排队时抢先上传删除 mp3
+        if record_url in transcribe_urls and "MP3" in (save_type or ""):
+            for published in published_files:
+                if published.lower().endswith(".mp3"):
+                    placeholder = published + ".transcribing"
+                    try:
+                        Path(placeholder).touch()
+                        transcribe_executor.submit(transcribe_and_notify, published, record_name)
+                    except OSError as e:
+                        logger.warning(f"创建转写占位失败 {placeholder}: {e}")
 # 原自带是否执行脚本命令
         if script_command:
             logger.debug("开始执行脚本命令!")
@@ -745,6 +801,7 @@ def parse_url_config_line(line, default_quality):
         split_line = [line, '']
 
     split_line = [i.strip() for i in split_line]
+    transcribe_flag = ''
 
     if len(split_line) == 1:
         url = split_line[0]
@@ -764,14 +821,16 @@ def parse_url_config_line(line, default_quality):
         if contains_url(split_line[0]):
             quality = default_quality
             url, name, save_type = split_line[0], split_line[1], split_line[2]
+            transcribe_flag = split_line[3] if len(split_line) > 3 else ''
         else:
             quality, url, name = split_line[:3]
             save_type = split_line[3] if len(split_line) > 3 else ''
+            transcribe_flag = split_line[4] if len(split_line) > 4 else ''
 
     normalized_save_type = normalize_video_save_type(save_type)
     if save_type and not normalized_save_type:
         logger.warning(f"URL配置中的录制格式无效，将使用全局默认值: {save_type}")
-    return quality, url, name, normalized_save_type
+    return quality, url, name, normalized_save_type, transcribe_flag
 
 
 def get_record_headers(platform, live_url):
@@ -2255,6 +2314,7 @@ while True:
     create_time_file = options.get(read_config_value(config, '录制设置', '生成时间字幕文件', "否"), False)
     is_run_script = options.get(read_config_value(config, '录制设置', '是否录制完成后执行自定义脚本', "否"), False)
     custom_script = read_config_value(config, '录制设置', '自定义脚本执行命令', "") if is_run_script else None
+    transcribe_script = read_config_value(config, '录制设置', 'mp3转写md脚本路径', "").strip()
     enable_proxy_platform = read_config_value(
         config, '录制设置', '使用代理录制的平台(逗号分隔)',
         'tiktok, soop, pandalive, winktv, flextv, popkontv, twitch, liveme, showroom, chzzk, shopee, shp, youtu, faceit'
@@ -2394,7 +2454,9 @@ while True:
                 if is_comment_line:
                     line = line.lstrip('#')
 
-                quality, url, name, save_type = parse_url_config_line(line, video_record_quality)
+                quality, url, name, save_type, transcribe_flag = parse_url_config_line(line, video_record_quality)
+                if transcribe_flag == '转MD' and url and url not in transcribe_urls:
+                    transcribe_urls.add(url)
 
                 if quality not in ("原画", "蓝光", "超清", "高清", "标清", "流畅"):
                     quality = '原画'

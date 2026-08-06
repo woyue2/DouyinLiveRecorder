@@ -126,6 +126,11 @@ while IFS= read -r -d '' file; do
         continue
     fi
 
+    # 转写占位：mp3 正在被转写（main.py 创建 .transcribing），跳过避免抢先上传删除
+    if [ -e "${file}.transcribing" ]; then
+        continue
+    fi
+
     file_dir="$(dirname "$file")"
     target_dir="./converted/${file_dir#./}"
     target_file="$target_dir/$(basename "$file")"
@@ -145,7 +150,7 @@ while IFS= read -r -d '' file; do
     fi
 done < <(find . -path ./converted -prune -o -type f \( \
     -name "*.ts" -o -name "*.mkv" -o -name "*.flv" -o \
-    -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" \
+    -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.md" \
 \) -print0)
 
 log_message "[扫描汇总] 发现=$found_count 暂存=$staged_count 占用跳过=$occupied_count 暂存失败=$failed_stage_count"
@@ -164,7 +169,7 @@ if [ -d ./converted ]; then
         pending_bytes=$((pending_bytes + file_size))
     done < <(find ./converted -type f \( \
         -name "*.ts" -o -name "*.mkv" -o -name "*.flv" -o \
-        -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" \
+        -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.md" \
     \) -print0 | sort -z)
 fi
 
