@@ -23,6 +23,7 @@ publish_completed_segments = output_pipeline.publish_completed_segments
 RecordFormat = recording_config.RecordFormat
 RecordingConfig = recording_config.RecordingConfig
 normalize_audio_bitrate = recording_config.normalize_audio_bitrate
+formats_prefer_hls = recording_config.formats_prefer_hls
 
 
 class RecordFormatTests(unittest.TestCase):
@@ -33,6 +34,21 @@ class RecordFormatTests(unittest.TestCase):
 
     def test_invalid_value_falls_back_to_default(self):
         self.assertEqual(RecordFormat.parse("unknown", "MP4").name, "MP4")
+
+    def test_multiple_formats_are_split_and_canonicalized(self):
+        formats = RecordFormat.parse_multiple("ts|MP3|ts", "mp3音频")
+
+        self.assertEqual([record_format.name for record_format in formats], ["TS", "MP3"])
+
+    def test_ts_mp3_prefers_hls_even_when_global_default_is_mp3(self):
+        formats = RecordFormat.parse_multiple("TS|MP3", "mp3音频")
+
+        self.assertTrue(formats_prefer_hls(formats))
+
+    def test_audio_only_format_does_not_prefer_hls(self):
+        formats = RecordFormat.parse_multiple("MP3", "TS")
+
+        self.assertFalse(formats_prefer_hls(formats))
 
     def test_recording_config_fingerprint_tracks_format_changes(self):
         before = RecordingConfig("原画", "https://example.com/live", "anchor", "MP4", "line")

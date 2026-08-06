@@ -43,7 +43,12 @@ from src.ffmpeg_diagnostics import (
     get_ffmpeg_log_path,
     write_ffmpeg_log_header,
 )
-from src.recording_config import RecordFormat, RecordingConfig, normalize_audio_bitrate
+from src.recording_config import (
+    RecordFormat,
+    RecordingConfig,
+    formats_prefer_hls,
+    normalize_audio_bitrate,
+)
 from src.stream_selection import is_flv_preferred_platform, select_source_url
 from src.proxy import ProxyDetector
 from src.utils import logger
@@ -1366,11 +1371,12 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                 continue
 
                             requested_save_type = url_video_save_type or video_save_type
-                            requested_record_format = RecordFormat.parse(
+                            record_formats = RecordFormat.parse_multiple(
                                 requested_save_type,
                                 video_save_type,
                             )
-                            prefer_hls = requested_record_format.name in {"TS", "MP4"}
+                            format_names = {record_format.name for record_format in record_formats}
+                            prefer_hls = formats_prefer_hls(record_formats)
                             real_url = select_source_url(
                                 record_url,
                                 port_info,
@@ -1379,7 +1385,8 @@ def start_record(url_data: tuple, count_variable: int = -1,
                             if prefer_hls and real_url == port_info.get("m3u8_url"):
                                 logger.debug(
                                     f"{platform}使用HLS源录制"
-                                    f"{requested_record_format.name}，避免FLV输入兼容性问题"
+                                    f"{'|'.join(record_format.name for record_format in record_formats)}，"
+                                    "避免FLV输入兼容性问题"
                                 )
                             full_path = f'{default_path}/{platform}'
                             if real_url:
@@ -1502,11 +1509,7 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                 if platform in only_audio_platform_list:
                                     only_audio_record = True
 
-                                # 多格式解析(| 分隔,目前仅支持 {TS, MP3} 组合为双输出)
-                                record_formats = RecordFormat.parse_multiple(
-                                    requested_save_type, video_save_type
-                                )
-                                format_names = {f.name for f in record_formats}
+                                # 复用直播源选择前的解析结果；目前仅支持 {TS, MP3} 组合为双输出
                                 is_ts_mp3_dual = format_names == {"TS", "MP3"}
                                 record_format = record_formats[0]
 

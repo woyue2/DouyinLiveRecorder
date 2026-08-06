@@ -70,6 +70,11 @@ class RecordFormat:
         return result or [cls.parse(default)]
 
 
+def formats_prefer_hls(formats: list[RecordFormat]) -> bool:
+    """包含 TS/MP4 视频输出时优先选择 HLS 直播源。"""
+    return any(record_format.name in {"TS", "MP4"} for record_format in formats)
+
+
 @dataclass(frozen=True)
 class RecordingConfig:
     quality: str
