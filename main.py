@@ -444,9 +444,13 @@ def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
             capture_output=True, text=True, timeout=3600,
         )
         if result.returncode == 0:
-            content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
+            if "SENSITIVE_RAW" in result.stdout:
+                content = (f"[直播转写] {record_name} 转写完成（审核拦截，已用原始文本生成"
+                           f" -敏感.md）：{mp3_name}，md 已生成待上传")
+            else:
+                content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
         else:
-            err = (result.stderr or f"退出码 {result.returncode}").strip()[:200]
+            err = (result.stderr or result.stdout or f"退出码 {result.returncode}").strip()[:200]
             content = f"[直播转写] {record_name} 转写失败：{mp3_name} 错误：{err}"
     except Exception as e:
         content = f"[直播转写] {record_name} 转写异常：{mp3_name} {type(e).__name__}: {e}"
@@ -1573,7 +1577,6 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                     "-fflags", "+discardcorrupt",
                                     "-reconnect", "1",
                                     "-reconnect_streamed", "1",
-                                    "-reconnect_at_eof", "1",
                                     "-reconnect_delay_max", "60",
                                     "-re", "-i", real_url,
                                     "-bufsize", bufsize,
