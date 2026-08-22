@@ -14,6 +14,8 @@ BYPY_RETRY_COUNT=1
 BYPY_TIMEOUT=120
 # Files at or above 1.5 GiB would enter bypy's currently denied tmpfile API.
 NORMAL_UPLOAD_LIMIT_BYTES=1610612736
+# Target size per split part when an oversized file must be divided (~1.2 GiB headroom).
+SPLIT_TARGET_BYTES=1258291200
 
 SCRIPT_DIR="$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &&
@@ -66,6 +68,215 @@ format_notification_files() {
         result+=$'\n- ...另有 '"$((${#files[@]} - max_display_count))"$' 个文件'
     fi
     printf '%s' "$result"
+}
+
+collect_split_parts() {
+    # Fill SPLIT_PARTS with existing part files beside $1 (glob order = sorted).
+    local src="$1"
+    local dir base stem p
+    dir="$(dirname -- "$src")"
+    base="$(basename -- "$src")"
+    stem="${base%.*}"
+    SPLIT_PARTS=()
+    for p in "$dir/$stem".part[0-9][0-9][0-9].*; do
+        [ -f "$p" ] && SPLIT_PARTS+=("$p")
+    done
+}
+
+split_marker_path() {
+    # Marker recording a completed, verified split for $1.
+    local dir base stem
+    dir="$(dirname -- "$1")"
+    base="$(basename -- "$1")"
+    stem="${base%.*}"
+    printf '%s/%s.split.done' "$dir" "$stem"
+}
+
+prepare_split_parts() {
+    # Prepare parts below NORMAL_UPLOAD_LIMIT_BYTES for an oversized $1 ($2 = size).
+    # bypy output/diagnostics go to $3. Fills SPLIT_PARTS; on failure sets
+    # split_error_category / split_error_message and returns non-zero.
+    local src="$1" src_size="$2" up_log="$3"
+    split_error_category=""
+    split_error_message=""
+    SPLIT_PARTS=()
+
+    local dir base stem ext marker expected_parts
+    dir="$(dirname -- "$src")"
+    base="$(basename -- "$src")"
+    stem="${base%.*}"
+    ext="${base##*.}"
+    marker="$(split_marker_path "$src")"
+
+    # Reuse a completed previous split; discard stale leftovers from interrupted runs.
+    collect_split_parts "$src"
+    if [ "${#SPLIT_PARTS[@]}" -gt 0 ]; then
+        expected_parts="$(cat -- "$marker" 2>/dev/null || true)"
+        if [ -n "$expected_parts" ] && [ "$expected_parts" = "${#SPLIT_PARTS[@]}" ]; then
+            printf '\n===== REUSING %s PARTS FROM PREVIOUS RUN =====\n' "${#SPLIT_PARTS[@]}" >>"$up_log"
+            return 0
+        fi
+        rm -f -- "${SPLIT_PARTS[@]}" "$marker"
+        SPLIT_PARTS=()
+    fi
+
+    local avail
+    avail="$(df -B1 --output=avail -- "$src" | tail -n 1)"
+    if [ -z "$avail" ] || [ "$avail" -lt "$src_size" ]; then
+        split_error_category="insufficient_disk_space"
+        split_error_message="磁盘剩余空间不足，无法切分（需要约 ${src_size} 字节，可用 ${avail:-未知} 字节）"
+        return 1
+    fi
+
+    local parts=$(( (src_size + SPLIT_TARGET_BYTES - 1) / SPLIT_TARGET_BYTES ))
+    local split_ok=1
+
+    case "$ext" in
+        ts|flv|mkv|mp4)
+            local duration segment_time
+            duration="$(ffprobe -v error -show_entries format=duration \
+                -of default=noprint_wrappers=1:nokey=1 -- "$src" 2>>"$up_log" | \
+                awk '{printf "%d", $1}')"
+            if ! [[ "$duration" =~ ^[1-9][0-9]*$ ]]; then
+                split_error_category="probe_failed"
+                split_error_message="ffprobe 无法读取媒体时长，无法按时间切分；文件已保留"
+                return 1
+            fi
+            segment_time=$(( duration / parts ))
+            [ "$segment_time" -lt 1 ] && segment_time=1
+            {
+                printf '\n===== OVERSIZE SPLIT: ffmpeg copy segment_time=%ss parts=%s =====\n' \
+                    "$segment_time" "$parts"
+            } >>"$up_log"
+            ffmpeg -nostdin -hide_banner -loglevel warning -y \
+                -i "$src" -c copy -f segment \
+                -segment_time "$segment_time" -reset_timestamps 1 \
+                "$dir/$stem.part%03d.$ext" >>"$up_log" 2>&1 || split_ok=0
+            ;;
+        *)
+            local chunk_bytes=$(( (src_size + parts - 1) / parts ))
+            {
+                printf '\n===== OVERSIZE BINARY SPLIT: chunk=%s bytes parts=%s =====\n' \
+                    "$chunk_bytes" "$parts"
+            } >>"$up_log"
+            split -b "$chunk_bytes" -d -a 3 --additional-suffix ".$ext" \
+                -- "$src" "$dir/$stem.part" >>"$up_log" 2>&1 || split_ok=0
+            ;;
+    esac
+
+    if [ "$split_ok" -ne 1 ]; then
+        collect_split_parts "$src"
+        [ "${#SPLIT_PARTS[@]}" -gt 0 ] && rm -f -- "${SPLIT_PARTS[@]}"
+        rm -f -- "$marker"
+        SPLIT_PARTS=()
+        split_error_category="split_failed"
+        split_error_message="切分命令执行失败（详见 $up_log）；原文件已保留"
+        return 1
+    fi
+
+    collect_split_parts "$src"
+    if [ "${#SPLIT_PARTS[@]}" -eq 0 ]; then
+        rm -f -- "$marker"
+        split_error_category="split_failed"
+        split_error_message="切分后未产生任何分片；原文件已保留"
+        return 1
+    fi
+
+    # Integrity gate before anything is uploaded or deleted.
+    local p psz max_part=0 total_bytes=0 too_big=0
+    for p in "${SPLIT_PARTS[@]}"; do
+        psz="$(stat -c %s -- "$p")"
+        total_bytes=$((total_bytes + psz))
+        [ "$psz" -gt "$max_part" ] && max_part=$psz
+        [ "$psz" -ge "$NORMAL_UPLOAD_LIMIT_BYTES" ] && too_big=1
+    done
+    if [ "$too_big" -ne 0 ] || [ "$total_bytes" -lt $(( src_size * 99 / 100 )) ]; then
+        rm -f -- "${SPLIT_PARTS[@]}"
+        SPLIT_PARTS=()
+        split_error_category="split_failed"
+        split_error_message="切分结果校验失败（最大分片=$max_part 字节，合计=$total_bytes 字节，原文件=$src_size 字节），已清理分片并保留原文件"
+        return 1
+    fi
+
+    printf '%s\n' "${#SPLIT_PARTS[@]}" >"$marker" || true
+    return 0
+}
+
+run_upload_and_verify() {
+    # Upload one local file via bypy, then verify the exact remote size.
+    # Sets UPLOAD_EXIT_CODE REMOTE_SIZE ERROR_CODE ERROR_CATEGORY ERROR_MESSAGE
+    # RAPIDUPLOAD_FALLBACK. Returns 0 only when fully verified.
+    local up_local="$1" up_remote="$2" up_log="$3"
+    local tmp_log="${up_log}.bypy.tmp"
+
+    UPLOAD_EXIT_CODE=0
+    REMOTE_SIZE=""
+    ERROR_CODE=""
+    ERROR_CATEGORY=""
+    ERROR_MESSAGE=""
+    RAPIDUPLOAD_FALLBACK=0
+    : >"$tmp_log"
+
+    python3 -m bypy -v \
+        --retry "$BYPY_RETRY_COUNT" \
+        --timeout "$BYPY_TIMEOUT" \
+        -s "$BYPY_SLICE_SIZE" \
+        upload "$up_local" "$up_remote" overwrite \
+        >>"$tmp_log" 2>&1
+    UPLOAD_EXIT_CODE=$?
+
+    # 31023 from _rapidupload_file_act is a rejected rapid-upload attempt.
+    # If bypy subsequently uploads normally, the file may still succeed.
+    if grep -qE '_rapidupload_file_act|method[^[:alnum:]]+rapidupload' "$tmp_log" \
+        && grep -qE 'Error code:[[:space:]]*31023|error_code[^0-9]+31023' "$tmp_log"; then
+        RAPIDUPLOAD_FALLBACK=1
+    fi
+
+    local terminal_error
+    terminal_error="$(grep -E '^Error [0-9]+[[:space:]]*$' "$tmp_log" | tail -n 1 || true)"
+    if [ -n "$terminal_error" ]; then
+        ERROR_CODE="${terminal_error#Error }"
+    elif grep -qE 'Error code:[[:space:]]*31064|Error 31064' "$tmp_log"; then
+        ERROR_CODE="31064"
+    fi
+
+    if [ "$ERROR_CODE" = "31064" ]; then
+        ERROR_CATEGORY="authorization_31064"
+        ERROR_MESSAGE="百度 tmpfile 分片接口拒绝文件上传"
+    elif [ "$UPLOAD_EXIT_CODE" -ne 0 ]; then
+        ERROR_CATEGORY="upload_process_failed"
+        ERROR_MESSAGE="bypy 进程退出码为 $UPLOAD_EXIT_CODE"
+    elif [ -n "$terminal_error" ]; then
+        ERROR_CATEGORY="bypy_terminal_error"
+        ERROR_MESSAGE="$terminal_error"
+    elif ! grep -qE ' OK\.[[:space:]]*$' "$tmp_log"; then
+        ERROR_CATEGORY="missing_success_marker"
+        ERROR_MESSAGE="bypy 未输出最终成功标记"
+    else
+        local meta_output meta_exit_code local_bytes
+        local_bytes="$(stat -c %s -- "$up_local")"
+        meta_output="$(python3 -m bypy --retry "$BYPY_RETRY_COUNT" \
+            --timeout "$BYPY_TIMEOUT" meta "$up_remote" '$s' 2>&1)"
+        meta_exit_code=$?
+        {
+            printf '\n===== REMOTE SIZE VERIFICATION =====\n'
+            printf '%s\n' "$meta_output"
+        } >>"$tmp_log"
+        REMOTE_SIZE="$(printf '%s\n' "$meta_output" | \
+            awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ {value=$1} END {print value}')"
+
+        if [ "$meta_exit_code" -ne 0 ] || [ -z "$REMOTE_SIZE" ]; then
+            ERROR_CATEGORY="remote_meta_failed"
+            ERROR_MESSAGE="无法读取远端文件大小"
+        elif [ "$REMOTE_SIZE" != "$local_bytes" ]; then
+            ERROR_CATEGORY="remote_size_mismatch"
+            ERROR_MESSAGE="远端大小不一致：本地=$local_bytes 远端=$REMOTE_SIZE"
+        fi
+    fi
+
+    { printf '\n===== BYPY RAW OUTPUT =====\n'; cat -- "$tmp_log"; } >>"$up_log"
+    rm -f -- "$tmp_log"
+    [ -z "$ERROR_CATEGORY" ]
 }
 
 finish_run_record() {
@@ -170,7 +381,7 @@ if [ -d ./converted ]; then
     done < <(find ./converted -type f \( \
         -name "*.ts" -o -name "*.mkv" -o -name "*.flv" -o \
         -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.md" \
-    \) -print0 | sort -z)
+    \) ! -name '*.part[0-9][0-9][0-9].*' ! -name '*.split.done' -print0 | sort -z)
 fi
 
 db_command run-start \
@@ -242,26 +453,80 @@ for ((index = 0; index < pending_count; index++)); do
     error_category=""
     error_message=""
     rapidupload_fallback=0
+    split_part_count=0
+    route_note="普通上传"
 
     if [ "$local_size" -ge "$NORMAL_UPLOAD_LIMIT_BYTES" ]; then
-        process_exit_code=2
-        error_category="requires_denied_slice_api"
-        error_message="文件达到 1.5GiB，会进入已确认返回 31064 的 tmpfile 分片接口；已跳过并保留"
-        printf '%s\n' "$error_message" >"$running_log"
-    else
-        python3 -m bypy -v \
-            --retry "$BYPY_RETRY_COUNT" \
-            --timeout "$BYPY_TIMEOUT" \
-            -s "$BYPY_SLICE_SIZE" \
-            upload "$local_file" "$remote_file" overwrite \
-            >"$running_log" 2>&1
-        process_exit_code=$?
+        # Oversized: bypy would enter the denied tmpfile slice API (31064).
+        # Split locally into < limit parts, upload and verify each part, and
+        # delete the original only after every part is verified remotely.
+        if ! prepare_split_parts "$local_file" "$local_size" "$running_log"; then
+            error_category="$split_error_category"
+            error_message="$split_error_message"
+        else
+            split_part_count="${#SPLIT_PARTS[@]}"
+            route_note="已切分为 $split_part_count 段上传"
+            if [ -n "$file_id" ]; then
+                db_command event \
+                    --run-id "$RUN_ID" \
+                    --file-id "$file_id" \
+                    --level info \
+                    --type oversize_split \
+                    --message "文件 $local_size 字节超过单文件上限，已切分为 $split_part_count 段逐段上传核验" \
+                    >/dev/null || true
+            fi
+            part_index=0
+            all_parts_ok=1
+            for part_file in "${SPLIT_PARTS[@]}"; do
+                part_index=$((part_index + 1))
+                part_base="$(basename -- "$part_file")"
+                part_rel_dir="$(dirname -- "$relative_file")"
+                if [ "$part_rel_dir" = "." ]; then
+                    part_remote="$REMOTE_ROOT/$part_base"
+                else
+                    part_remote="$REMOTE_ROOT/$part_rel_dir/$part_base"
+                fi
 
-        # 31023 from _rapidupload_file_act is a rejected rapid-upload attempt.
-        # If bypy subsequently uploads normally, the file may still succeed.
-        if grep -qE '_rapidupload_file_act|method[^[:alnum:]]+rapidupload' "$running_log" \
-            && grep -qE 'Error code:[[:space:]]*31023|error_code[^0-9]+31023' "$running_log"; then
-            rapidupload_fallback=1
+                printf '\n===== PART %s/%s: %s =====\n' \
+                    "$part_index" "$split_part_count" "$part_base" >>"$running_log"
+
+                run_upload_and_verify "$part_file" "$part_remote" "$running_log"
+                [ "$RAPIDUPLOAD_FALLBACK" -eq 1 ] && rapidupload_fallback=1
+
+                if [ -n "$ERROR_CATEGORY" ]; then
+                    all_parts_ok=0
+                    process_exit_code=$UPLOAD_EXIT_CODE
+                    error_code=$ERROR_CODE
+                    error_category="oversize_part_failed"
+                    error_message="切分为 $split_part_count 段后第 $part_index 段（$part_base）上传失败：$ERROR_MESSAGE"
+                    log_message "[分片失败 $sequence/$pending_count] 保留分片与原文件: $part_base；$ERROR_MESSAGE"
+                    break
+                fi
+
+                if ! rm -f -- "$part_file"; then
+                    all_parts_ok=0
+                    error_category="local_delete_failed"
+                    error_message="第 $part_index 段远端核验成功，但删除本地分片失败；本地文件保留"
+                    log_message "[分片警告 $sequence/$pending_count] $error_message: $part_base"
+                    break
+                fi
+                log_message "[分片成功 $sequence/$pending_count] $part_index/$split_part_count 已核验并删除本地: $part_base ($REMOTE_SIZE 字节)"
+            done
+            if [ "$all_parts_ok" -eq 1 ] && [ "$rapidupload_fallback" -eq 1 ]; then
+                route_note="$route_note；发生秒传回退"
+            fi
+        fi
+    else
+        run_upload_and_verify "$local_file" "$remote_file" "$running_log"
+        process_exit_code=$UPLOAD_EXIT_CODE
+        remote_size=$REMOTE_SIZE
+        error_code=$ERROR_CODE
+        error_category=$ERROR_CATEGORY
+        error_message=$ERROR_MESSAGE
+        rapidupload_fallback=$RAPIDUPLOAD_FALLBACK
+
+        if [ "$rapidupload_fallback" -eq 1 ]; then
+            route_note="秒传失败后回退普通上传"
             if [ -n "$file_id" ]; then
                 db_command event \
                     --run-id "$RUN_ID" \
@@ -272,66 +537,27 @@ for ((index = 0; index < pending_count; index++)); do
                     >/dev/null || true
             fi
         fi
-
-        terminal_error="$(grep -E '^Error [0-9]+[[:space:]]*$' "$running_log" | tail -n 1 || true)"
-        if [ -n "$terminal_error" ]; then
-            error_code="${terminal_error#Error }"
-        elif grep -qE 'Error code:[[:space:]]*31064|Error 31064' "$running_log"; then
-            error_code="31064"
-        fi
-
-        if [ "$error_code" = "31064" ]; then
-            error_category="authorization_31064"
-            error_message="百度 tmpfile 分片接口拒绝文件上传"
-        elif [ "$process_exit_code" -ne 0 ]; then
-            error_category="upload_process_failed"
-            error_message="bypy 进程退出码为 $process_exit_code"
-        elif [ -n "$terminal_error" ]; then
-            error_category="bypy_terminal_error"
-            error_message="$terminal_error"
-        elif ! grep -qE ' OK\.[[:space:]]*$' "$running_log"; then
-            error_category="missing_success_marker"
-            error_message="bypy 未输出最终成功标记"
-        else
-            meta_output="$(python3 -m bypy --retry "$BYPY_RETRY_COUNT" \
-                --timeout "$BYPY_TIMEOUT" meta "$remote_file" '$s' 2>&1)"
-            meta_exit_code=$?
-            {
-                printf '\n===== REMOTE SIZE VERIFICATION =====\n'
-                printf '%s\n' "$meta_output"
-            } >>"$running_log"
-            remote_size="$(printf '%s\n' "$meta_output" | \
-                awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ {value=$1} END {print value}')"
-
-            if [ "$meta_exit_code" -ne 0 ] || [ -z "$remote_size" ]; then
-                error_category="remote_meta_failed"
-                error_message="无法读取远端文件大小"
-            elif [ "$remote_size" != "$local_size" ]; then
-                error_category="remote_size_mismatch"
-                error_message="远端大小不一致：本地=$local_size 远端=$remote_size"
-            fi
-        fi
     fi
 
     if [ -z "$error_category" ]; then
-        if rm -f -- "$local_file"; then
+        delete_also="$(split_marker_path "$local_file")"
+        if rm -f -- "$local_file" "$delete_also"; then
             mv -- "$running_log" "$success_log"
             success_count=$((success_count + 1))
             success_files+=("$relative_file")
             elapsed=$(($(date +%s) - file_started_epoch))
-            route_note="普通上传"
-            [ "$rapidupload_fallback" -eq 1 ] && route_note="秒传失败后回退普通上传"
             log_message "[文件成功 $sequence/$pending_count] $route_note；已核验并删除本地文件: $relative_file (${elapsed}s)"
             if [ -n "$file_id" ]; then
-                db_command file-finish \
-                    --file-id "$file_id" --status success \
-                    --elapsed-seconds "$elapsed" \
-                    --process-exit-code "$process_exit_code" \
-                    --remote-size "$remote_size" \
-                    --detail-log-path "$success_log" \
-                    --rapidupload-fallback "$rapidupload_fallback" \
-                    --raw-output-file "$success_log" \
-                    --local-deleted 1 >/dev/null || true
+                finish_args=(file-finish
+                    --file-id "$file_id" --status success
+                    --elapsed-seconds "$elapsed"
+                    --process-exit-code "$process_exit_code"
+                    --detail-log-path "$success_log"
+                    --rapidupload-fallback "$rapidupload_fallback"
+                    --raw-output-file "$success_log"
+                    --local-deleted 1)
+                [ -n "$remote_size" ] && finish_args+=(--remote-size "$remote_size")
+                db_command "${finish_args[@]}" >/dev/null || true
             fi
             continue
         fi
