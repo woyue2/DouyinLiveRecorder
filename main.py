@@ -448,7 +448,20 @@ def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
                 content = (f"[直播转写] {record_name} 转写完成（审核拦截，已用原始文本生成"
                            f" -敏感.md）：{mp3_name}，md 已生成待上传")
             else:
-                content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
+                summary_match = re.search(r'<!--SUMMARY_START-->\s*(.*?)\s*<!--SUMMARY_END-->',
+                                          result.stdout, re.DOTALL)
+                if summary_match:
+                    summary_text = summary_match.group(1).strip()
+                    # 格式化摘要，清理可能的引用前缀 > 便于在各推送端展示
+                    clean_lines = []
+                    for line in summary_text.splitlines():
+                        clean_lines.append(line.lstrip('> ').strip())
+                    summary_display = "\n".join(clean_lines).strip()
+                    content = (f"{summary_display}\n\n"
+                               f"--------------------\n"
+                               f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传")
+                else:
+                    content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
         else:
             err = (result.stderr or result.stdout or f"退出码 {result.returncode}").strip()[:200]
             content = f"[直播转写] {record_name} 转写失败：{mp3_name} 错误：{err}"
