@@ -501,8 +501,8 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         tags=meta["tags"],
         tid=bili_default_tid,
         cookie_path=bili_cookie_path,
-        copyright_type=2,
-        source="抖音直播",
+        copyright_type=1,
+        source="",
         biliup_bin=biliup_bin,
         is_only_self=is_only_self
     )
