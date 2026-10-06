@@ -591,13 +591,19 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                     mp4_candidate if os.path.exists(mp4_candidate) else ""
                 )
                 if video_target:
-                    bili_upload_executor.submit(
-                        process_bili_upload_task,
-                        video_target,
-                        md_path,
-                        record_name,
-                        record_url
-                    )
+                    try:
+                        bili_upload_executor.submit(
+                            process_bili_upload_task,
+                            video_target,
+                            md_path,
+                            record_name,
+                            record_url
+                        )
+                    except RuntimeError as e:
+                        if "shutdown" in str(e).lower():
+                            logger.info(f"主程序退出中，跳过B站投稿提交: {video_target}")
+                        else:
+                            raise
                 else:
                     logger.warning(f"B站投稿跳过 {mp3_name}：未找到同名视频文件 ({ts_candidate})")
                     # 未找到同名视频，清理占位符，避免残留
@@ -665,6 +671,16 @@ def submit_transcribe(published_files: list, record_name: str, record_url: str =
         try:
             Path(placeholder).touch()
             transcribe_executor.submit(transcribe_and_notify, published, record_name, record_url)
+        except RuntimeError as e:
+            if "shutdown" in str(e).lower():
+                logger.info(f"主程序退出中，跳过转写提交: {published}")
+                if os.path.exists(placeholder):
+                    try:
+                        os.remove(placeholder)
+                    except OSError:
+                        pass
+            else:
+                logger.warning(f"提交转写任务失败 {placeholder}: {e}")
         except OSError as e:
             logger.warning(f"创建转写占位失败 {placeholder}: {e}")
 
