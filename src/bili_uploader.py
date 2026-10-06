@@ -1,0 +1,459 @@
+# -*- coding: utf-8 -*-
+"""Bilibili 自动投稿与元数据解析模块
+
+负责：
+1. 从转写生成的 .md 文件中提取适合 B 站娱乐/知识直播的有流量标题、精彩看点简介、标签；
+2. 过滤原直播间链接与老套标签（如【直播精华】）；
+3. 调用 biliup 进行视频投稿；
+4. 投稿成功后根据策略清理本地 TS 文件，保留 MD 文件供百度云文字备份。
+"""
+
+import os
+import re
+import subprocess
+import logging
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+def extract_bili_metadata(
+    md_path: str,
+    record_name: str,
+    streamer_type: str = "娱乐搞笑",
+    default_tags: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+    llm_api_base: Optional[str] = None,
+    llm_model: str = "deepseek-chat"
+) -> Dict[str, str]:
+    """从转写 .md 文件中解析出适合 B 站投稿的标题、简介与标签。
+
+    若提供了 llm_api_key，会优先调用大语言模型为本段内容撰写爆款标题与看点；
+    未配置或调用失败时，自动回退到基于规则的高能看点提炼。
+
+    Args:
+        md_path: .md 文件绝对或相对路径
+        record_name: 主播名或房间标识（例如：合家欢乐乐乐）
+        streamer_type: 主播直播类型（娱乐搞笑 / 知识干货 / 聊天日常）
+        default_tags: 默认追加标签
+        llm_api_key: 可选的大模型 API Key
+        llm_api_base: 可选的 API 基础地址（如 https://api.deepseek.com）
+        llm_model: 模型名称
+
+    Returns:
+        dict 包含 'title', 'desc', 'tags'
+    """
+    clean_streamer_name = record_name.split(" ", maxsplit=1)[-1].strip()
+    # 去除可能的前缀，如 "主播: "
+    clean_streamer_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_streamer_name).strip()
+
+    title = ""
+    tags = ""
+    desc_content = ""
+
+    md_content = ""
+    # 若原路径不存在，尝试从 ./converted/ 备份暂存目录查找
+    if not os.path.exists(md_path):
+        p = Path(md_path)
+        converted_candidate = p.parent / "converted" / p.name
+        if converted_candidate.exists():
+            md_path = str(converted_candidate)
+
+    if os.path.exists(md_path):
+        try:
+            md_content = Path(md_path).read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"读取 MD 文件失败: {md_path}, 错误: {e}")
+
+    # 0. 若配置了 LLM，优先尝试由 LLM 生成网感标题与简介
+    active_api_key = llm_api_key or os.getenv("BILI_LLM_API_KEY")
+    if active_api_key and md_content:
+        llm_meta = generate_bili_meta_with_llm(
+            text_content=md_content,
+            record_name=record_name,
+            streamer_type=streamer_type,
+            api_key=active_api_key,
+            api_base=llm_api_base,
+            model=llm_model
+        )
+        if llm_meta:
+            return llm_meta
+
+    # 1. 尝试从专用的 <!--BILI_META_START--> 标记中提取
+    bili_meta_match = re.search(
+        r'<!--BILI_META_START-->\s*(.*?)\s*<!--BILI_META_END-->',
+        md_content,
+        re.DOTALL
+    )
+    if bili_meta_match:
+        meta_block = bili_meta_match.group(1).strip()
+        title_match = re.search(r'^(?:TITLE|标题)[:：]\s*(.+)$', meta_block, re.MULTILINE | re.IGNORECASE)
+        if title_match:
+            title = title_match.group(1).strip()
+        tags_match = re.search(r'^(?:TAGS|标签)[:：]\s*(.+)$', meta_block, re.MULTILINE | re.IGNORECASE)
+        if tags_match:
+            tags = tags_match.group(1).strip()
+
+    # 2. 提取摘要与精彩看点 <!--SUMMARY_START-->
+    summary_match = re.search(
+        r'<!--SUMMARY_START-->\s*(.*?)\s*<!--SUMMARY_END-->',
+        md_content,
+        re.DOTALL
+    )
+    if summary_match:
+        raw_summary = summary_match.group(1).strip()
+        clean_lines = []
+        for line in raw_summary.splitlines():
+            # 清理引用符号
+            l = line.lstrip('> ').strip()
+            # 过滤任何外部链接与原直播间链接
+            l = re.sub(r'https?://\S+', '', l).strip()
+            # 过滤【直播精华】、录播等字眼
+            l = re.sub(r'【直播[精核心]+】', '', l).strip()
+            if l:
+                clean_lines.append(l)
+        desc_content = "\n".join(clean_lines).strip()
+
+    # 3. 如果未显式提供 TITLE，则从摘要/看点首行智能提炼有流量的标题
+    if not title:
+        candidate_title = ""
+        if desc_content:
+            for line in desc_content.splitlines():
+                # 跳过纯标题/导语行如 "精彩看点："、"本段精彩看点："、"### 高能笑点"
+                if re.match(r'^#*\s*(本段|今日|本次)?(精彩|高能|核心|爆笑)?(看点|笑点|内容|提炼|摘要|干货)[:：]?$', line.strip()):
+                    continue
+                # 清洗序号或列表符号
+                clean_line = re.sub(r'^[-*•\d+.\s、]+', '', line).strip()
+                # 去除时间戳标记如 [02:15] 或 02:15
+                clean_line = re.sub(r'^\[?\d{1,2}:\d{2}\]?\s*', '', clean_line).strip()
+                if len(clean_line) >= 4:
+                    candidate_title = clean_line
+                    break
+
+        if candidate_title:
+            # 娱乐搞笑类标题网感包装
+            short_name = clean_streamer_name[-2:] if len(clean_streamer_name) >= 4 else clean_streamer_name
+            # 如果候选标题开头已经有主播全名或常用简称，避免机械重复
+            if candidate_title.startswith(clean_streamer_name):
+                title = candidate_title
+            elif candidate_title.startswith(short_name):
+                # 例如 "乐乐模仿..." 优化为 "合家欢乐乐乐：模仿..." 或保留全名
+                rest = candidate_title[len(short_name):].lstrip('：:，, ')
+                title = f"{clean_streamer_name}：{rest}" if rest else candidate_title
+            else:
+                title = f"{clean_streamer_name}：{candidate_title}"
+        else:
+            # 回退默认标题：文件名时间或简单标识
+            file_stem = Path(md_path).stem
+            title = f"{clean_streamer_name} 直播高能名场面 ({file_stem[-3:] if file_stem[-3:].isdigit() else '片段'})"
+
+    # 严格保证 B 站标题约束：
+    # 1. 不含【直播精华】
+    title = re.sub(r'【直播[精核心]+】', '', title).strip()
+    # 2. 不超过 80 个字符限制
+    if len(title) > 80:
+        title = title[:77] + "..."
+
+    # 4. 标签处理
+    tag_list = []
+    if tags:
+        tag_list.extend([t.strip()[:20] for t in re.split(r'[,，\s]+', tags) if t.strip()])
+
+    # 确保主播名在标签首位
+    if clean_streamer_name:
+        if clean_streamer_name in tag_list:
+            tag_list.remove(clean_streamer_name)
+        tag_list.insert(0, clean_streamer_name[:20])
+
+    # 娱乐主播特定配套标签
+    type_tags = {
+        "娱乐搞笑": ["搞笑", "名场面", "主播日常", "搞笑日常", "高能"],
+        "知识干货": ["知识", "干货", "商业思维", "认知提升"],
+        "聊天日常": ["日常", "闲聊", "互动", "治愈"],
+    }.get(streamer_type, ["娱乐", "搞笑"])
+
+    for t in type_tags:
+        t_clean = t[:20]
+        if t_clean not in tag_list:
+            tag_list.append(t_clean)
+
+    if default_tags:
+        for t in re.split(r'[,，\s]+', default_tags):
+            t_clean = t.strip()[:20]
+            if t_clean and t_clean not in tag_list:
+                tag_list.append(t_clean)
+
+    # B 站单个视频最多 12 个标签，且单标签不超过 20 字
+    final_tags = ",".join(tag_list[:12])
+
+    # 5. 简介兜底（确保不带外部直播间链接，且限制长度）
+    if not desc_content:
+        desc_content = f"{clean_streamer_name} 直播精彩片段分享，喜欢欢迎关注点赞！"
+    elif len(desc_content) > 1000:
+        desc_content = desc_content[:997] + "..."
+
+    return {
+        "title": title,
+        "desc": desc_content,
+        "tags": final_tags,
+    }
+
+
+def upload_video_biliup(
+    video_path: str,
+    title: str,
+    desc: str,
+    tags: str,
+    tid: int = 138,
+    cookie_path: str = "cookies.json",
+    line: Optional[str] = None,
+    copyright_type: int = 2,
+    source: str = "",
+    biliup_bin: str = "biliup"
+) -> Tuple[bool, str]:
+    """调用 biliup 命令上传视频到 B 站。
+
+    Args:
+        video_path: 本地视频绝对路径
+        title: 视频标题
+        desc: 视频简介
+        tags: 视频标签，英文逗号分隔
+        tid: B 站分区 ID（默认 138: 搞笑）
+        cookie_path: cookies.json 路径
+        line: 上传线路 (如 bldsa, kodo, tx, cos)
+        copyright_type: 1 自制，2 转载
+        source: 转载来源描述（不放 URL）
+        biliup_bin: biliup 可执行文件路径（默认 'biliup'）
+
+    Returns:
+        (是否成功, 日志/错误信息)
+    """
+    if not os.path.exists(video_path):
+        return False, f"视频文件不存在: {video_path}"
+
+    if not os.path.exists(cookie_path):
+        return False, f"B 站 Cookie 文件不存在: {cookie_path}，请先执行 biliup login 登录"
+
+    cmd = [
+        str(biliup_bin or "biliup"),
+        "-u", str(cookie_path),
+        "upload",
+        str(video_path),
+        "--title", title,
+        "--desc", desc,
+        "--tag", tags,
+        "--tid", str(tid),
+        "--copyright", str(copyright_type),
+    ]
+
+    if copyright_type == 2 and source:
+        cmd.extend(["--source", source])
+
+    if line:
+        cmd.extend(["--line", line])
+
+    logger.info(f"开始执行 B 站上传: 标题={title}, 路径={video_path}")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+            encoding="utf-8",
+            errors="replace"
+        )
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode == 0:
+            logger.info(f"B 站上传成功: {title}")
+            return True, output
+        else:
+            logger.error(f"B 站上传失败 (退出码 {result.returncode}): {output[:500]}")
+            return False, output
+    except subprocess.TimeoutExpired:
+        return False, "biliup 上传超时 (超过 2 小时)"
+    except Exception as e:
+        return False, f"biliup 执行异常: {type(e).__name__}: {e}"
+
+
+def handle_post_upload_cleanup(video_path: str, policy: str = "仅百度云上传md(删除ts)") -> None:
+    """根据 Setting 策略处理上传完成后的本地视频与占位文件。
+
+    策略选项:
+    - "仅百度云上传md(删除ts)": 删除本地 TS 视频与 .bili_uploading 占位，保留 MD 文件
+    - "百度云继续上传ts": 仅删除 .bili_uploading 占位，保留 TS 供百度云脚本搬运
+    - "保留本地": 不删除 TS，移除占位
+    """
+    placeholder = video_path + ".bili_uploading"
+    try:
+        if os.path.exists(placeholder):
+            os.remove(placeholder)
+    except OSError as e:
+        logger.warning(f"移除 B 站占位符失败 {placeholder}: {e}")
+
+    if policy == "仅百度云上传md(删除ts)":
+        try:
+            if os.path.exists(video_path):
+                os.remove(video_path)
+                logger.info(f"[B站策略执行] 视频已上传B站，本地TS已按配置删除: {video_path}")
+        except OSError as e:
+            logger.error(f"删除已上传视频失败 {video_path}: {e}")
+
+
+def generate_bili_meta_with_llm(
+    text_content: str,
+    record_name: str,
+    streamer_type: str = "娱乐搞笑",
+    api_key: Optional[str] = None,
+    api_base: Optional[str] = None,
+    model: str = "deepseek-chat"
+) -> Optional[Dict[str, str]]:
+    """调用大语言模型（兼容 MiniMax / DeepSeek / OpenAI 接口）生成爆款 B 站标题、高能简介与标签。
+
+    若未配置 API Key 或请求失败，返回 None，调用方将自动回退到规则提取。
+    """
+    if not api_key or not text_content.strip():
+        return None
+
+    clean_streamer_name = record_name.split(" ", maxsplit=1)[-1].strip()
+    clean_streamer_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_streamer_name).strip()
+
+    # 预处理：清洗由于网络卡顿、推流掉包或 ASR 幻觉造成的单句连续机械重复行
+    cleaned_lines = []
+    last_clean = ""
+    repeat_count = 0
+    for raw_line in text_content.splitlines():
+        text_part = re.sub(r'^\[?\d{1,2}:\d{2}\]?\s*', '', raw_line).strip()
+        if text_part == last_clean and text_part:
+            repeat_count += 1
+            if repeat_count < 2:  # 最多保留 1 次重复
+                cleaned_lines.append(raw_line)
+        else:
+            last_clean = text_part
+            repeat_count = 0
+            cleaned_lines.append(raw_line)
+    filtered_content = "\n".join(cleaned_lines)
+
+    prompt_map = {
+        "娱乐搞笑": (
+            f"你是一位B站与抖音百万爆款娱乐切片运营专家。\n"
+            f"请根据主播【{clean_streamer_name}】的直播文本，提炼出最抓人眼球的名场面与笑点。\n"
+            f"【要求】：\n"
+            f"1. 严禁出现任何网址或直播间链接！\n"
+            f"2. 严禁出现【直播精华】、录播、第X段等死板字眼！\n"
+            f"3. 严禁将「网络卡顿」、「复读机循环」、「单句机械重复」等推流故障或语音识别幻觉当成看点！必须选择有真实情节、段子、聊天互动或PK对局的名场面。\n"
+            f"4. 标题：必须极具网感、爆笑或反转名场面，包含主播名或简称，30字内吸引点击。\n"
+            f"5. 简介：提炼2~4个本段高能笑点/名场面（每行一个）。若文本中包含时间戳信息，每行开头必须附带时间戳（格式如 02:15、08:30），B站观众点击时间戳可直接跳转进度条！\n"
+            f"6. 标签：以英文逗号分隔5~8个热门标签，首个标签为主播名。\n"
+            f"必须以合法JSON格式输出，字段包含: title, desc, tags。请确保JSON字符串中的换行用\\n表示，不要使用未转义的特殊字符。"
+        ),
+        "知识干货": (
+            f"你是一位资深视频知识内容编辑。\n"
+            f"请根据主播【{clean_streamer_name}】的直播文本，提炼核心商业/认知干货。\n"
+            f"【要求】：\n"
+            f"1. 严禁出现任何网址或直播间链接！\n"
+            f"2. 严禁将网络卡顿或单句机械重复当成干货！\n"
+            f"3. 标题：突出最具颠覆性认知或核心方法论，30字内。\n"
+            f"4. 简介：条理清晰罗列核心干货要点，每行开头尽量附带时间戳（如 02:15）供进度跳转。\n"
+            f"5. 标签：以英文逗号分隔5~8个相关知识标签。\n"
+            f"必须以合法JSON格式输出，字段包含: title, desc, tags。"
+        ),
+    }
+
+    system_prompt = prompt_map.get(streamer_type, prompt_map["娱乐搞笑"])
+    user_content = filtered_content[:4000]  # 截取清洗后的前 4000 字符用于分析
+
+    base_url = (api_base or "https://api.deepseek.com").rstrip("/")
+    is_anthropic_api = "/anthropic" in base_url or "api.anthropic.com" in base_url
+
+    import json
+    import urllib.request
+
+    try:
+        if is_anthropic_api:
+            # MiniMax Anthropic 兼容端点或原生 Anthropic 协议
+            url = base_url + "/v1/messages"
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01"
+            }
+            payload = {
+                "model": model,
+                "max_tokens": 1024,
+                "system": system_prompt,
+                "messages": [
+                    {"role": "user", "content": f"直播内容文本如下：\n{user_content}"}
+                ]
+            }
+        else:
+            # 标准 OpenAI / DeepSeek / MiniMax v1 兼容端点
+            url = base_url + ("/v1/chat/completions" if not base_url.endswith("/v1") else "/chat/completions")
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"直播内容文本如下：\n{user_content}"}
+                ],
+                "temperature": 0.7
+            }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            if is_anthropic_api:
+                content = resp_data["content"][0]["text"]
+            else:
+                content = resp_data["choices"][0]["message"]["content"]
+
+            # 清理可能的 markdown 代码块标记 ```json ... ```
+            content_cleaned = re.sub(r'^```(?:json)?\s*', '', content.strip(), flags=re.IGNORECASE)
+            content_cleaned = re.sub(r'\s*```$', '', content_cleaned.strip())
+            # 尝试提取首个合法 JSON 对象并使用 strict=False 解析（允许字符串内存在原始换行与控制字符）
+            json_match = re.search(r'\{[\s\S]*\}', content_cleaned)
+            json_str = json_match.group(0) if json_match else content_cleaned
+            try:
+                result = json.loads(json_str, strict=False)
+            except Exception:
+                # 容错处理：清除异常不可见控制字符后重试
+                clean_str = re.sub(r'[\x00-\x09\x0b-\x1f]', '', json_str)
+                result = json.loads(clean_str, strict=False)
+
+            title = str(result.get("title", "")).strip()
+            desc = str(result.get("desc", "")).strip()
+
+            raw_tags = result.get("tags", "")
+            if isinstance(raw_tags, list):
+                tag_list = [str(t).strip()[:20] for t in raw_tags if str(t).strip()]
+                tags = ",".join(tag_list)
+            else:
+                tag_list = [t.strip()[:20] for t in str(raw_tags).split(",") if t.strip()]
+                tags = ",".join(tag_list)
+
+            # 二次净化确保不包含直播链接与【直播精华】
+            title = re.sub(r'【直播[精核心]+】', '', title).strip()
+            desc = re.sub(r'https?://\S+', '', desc).strip()
+            if len(desc) > 1000:
+                desc = desc[:997] + "..."
+
+            if title:
+                logger.info(f"LLM 成功生成 B 站元数据: 标题={title}")
+                return {
+                    "title": title[:80],
+                    "desc": desc,
+                    "tags": tags or f"{clean_streamer_name},搞笑,名场面",
+                }
+    except Exception as e:
+        logger.warning(f"调用 LLM 生成 B 站元数据失败: {e}，将回退到规则提取")
+
+    return None
+

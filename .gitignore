@@ -172,3 +172,9 @@ backup_config/
 
 # for diaocha
 DanMu/
+
+# Bilibili credentials
+cookies.json
+*cookies*.json
+biliup-master/
+

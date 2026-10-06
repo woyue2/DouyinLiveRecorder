@@ -342,6 +342,12 @@ while IFS= read -r -d '' file; do
         continue
     fi
 
+    # B站上传占位：视频或同名文件正在等待转写/正在上传B站（main.py 创建 .bili_uploading），跳过避免抢先上传删除
+    file_stem="${file%.*}"
+    if [ -e "${file}.bili_uploading" ] || [ -e "${file_stem}.ts.bili_uploading" ] || [ -e "${file_stem}.mp4.bili_uploading" ]; then
+        continue
+    fi
+
     file_dir="$(dirname "$file")"
     target_dir="./converted/${file_dir#./}"
     target_file="$target_dir/$(basename "$file")"

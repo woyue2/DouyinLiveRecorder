@@ -49,6 +49,11 @@ from src.recording_config import (
     formats_prefer_hls,
     normalize_audio_bitrate,
 )
+from src.bili_uploader import (
+    extract_bili_metadata,
+    upload_video_biliup,
+    handle_post_upload_cleanup,
+)
 from src.stream_selection import is_flv_preferred_platform, select_source_url
 from src.proxy import ProxyDetector
 from src.utils import logger
@@ -82,6 +87,10 @@ postprocess_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pos
 transcribe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcribe")
 # 需要转写为 md 的直播 URL 集合，由 URL_config.ini 第4列"转MD"在配置加载时登记
 transcribe_urls: set[str] = set()
+# B站投稿专用单线程池：单并发投稿，避免频繁 API 请求触发 B 站 601 限制
+bili_upload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bili_upload")
+# 需要上传 B 站的直播 URL 集合，由 URL_config.ini 中 "传B站" 登记
+bili_upload_urls: set[str] = set()
 url_tuples_list = []
 url_comments = []
 text_no_repeat_url = []
@@ -423,9 +432,96 @@ def run_script(command: str) -> None:
 
 # 转写封装脚本路径（从 config.ini [录制设置] mp3转写md脚本路径 读取）：mp3→txt→md 一体化
 transcribe_script = ""
+# B站投稿全局配置项（从 config.ini [B站投稿] 读取）
+bili_upload_enabled = False
+bili_post_policy = "仅百度云上传md(删除ts)"
+bili_cookie_path = "cookies.json"
+bili_default_tid = 138
+bili_default_tags = "搞笑,名场面,主播日常,搞笑日常"
+bili_llm_api_key = ""
+bili_llm_api_base = "https://api.deepseek.com"
+bili_llm_model = "deepseek-chat"
+biliup_bin = "biliup"
+streamer_types = {}
+default_streamer_type = "娱乐搞笑"
 
 
-def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
+_VIDEO_EXTS = (".ts", ".mp4", ".flv", ".mkv")
+
+
+def is_video_file(file_path: str) -> bool:
+    """判断文件是否为视频格式。"""
+    return Path(file_path).suffix.lower() in _VIDEO_EXTS
+
+
+def hold_videos_for_bili(files: list) -> None:
+    """对已发布的视频文件创建 .bili_uploading 占位，防止百度云定时脚本在转写和传B站完成前抢先上传删除。"""
+    for f in files:
+        if is_video_file(f):
+            marker = f + ".bili_uploading"
+            if not os.path.exists(marker):
+                try:
+                    Path(marker).touch()
+                except OSError as e:
+                    logger.warning(f"创建B站占位失败 {marker}: {e}")
+
+
+def process_bili_upload_task(video_path: str, md_path: str, record_name: str, record_url: str) -> None:
+    """提取 MD 中的标题与简介，调用 biliup 上传视频，成功后按策略清理本地视频，并发送通知。"""
+    clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
+    clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
+    streamer_type = streamer_types.get(clean_name.lower(), default_streamer_type)
+
+    meta = extract_bili_metadata(
+        md_path=md_path,
+        record_name=record_name,
+        streamer_type=streamer_type,
+        default_tags=bili_default_tags,
+        llm_api_key=bili_llm_api_key or None,
+        llm_api_base=bili_llm_api_base or None,
+        llm_model=bili_llm_model or "deepseek-chat"
+    )
+
+    success, output = upload_video_biliup(
+        video_path=video_path,
+        title=meta["title"],
+        desc=meta["desc"],
+        tags=meta["tags"],
+        tid=bili_default_tid,
+        cookie_path=bili_cookie_path,
+        copyright_type=2,
+        source="抖音直播",
+        biliup_bin=biliup_bin
+    )
+
+    video_name = Path(video_path).name
+    if success:
+        bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
+        bvid = bvid_match.group(0) if bvid_match else "已提交"
+        content = (f"[B站投稿成功] {record_name}\n"
+                   f"标题: {meta['title']}\n"
+                   f"BV号: {bvid}\n"
+                   f"文件: {video_name}")
+        handle_post_upload_cleanup(video_path, policy=bili_post_policy)
+    else:
+        err = output.strip()[:200]
+        content = (f"[B站投稿失败] {record_name}\n"
+                   f"文件: {video_name}\n"
+                   f"错误: {err}")
+        # 上传失败时，清理占位符，允许百度云脚本备份并清理，避免磁盘被占满
+        placeholder = video_path + ".bili_uploading"
+        if os.path.exists(placeholder):
+            try:
+                os.remove(placeholder)
+            except OSError:
+                pass
+    try:
+        push_message(record_name, "", content)
+    except Exception as e:
+        logger.error(f"B站投稿通知发送失败 {video_name}: {e}")
+
+
+def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "") -> None:
     """异步转写 mp3→md 并发通知。调用方需在 submit 前同步创建占位文件
     xxx.mp3.transcribing 防止 cron 抢先上传删除 mp3；本函数结束时（成败都）删除占位。"""
     placeholder = mp3_path + ".transcribing"
@@ -444,11 +540,13 @@ def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
             capture_output=True, text=True, timeout=3600,
         )
         if result.returncode == 0:
+            md_candidate = Path(mp3_path).with_suffix('.md')
+            sensitive_candidate = Path(mp3_path).with_name(f"{Path(mp3_path).stem}-敏感.md")
+            md_path = str(sensitive_candidate if not md_candidate.exists() and sensitive_candidate.exists() else md_candidate)
             if "SENSITIVE_RAW" in result.stdout:
                 content = (f"[直播转写] {record_name} 转写完成（审核拦截，已用原始文本生成"
                            f" -敏感.md）：{mp3_name}，md 已生成待上传")
             else:
-                md_path = str(Path(mp3_path).with_suffix('.md'))
                 summary_display = ""
                 try:
                     if os.path.exists(md_path):
@@ -470,11 +568,52 @@ def transcribe_and_notify(mp3_path: str, record_name: str) -> None:
                                f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传")
                 else:
                     content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
+
+            # 触发B站投稿：转写完成后，如果该URL配置了传B站，立即提交投稿任务
+            if record_url in bili_upload_urls and bili_upload_enabled:
+                ts_candidate = str(Path(mp3_path).with_suffix('.ts'))
+                mp4_candidate = str(Path(mp3_path).with_suffix('.mp4'))
+                video_target = ts_candidate if os.path.exists(ts_candidate) else (
+                    mp4_candidate if os.path.exists(mp4_candidate) else ""
+                )
+                if video_target:
+                    bili_upload_executor.submit(
+                        process_bili_upload_task,
+                        video_target,
+                        md_path,
+                        record_name,
+                        record_url
+                    )
+                else:
+                    logger.warning(f"B站投稿跳过 {mp3_name}：未找到同名视频文件 ({ts_candidate})")
+                    # 未找到同名视频，清理占位符，避免残留
+                    for ext in ('.ts', '.mp4'):
+                        v_hold = str(Path(mp3_path).with_suffix(ext)) + ".bili_uploading"
+                        if os.path.exists(v_hold):
+                            try:
+                                os.remove(v_hold)
+                            except OSError:
+                                pass
         else:
             err = (result.stderr or result.stdout or f"退出码 {result.returncode}").strip()[:200]
             content = f"[直播转写] {record_name} 转写失败：{mp3_name} 错误：{err}"
+            # 转写失败时清理对应视频占位符，避免视频被永久跳过上传
+            for ext in ('.ts', '.mp4'):
+                v_hold = str(Path(mp3_path).with_suffix(ext)) + ".bili_uploading"
+                if os.path.exists(v_hold):
+                    try:
+                        os.remove(v_hold)
+                    except OSError:
+                        pass
     except Exception as e:
         content = f"[直播转写] {record_name} 转写异常：{mp3_name} {type(e).__name__}: {e}"
+        for ext in ('.ts', '.mp4'):
+            v_hold = str(Path(mp3_path).with_suffix(ext)) + ".bili_uploading"
+            if os.path.exists(v_hold):
+                try:
+                    os.remove(v_hold)
+                except OSError:
+                    pass
     finally:
         try:
             if os.path.exists(placeholder):
@@ -500,7 +639,7 @@ def save_type_produces_audio(save_type: str) -> bool:
     return any(record_format.audio_only for record_format in RecordFormat.parse_multiple(save_type))
 
 
-def submit_transcribe(published_files: list, record_name: str) -> None:
+def submit_transcribe(published_files: list, record_name: str, record_url: str = "") -> None:
     """将已发布的音频文件逐个提交转写。submit 前同步创建 .transcribing 占位，
     防止 upload_baidu.sh 在转写排队时抢先上传删除音频。"""
     for published in published_files:
@@ -511,30 +650,29 @@ def submit_transcribe(published_files: list, record_name: str) -> None:
             continue
         try:
             Path(placeholder).touch()
-            transcribe_executor.submit(transcribe_and_notify, published, record_name)
+            transcribe_executor.submit(transcribe_and_notify, published, record_name, record_url)
         except OSError as e:
             logger.warning(f"创建转写占位失败 {placeholder}: {e}")
 
 
 def cleanup_stale_transcribe_placeholders(save_root: str) -> None:
-    """启动时清理残留的 *.transcribing 占位文件，避免程序崩溃后对应音频被永久跳过上传。"""
+    """启动时清理残留的 *.transcribing 与 *.bili_uploading 占位文件，避免程序崩溃后对应文件被永久跳过上传。"""
     removed = 0
     try:
         for root, _dirs, files in os.walk(save_root):
             for name in files:
-                if not name.endswith(".transcribing"):
-                    continue
-                placeholder = os.path.join(root, name)
-                try:
-                    os.remove(placeholder)
-                    removed += 1
-                    logger.info(f"清理残留转写占位文件: {placeholder}")
-                except OSError as e:
-                    logger.warning(f"清理转写占位失败 {placeholder}: {e}")
+                if name.endswith(".transcribing") or name.endswith(".bili_uploading"):
+                    placeholder = os.path.join(root, name)
+                    try:
+                        os.remove(placeholder)
+                        removed += 1
+                        logger.info(f"清理残留占位文件: {placeholder}")
+                    except OSError as e:
+                        logger.warning(f"清理占位失败 {placeholder}: {e}")
     except Exception as e:
-        logger.error(f"清理转写占位文件异常: {e}")
+        logger.error(f"清理残留占位文件异常: {e}")
     if removed:
-        logger.info(f"共清理 {removed} 个残留转写占位文件")
+        logger.info(f"共清理 {removed} 个残留占位文件")
 
 
 def clear_record_info(record_name: str, record_url: str) -> None:
@@ -694,8 +832,10 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             completed_segments = publish_completed_segments(working_file_path)
             for extra_working in (extra_working_paths or []):
                 completed_segments.extend(publish_completed_segments(extra_working))
+            if record_url in bili_upload_urls and bili_upload_enabled:
+                hold_videos_for_bili(completed_segments)
             if should_transcribe:
-                submit_transcribe(completed_segments, record_name)
+                submit_transcribe(completed_segments, record_name, record_url)
         if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
             color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
             clear_record_info(record_name, record_url)
@@ -754,9 +894,11 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             )
         status_text = "录制已安全停止" if stop_requested else "直播录制完成"
         print(f"\n{record_name} {stop_time} {status_text}\n")
+        if record_url in bili_upload_urls and bili_upload_enabled:
+            hold_videos_for_bili(published_files)
         # 转写触发：录制结束时最后一段(.part)发布后统一提交转写
         if should_transcribe:
-            submit_transcribe(published_files, record_name)
+            submit_transcribe(published_files, record_name, record_url)
 # 原自带是否执行脚本命令
         if script_command:
             logger.debug("开始执行脚本命令!")
@@ -872,7 +1014,7 @@ def parse_url_config_line(line, default_quality):
         split_line = [line, '']
 
     split_line = [i.strip() for i in split_line]
-    transcribe_flag = ''
+    extra_flags = []
 
     if len(split_line) == 1:
         url = split_line[0]
@@ -892,16 +1034,16 @@ def parse_url_config_line(line, default_quality):
         if contains_url(split_line[0]):
             quality = default_quality
             url, name, save_type = split_line[0], split_line[1], split_line[2]
-            transcribe_flag = split_line[3] if len(split_line) > 3 else ''
+            extra_flags = split_line[3:]
         else:
             quality, url, name = split_line[:3]
             save_type = split_line[3] if len(split_line) > 3 else ''
-            transcribe_flag = split_line[4] if len(split_line) > 4 else ''
+            extra_flags = split_line[4:]
 
     normalized_save_type = normalize_video_save_type(save_type)
     if save_type and not normalized_save_type:
         logger.warning(f"URL配置中的录制格式无效，将使用全局默认值: {save_type}")
-    return quality, url, name, normalized_save_type, transcribe_flag
+    return quality, url, name, normalized_save_type, extra_flags
 
 
 def get_record_headers(platform, live_url):
@@ -2299,6 +2441,10 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
             config_parser.add_section('Authorization')
         if '账号密码' not in config_parser.sections():
             config_parser.add_section('账号密码')
+        if 'B站投稿' not in config_parser.sections():
+            config_parser.add_section('B站投稿')
+        if '主播类型配置' not in config_parser.sections():
+            config_parser.add_section('主播类型配置')
         return config_parser.get(section, option)
     except (configparser.NoSectionError, configparser.NoOptionError):
         config_parser.set(section, option, str(default_value))
@@ -2484,6 +2630,21 @@ while True:
     laixiu_cookie = read_config_value(config, 'Cookie', 'laixiu_cookie', '')
     picarto_cookie = read_config_value(config, 'Cookie', 'picarto_cookie', '')
 
+    bili_upload_enabled = options.get(read_config_value(config, 'B站投稿', '是否开启B站自动投稿', "否"), False)
+    bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
+    bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
+    bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))
+    bili_default_tags = read_config_value(config, 'B站投稿', '默认标签', "搞笑,名场面,主播日常,搞笑日常").strip()
+    bili_llm_api_key = read_config_value(config, 'B站投稿', '大模型api_key', "").strip()
+    bili_llm_api_base = read_config_value(config, 'B站投稿', '大模型api_base', "https://api.deepseek.com").strip()
+    bili_llm_model = read_config_value(config, 'B站投稿', '大模型model', "deepseek-chat").strip()
+    biliup_bin = read_config_value(config, 'B站投稿', 'biliup可执行文件路径', "biliup").strip()
+    streamer_types = {}
+    if '主播类型配置' in config.sections():
+        for k, v in config.items('主播类型配置'):
+            streamer_types[k.strip().lower()] = v.strip()
+    default_streamer_type = streamer_types.get('默认类型', '娱乐搞笑')
+
     video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
     # 支持 | 分隔的多格式(如 ts|MP3);单格式时退化为原白名单校验
     normalized_multi = normalize_video_save_type(video_save_type)
@@ -2508,6 +2669,8 @@ while True:
 
     try:
         url_comments, line_list, url_line_list = [[] for _ in range(3)]
+        transcribe_urls.clear()
+        bili_upload_urls.clear()
         with open(url_config_file, "r", encoding=text_encoding, errors='ignore') as file:
             for origin_line in file:
                 if origin_line in line_list:
@@ -2525,9 +2688,17 @@ while True:
                 if is_comment_line:
                     line = line.lstrip('#')
 
-                quality, url, name, save_type, transcribe_flag = parse_url_config_line(line, video_record_quality)
-                if transcribe_flag == '转MD' and url and url not in transcribe_urls:
+                quality, url, name, save_type, extra_flags = parse_url_config_line(line, video_record_quality)
+                if isinstance(extra_flags, str):
+                    extra_flags = [extra_flags]
+                if '转MD' in extra_flags and url:
                     transcribe_urls.add(url)
+                if '传B站' in extra_flags and url:
+                    bili_upload_urls.add(url)
+                    # 传B站依赖转MD产出标题与简介，自动关联转MD
+                    if '转MD' not in extra_flags:
+                        logger.info(f"URL配置检测到 '传B站'，自动关联启用 '转MD': {url}")
+                        transcribe_urls.add(url)
 
                 if quality not in ("原画", "蓝光", "超清", "高清", "标清", "流畅"):
                     quality = '原画'
