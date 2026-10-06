@@ -11,6 +11,7 @@
 import os
 import re
 import subprocess
+import shutil
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -237,8 +238,20 @@ def upload_video_biliup(
     if not os.path.exists(cookie_path):
         return False, f"B 站 Cookie 文件不存在: {cookie_path}，请先执行 biliup login 登录"
 
+    # 智能定位 biliup 可执行文件路径
+    resolved_bin = str(biliup_bin or "biliup")
+    if not shutil.which(resolved_bin):
+        candidates = [
+            os.path.expanduser("~/.local/bin/biliup"),
+            "/home/ubuntu/.local/bin/biliup",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                resolved_bin = c
+                break
+
     cmd = [
-        str(biliup_bin or "biliup"),
+        resolved_bin,
         "-u", str(cookie_path),
         "upload",
         str(video_path),
