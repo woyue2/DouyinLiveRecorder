@@ -91,6 +91,8 @@ transcribe_urls: set[str] = set()
 bili_upload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bili_upload")
 # 需要上传 B 站的直播 URL 集合，由 URL_config.ini 中 "传B站" 登记
 bili_upload_urls: set[str] = set()
+# 仅自己可见的 B 站投稿 URL 集合，由 URL_config.ini 中 "仅自己可见" 登记
+bili_self_only_urls: set[str] = set()
 url_tuples_list = []
 url_comments = []
 text_no_repeat_url = []
@@ -444,6 +446,8 @@ bili_llm_model = "deepseek-chat"
 biliup_bin = "biliup"
 streamer_types = {}
 default_streamer_type = "娱乐搞笑"
+streamer_visibility = {}
+default_streamer_visibility = "公开"
 
 
 _VIDEO_EXTS = (".ts", ".mp4", ".flv", ".mkv")
@@ -482,6 +486,14 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         llm_model=bili_llm_model or "deepseek-chat"
     )
 
+    is_only_self = False
+    if record_url in bili_self_only_urls:
+        is_only_self = True
+    elif streamer_visibility.get(clean_name.lower()) == '仅自己可见':
+        is_only_self = True
+    elif default_streamer_visibility == '仅自己可见':
+        is_only_self = True
+
     success, output = upload_video_biliup(
         video_path=video_path,
         title=meta["title"],
@@ -491,21 +503,23 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         cookie_path=bili_cookie_path,
         copyright_type=2,
         source="抖音直播",
-        biliup_bin=biliup_bin
+        biliup_bin=biliup_bin,
+        is_only_self=is_only_self
     )
 
     video_name = Path(video_path).name
+    vis_label = " (仅自己可见)" if is_only_self else ""
     if success:
         bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
         bvid = bvid_match.group(0) if bvid_match else "已提交"
-        content = (f"[B站投稿成功] {record_name}\n"
+        content = (f"[B站投稿成功{vis_label}] {record_name}\n"
                    f"标题: {meta['title']}\n"
                    f"BV号: {bvid}\n"
                    f"文件: {video_name}")
         handle_post_upload_cleanup(video_path, policy=bili_post_policy)
     else:
         err = output.strip()[:200]
-        content = (f"[B站投稿失败] {record_name}\n"
+        content = (f"[B站投稿失败{vis_label}] {record_name}\n"
                    f"文件: {video_name}\n"
                    f"错误: {err}")
         # 上传失败时，清理占位符，允许百度云脚本备份并清理，避免磁盘被占满
@@ -2445,6 +2459,8 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
             config_parser.add_section('B站投稿')
         if '主播类型配置' not in config_parser.sections():
             config_parser.add_section('主播类型配置')
+        if '主播可见性配置' not in config_parser.sections():
+            config_parser.add_section('主播可见性配置')
         return config_parser.get(section, option)
     except (configparser.NoSectionError, configparser.NoOptionError):
         config_parser.set(section, option, str(default_value))
@@ -2645,6 +2661,12 @@ while True:
             streamer_types[k.strip().lower()] = v.strip()
     default_streamer_type = streamer_types.get('默认类型', '娱乐搞笑')
 
+    streamer_visibility = {}
+    if '主播可见性配置' in config.sections():
+        for k, v in config.items('主播可见性配置'):
+            streamer_visibility[k.strip().lower()] = v.strip()
+    default_streamer_visibility = streamer_visibility.get('默认可见性', '公开')
+
     video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
     # 支持 | 分隔的多格式(如 ts|MP3);单格式时退化为原白名单校验
     normalized_multi = normalize_video_save_type(video_save_type)
@@ -2671,6 +2693,7 @@ while True:
         url_comments, line_list, url_line_list = [[] for _ in range(3)]
         transcribe_urls.clear()
         bili_upload_urls.clear()
+        bili_self_only_urls.clear()
         with open(url_config_file, "r", encoding=text_encoding, errors='ignore') as file:
             for origin_line in file:
                 if origin_line in line_list:
@@ -2693,6 +2716,8 @@ while True:
                     extra_flags = [extra_flags]
                 if '转MD' in extra_flags and url:
                     transcribe_urls.add(url)
+                if any(f in extra_flags for f in ('仅自己可见', '私密')) and url:
+                    bili_self_only_urls.add(url)
                 if '传B站' in extra_flags and url:
                     bili_upload_urls.add(url)
                     # 传B站依赖转MD产出标题与简介，自动关联转MD

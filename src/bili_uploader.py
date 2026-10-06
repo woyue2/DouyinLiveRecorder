@@ -210,7 +210,8 @@ def upload_video_biliup(
     line: Optional[str] = None,
     copyright_type: int = 2,
     source: str = "",
-    biliup_bin: str = "biliup"
+    biliup_bin: str = "biliup",
+    is_only_self: bool = False
 ) -> Tuple[bool, str]:
     """调用 biliup 命令上传视频到 B 站。
 
@@ -225,6 +226,7 @@ def upload_video_biliup(
         copyright_type: 1 自制，2 转载
         source: 转载来源描述（不放 URL）
         biliup_bin: biliup 可执行文件路径（默认 'biliup'）
+        is_only_self: 是否仅自己可见（私密投稿，默认 False 公开）
 
     Returns:
         (是否成功, 日志/错误信息)
@@ -246,6 +248,9 @@ def upload_video_biliup(
         "--tid", str(tid),
         "--copyright", str(copyright_type),
     ]
+
+    if is_only_self:
+        cmd.extend(["--is-only-self", "1"])
 
     if copyright_type == 2 and source:
         cmd.extend(["--source", source])

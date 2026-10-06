@@ -167,3 +167,56 @@ TAGS: 合家欢乐乐乐,超长超长超长超长超长超长超长超长超长�
     finally:
         os.remove(temp_md)
 
+
+def test_upload_is_only_self(monkeypatch):
+    import subprocess
+    recorded_cmd = []
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal recorded_cmd
+        recorded_cmd = cmd
+        class FakeResult:
+            returncode = 0
+            stdout = "bvid: String(\"BVtest123\")"
+            stderr = ""
+        return FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".ts", delete=False) as f:
+        f.write("fake video")
+        temp_ts = f.name
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write("{}")
+        temp_cookie = f.name
+
+    try:
+        # 测试 is_only_self=True
+        success, out = bili_uploader.upload_video_biliup(
+            video_path=temp_ts,
+            title="测试标题",
+            desc="测试简介",
+            tags="测试标签",
+            cookie_path=temp_cookie,
+            is_only_self=True
+        )
+        assert success
+        assert "--is-only-self" in recorded_cmd
+        idx = recorded_cmd.index("--is-only-self")
+        assert recorded_cmd[idx + 1] == "1"
+
+        # 测试 is_only_self=False (公开)
+        success, out = bili_uploader.upload_video_biliup(
+            video_path=temp_ts,
+            title="测试标题",
+            desc="测试简介",
+            tags="测试标签",
+            cookie_path=temp_cookie,
+            is_only_self=False
+        )
+        assert success
+        assert "--is-only-self" not in recorded_cmd
+    finally:
+        os.remove(temp_ts)
+        os.remove(temp_cookie)
+
