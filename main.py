@@ -438,8 +438,11 @@ transcribe_script = ""
 # B站投稿全局配置项（从 config.ini [B站投稿] 读取）
 bili_upload_enabled = False
 bili_upload_mode = "整场多P投稿"
-bili_cooldown_minutes = 60
+bili_min_interval_seconds = 360 * 60
+bili_cooldown_minutes = 360
 bili_cooldown_until = 0.0
+bili_last_submit_time = 0.0
+bili_last_submit_lock = threading.Lock()
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
 bili_default_tid = 138
@@ -474,12 +477,51 @@ def hold_videos_for_bili(files: list) -> None:
                     logger.warning(f"创建B站占位失败 {marker}: {e}")
 
 
+def wait_for_bili_slot() -> bool:
+    """在投稿前等待满足最小投稿间隔与风控冷却要求。返回 False 表示等待超时放弃。"""
+    global bili_last_submit_time
+    while True:
+        now = time.time()
+        wait_seconds = 0.0
+        reason = ""
+        if now < bili_cooldown_until:
+            wait_seconds = bili_cooldown_until - now
+            reason = "风控冷却"
+        elif bili_min_interval_seconds > 0 and bili_last_submit_time > 0:
+            elapsed = now - bili_last_submit_time
+            if elapsed < bili_min_interval_seconds:
+                wait_seconds = bili_min_interval_seconds - elapsed
+                reason = "最小投稿间隔"
+        if wait_seconds <= 0:
+            return True
+        logger.info(
+            f"B站投稿受限（{reason}），需等待约 {int(wait_seconds // 60)} 分钟后再提交，"
+            f"期间视频已加锁保护不会被删除"
+        )
+        try:
+            push_message(
+                "B站投稿",
+                "",
+                f"[B站投稿排队] 受限于{reason}，将在约 {int(wait_seconds // 60)} 分钟后自动提交。"
+                f"视频已加锁保护，不会被删除或上传网盘。",
+            )
+        except Exception:
+            pass
+        # 单次最多等待 2 小时后重新判断，避免无限占用执行器线程
+        time.sleep(min(wait_seconds, 7200))
+
+
+def mark_bili_submitted() -> None:
+    """记录一次投稿发起时间，用于计算下一次的最小间隔。"""
+    global bili_last_submit_time
+    with bili_last_submit_lock:
+        bili_last_submit_time = time.time()
+
+
 def process_bili_upload_task(video_path: str, md_path: str, record_name: str, record_url: str) -> None:
     """提取 MD 中的标题与简介，调用 biliup 上传单视频，成功后按策略清理本地视频，并发送通知。"""
     global bili_cooldown_until
-    if time.time() < bili_cooldown_until:
-        rem = int((bili_cooldown_until - time.time()) // 60)
-        logger.warning(f"B站投稿处于风控冷却期中（剩余约 {rem} 分钟），暂缓提交: {video_path}")
+    if not wait_for_bili_slot():
         return
 
     if not os.path.exists(video_path):
@@ -519,6 +561,7 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
     elif default_streamer_visibility == '仅自己可见':
         is_only_self = True
 
+    mark_bili_submitted()
     success, output = upload_video_biliup(
         video_path=video_path,
         title=meta["title"],
@@ -571,9 +614,7 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
 def process_session_multi_p_upload(save_file_path: str, record_name: str, record_url: str) -> None:
     """整场直播录制结束时，汇总该场次的所有 TS 分段，作为多 P 合集一次性投稿到 B 站。"""
     global bili_cooldown_until
-    if time.time() < bili_cooldown_until:
-        rem = int((bili_cooldown_until - time.time()) // 60)
-        logger.warning(f"B站投稿处于风控冷却期中（剩余约 {rem} 分钟），暂缓整场多P提交: {save_file_path}")
+    if not wait_for_bili_slot():
         return
 
     session_dir = str(Path(save_file_path).parent)
@@ -624,6 +665,7 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
     elif default_streamer_visibility == '仅自己可见':
         is_only_self = True
 
+    mark_bili_submitted()
     success, output = upload_video_biliup(
         video_path=valid_ts_paths,
         title=meta["title"],
@@ -2814,7 +2856,8 @@ while True:
 
     bili_upload_enabled = options.get(read_config_value(config, 'B站投稿', '是否开启B站自动投稿', "否"), False)
     bili_upload_mode = read_config_value(config, 'B站投稿', '投稿模式', "整场多P投稿").strip()
-    bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 60))
+    bili_min_interval_seconds = int(read_config_value(config, 'B站投稿', '最小投稿间隔(分钟)', 360)) * 60
+    bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 360))
     bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
     bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
     bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))
