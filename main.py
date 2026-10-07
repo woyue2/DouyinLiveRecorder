@@ -442,7 +442,11 @@ bili_min_interval_seconds = 360 * 60
 bili_cooldown_minutes = 360
 bili_cooldown_until = 0.0
 bili_last_submit_time = 0.0
-bili_last_submit_lock = threading.Lock()
+bili_submit_lock = threading.Lock()
+# B站待投稿队列：满足最小间隔后由后台线程依次提交，避免阻塞录制主流程
+bili_pending_queue: list[dict] = []
+bili_queue_lock = threading.Lock()
+bili_queue_worker_started = False
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
 bili_default_tid = 138
@@ -477,64 +481,120 @@ def hold_videos_for_bili(files: list) -> None:
                     logger.warning(f"创建B站占位失败 {marker}: {e}")
 
 
-def wait_for_bili_slot() -> bool:
-    """在投稿前等待满足最小投稿间隔与风控冷却要求。返回 False 表示等待超时放弃。"""
-    global bili_last_submit_time
-    while True:
-        now = time.time()
-        wait_seconds = 0.0
-        reason = ""
-        if now < bili_cooldown_until:
-            wait_seconds = bili_cooldown_until - now
-            reason = "风控冷却"
-        elif bili_min_interval_seconds > 0 and bili_last_submit_time > 0:
-            elapsed = now - bili_last_submit_time
-            if elapsed < bili_min_interval_seconds:
-                wait_seconds = bili_min_interval_seconds - elapsed
-                reason = "最小投稿间隔"
-        if wait_seconds <= 0:
-            return True
-        logger.info(
-            f"B站投稿受限（{reason}），需等待约 {int(wait_seconds // 60)} 分钟后再提交，"
-            f"期间视频已加锁保护不会被删除"
-        )
-        try:
-            push_message(
-                "B站投稿",
-                "",
-                f"[B站投稿排队] 受限于{reason}，将在约 {int(wait_seconds // 60)} 分钟后自动提交。"
-                f"视频已加锁保护，不会被删除或上传网盘。",
-            )
-        except Exception:
-            pass
-        # 单次最多等待 2 小时后重新判断，避免无限占用执行器线程
-        time.sleep(min(wait_seconds, 7200))
+def bili_slot_status() -> tuple[bool, str, int]:
+    """非阻塞检查当前是否允许投稿。返回 (是否可投, 原因, 还需等待秒数)。"""
+    now = time.time()
+    if now < bili_cooldown_until:
+        return False, "风控冷却", int(bili_cooldown_until - now)
+    if bili_min_interval_seconds > 0 and bili_last_submit_time > 0:
+        elapsed = now - bili_last_submit_time
+        if elapsed < bili_min_interval_seconds:
+            return False, "最小投稿间隔", int(bili_min_interval_seconds - elapsed)
+    return True, "", 0
 
 
 def mark_bili_submitted() -> None:
     """记录一次投稿发起时间，用于计算下一次的最小间隔。"""
     global bili_last_submit_time
-    with bili_last_submit_lock:
+    with bili_submit_lock:
         bili_last_submit_time = time.time()
 
 
-def process_bili_upload_task(video_path: str, md_path: str, record_name: str, record_url: str) -> None:
-    """提取 MD 中的标题与简介，调用 biliup 上传单视频，成功后按策略清理本地视频，并发送通知。"""
-    global bili_cooldown_until
-    if not wait_for_bili_slot():
-        return
+def enqueue_bili_job(job: dict) -> None:
+    """将待投稿任务加入队列，由后台线程按最小间隔依次提交。"""
+    with bili_queue_lock:
+        bili_pending_queue.append(job)
+        position = len(bili_pending_queue)
+    logger.info(f"B站投稿已入队（队列第 {position} 位）: {job.get('record_name')}")
+    try:
+        push_message(
+            job.get("record_name", "B站投稿"),
+            "",
+            f"[B站投稿排队] 场次《{job.get('session_dir', '').split('/')[-1]}》已进入待投稿队列"
+            f"（第 {position} 位）。新号限制每 6 小时仅可投稿一次，"
+            f"视频全程加锁保护，不会被删除或上传网盘。",
+        )
+    except Exception as e:
+        logger.error(f"B站排队通知发送失败: {e}")
 
+
+def bili_queue_worker() -> None:
+    """后台投稿线程：每 3 分钟检查一次，满足间隔限制时取出队首任务提交。"""
+    while True:
+        time.sleep(180)
+        if not bili_upload_enabled:
+            continue
+        with bili_queue_lock:
+            job = bili_pending_queue[0] if bili_pending_queue else None
+        if job is None:
+            continue
+        ready, reason, wait_seconds = bili_slot_status()
+        if not ready:
+            logger.debug(f"B站队列等待中（{reason}，剩 {wait_seconds // 60} 分钟）")
+            continue
+        with bili_queue_lock:
+            if bili_pending_queue:
+                bili_pending_queue.pop(0)
+        logger.info(f"B站队列开始提交: {job.get('record_name')}")
+        try:
+            run_bili_job(job)
+        except Exception as e:
+            logger.error(f"B站队列任务执行异常: {type(e).__name__}: {e}")
+
+
+def ensure_bili_queue_worker() -> None:
+    """确保投稿后台线程已启动（只启动一次）。"""
+    global bili_queue_worker_started
+    if bili_queue_worker_started:
+        return
+    bili_queue_worker_started = True
+    threading.Thread(target=bili_queue_worker, name="bili-queue", daemon=True).start()
+    logger.info("B站投稿队列后台线程已启动")
+
+
+def wait_for_bili_slot() -> bool:
+    """兼容旧调用：非阻塞检查，不满足条件直接返回 False。"""
+    ready, reason, wait_seconds = bili_slot_status()
+    if not ready:
+        logger.info(f"B站投稿受限（{reason}），需等待约 {wait_seconds // 60} 分钟")
+    return ready
+
+
+def process_bili_upload_task(video_path: str, md_path: str, record_name: str, record_url: str) -> None:
+    """单分段投稿：满足间隔限制时直接提交，否则入队由后台线程稍后处理。"""
     if not os.path.exists(video_path):
         return
-    try:
-        file_size = os.path.getsize(video_path)
-        if file_size < 2 * 1024 * 1024:  # 小于 2MB 的极短残片跳过上传并清理占位
-            logger.info(f"视频文件过小 ({file_size} 字节)，跳过B站投稿: {video_path}")
-            handle_post_upload_cleanup(video_path, policy=bili_post_policy)
-            return
-    except OSError:
-        pass
+    ready, reason, wait_seconds = bili_slot_status()
+    if ready:
+        run_bili_job({
+            "kind": "single",
+            "video_path": video_path,
+            "md_path": md_path,
+            "record_name": record_name,
+            "record_url": record_url,
+        })
+        return
+    enqueue_bili_job({
+        "kind": "single",
+        "video_path": video_path,
+        "md_path": md_path,
+        "record_name": record_name,
+        "record_url": record_url,
+        "reason": reason,
+        "wait_seconds": wait_seconds,
+    })
 
+
+def run_bili_job(job: dict) -> None:
+    """执行实际的 B 站投稿任务（由直接调用或队列后台线程触发）。"""
+    if job.get("kind") == "single":
+        run_bili_single_job(job)
+    else:
+        run_bili_session_job(job)
+
+
+def _resolve_streamer_type(record_name: str) -> tuple[str, str]:
+    """从房间标识中解析主播名与主播类型。"""
     clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
     clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
     streamer_type = default_streamer_type
@@ -542,7 +602,55 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         if k in clean_name.lower() or clean_name.lower() in k:
             streamer_type = v
             break
+    return clean_name, streamer_type
 
+
+def _is_only_self(record_name: str, record_url: str, clean_name: str) -> bool:
+    """判断该投稿是否应设为仅自己可见。"""
+    if record_url and record_url in bili_self_only_urls:
+        return True
+    if streamer_visibility.get(clean_name.lower()) == '仅自己可见':
+        return True
+    return default_streamer_visibility == '仅自己可见'
+
+
+def _handle_bili_failure(output: str, record_name: str, extra: str, vis_label: str) -> str | None:
+    """处理投稿失败输出；若为风控限制返回 None，交由调用方设置冷却。"""
+    if "RATE_LIMITED_21566" in output:
+        return None
+    lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
+    err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
+    err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
+    return f"[B站投稿失败{vis_label}] {record_name}\n{extra}\n错误: {err}"
+
+
+def _rate_limit_notice(record_name: str) -> str:
+    return (f"[B站投稿触发风控冷却] {record_name}\n"
+            f"原因: 检测到平台频繁投稿限制(code 21566/601)\n"
+            f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
+
+
+def run_bili_single_job(job: dict) -> None:
+    """单分段投稿（兼容模式）。"""
+    global bili_cooldown_until
+    video_path = job["video_path"]
+    md_path = job["md_path"]
+    record_name = job["record_name"]
+    record_url = job.get("record_url", "")
+
+    if not os.path.exists(video_path):
+        logger.warning(f"B站投稿跳过，文件已不存在: {video_path}")
+        return
+    try:
+        file_size = os.path.getsize(video_path)
+        if file_size < 2 * 1024 * 1024:
+            logger.info(f"视频文件过小 ({file_size} 字节)，跳过B站投稿: {video_path}")
+            handle_post_upload_cleanup(video_path, policy=bili_post_policy)
+            return
+    except OSError:
+        pass
+
+    clean_name, streamer_type = _resolve_streamer_type(record_name)
     meta = extract_bili_metadata(
         md_path=md_path,
         record_name=record_name,
@@ -552,14 +660,8 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         llm_api_base=bili_llm_api_base or None,
         llm_model=bili_llm_model or "deepseek-chat"
     )
-
-    is_only_self = False
-    if record_url in bili_self_only_urls:
-        is_only_self = True
-    elif streamer_visibility.get(clean_name.lower()) == '仅自己可见':
-        is_only_self = True
-    elif default_streamer_visibility == '仅自己可见':
-        is_only_self = True
+    is_only_self = _is_only_self(record_name, record_url, clean_name)
+    vis_label = " (仅自己可见)" if is_only_self else ""
 
     mark_bili_submitted()
     success, output = upload_video_biliup(
@@ -576,7 +678,6 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
     )
 
     video_name = Path(video_path).name
-    vis_label = " (仅自己可见)" if is_only_self else ""
     if success:
         bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
         bvid = bvid_match.group(0) if bvid_match else "已提交"
@@ -586,19 +687,10 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
                    f"文件: {video_name}")
         handle_post_upload_cleanup(video_path, policy=bili_post_policy)
     else:
-        if "RATE_LIMITED_21566" in output:
+        content = _handle_bili_failure(output, record_name, f"文件: {video_name}", vis_label)
+        if content is None:
             bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
-            content = (f"[B站投稿触发风控冷却] {record_name}\n"
-                       f"原因: 检测到平台频繁投稿限制(code 21566/601)\n"
-                       f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
-        else:
-            lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
-            err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
-            err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
-            content = (f"[B站投稿失败{vis_label}] {record_name}\n"
-                       f"文件: {video_name}\n"
-                       f"错误: {err}")
-        # 上传失败时，清理占位符，允许百度云脚本备份并清理，避免磁盘被占满
+            content = _rate_limit_notice(record_name)
         placeholder = video_path + ".bili_uploading"
         if os.path.exists(placeholder):
             try:
@@ -611,42 +703,19 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         logger.error(f"B站投稿通知发送失败 {video_name}: {e}")
 
 
-def process_session_multi_p_upload(save_file_path: str, record_name: str, record_url: str) -> None:
-    """整场直播录制结束时，汇总该场次的所有 TS 分段，作为多 P 合集一次性投稿到 B 站。"""
+def run_bili_session_job(job: dict) -> None:
+    """整场多 P 合集投稿。"""
     global bili_cooldown_until
-    if not wait_for_bili_slot():
-        return
-
-    session_dir = str(Path(save_file_path).parent)
-    p = Path(session_dir)
-    ts_files = sorted(p.glob("*.ts"))
-    valid_ts_paths = []
-    for f in ts_files:
-        try:
-            if f.stat().st_size >= 2 * 1024 * 1024:
-                valid_ts_paths.append(str(f))
-        except OSError:
-            pass
+    session_dir = job["session_dir"]
+    record_name = job["record_name"]
+    record_url = job.get("record_url", "")
+    valid_ts_paths = [p for p in job.get("ts_paths", []) if os.path.exists(p)]
 
     if not valid_ts_paths:
-        logger.info(f"整场多P投稿：未找到有效视频文件 ({session_dir})")
+        logger.info(f"整场多P投稿：视频文件已不存在，跳过 ({session_dir})")
         return
 
-    # 等待正在转写的占位符完成（最多等 120 秒）
-    wait_start = time.time()
-    while time.time() - wait_start < 120:
-        if not list(p.glob("*.transcribing")):
-            break
-        time.sleep(2)
-
-    clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
-    clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
-    streamer_type = default_streamer_type
-    for k, v in streamer_types.items():
-        if k in clean_name.lower() or clean_name.lower() in k:
-            streamer_type = v
-            break
-
+    clean_name, streamer_type = _resolve_streamer_type(record_name)
     meta = extract_session_bili_metadata(
         session_dir=session_dir,
         record_name=record_name,
@@ -656,14 +725,8 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         llm_api_base=bili_llm_api_base or None,
         llm_model=bili_llm_model or "deepseek-chat"
     )
-
-    is_only_self = False
-    if record_url in bili_self_only_urls:
-        is_only_self = True
-    elif streamer_visibility.get(clean_name.lower()) == '仅自己可见':
-        is_only_self = True
-    elif default_streamer_visibility == '仅自己可见':
-        is_only_self = True
+    is_only_self = _is_only_self(record_name, record_url, clean_name)
+    vis_label = " (仅自己可见)" if is_only_self else ""
 
     mark_bili_submitted()
     success, output = upload_video_biliup(
@@ -689,22 +752,54 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
                    f"总集数: {len(valid_ts_paths)}P (全场自动合集)")
         handle_post_upload_cleanup(valid_ts_paths, policy=bili_post_policy)
     else:
-        if "RATE_LIMITED_21566" in output:
+        content = _handle_bili_failure(output, record_name, f"集数: {len(valid_ts_paths)}P", vis_label)
+        if content is None:
             bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
-            content = (f"[B站投稿触发风控冷却] {record_name}\n"
-                       f"原因: 检测到平台频繁投稿限制(code 21566/601)\n"
-                       f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
-        else:
-            lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
-            err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
-            err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
-            content = (f"[B站整场多P投稿失败{vis_label}] {record_name}\n"
-                       f"集数: {len(valid_ts_paths)}P\n"
-                       f"错误: {err}")
+            content = _rate_limit_notice(record_name)
     try:
         push_message(record_name, "", content)
     except Exception as e:
         logger.error(f"B站整场多P投稿通知发送失败: {e}")
+
+
+def process_session_multi_p_upload(save_file_path: str, record_name: str, record_url: str) -> None:
+    """录制结束：收集整场 TS，满足间隔限制则立即投稿，否则入队由后台线程稍后提交。"""
+    session_dir = str(Path(save_file_path).parent)
+    p = Path(session_dir)
+
+    # 等待正在转写的占位符完成（最多等 120 秒），确保简介素材齐全
+    wait_start = time.time()
+    while time.time() - wait_start < 120:
+        if not list(p.glob("*.transcribing")):
+            break
+        time.sleep(2)
+
+    valid_ts_paths = []
+    for f in sorted(p.glob("*.ts")):
+        try:
+            if f.stat().st_size >= 2 * 1024 * 1024:
+                valid_ts_paths.append(str(f))
+        except OSError:
+            pass
+
+    if not valid_ts_paths:
+        logger.info(f"整场多P投稿：未找到有效视频文件 ({session_dir})")
+        return
+
+    job = {
+        "kind": "session",
+        "session_dir": session_dir,
+        "ts_paths": valid_ts_paths,
+        "record_name": record_name,
+        "record_url": record_url,
+    }
+    ready, reason, wait_seconds = bili_slot_status()
+    if ready:
+        run_bili_job(job)
+    else:
+        job["reason"] = reason
+        job["wait_seconds"] = wait_seconds
+        enqueue_bili_job(job)
 
 
 def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "") -> None:
@@ -2877,6 +2972,10 @@ while True:
         for k, v in config.items('主播可见性配置'):
             streamer_visibility[k.strip().lower()] = v.strip()
     default_streamer_visibility = streamer_visibility.get('默认可见性', '公开')
+
+    # 启动 B 站待投稿队列后台线程（仅启动一次）
+    if bili_upload_enabled:
+        ensure_bili_queue_worker()
 
     video_save_type_list = ("FLV", "MKV", "TS", "MP4", "MP3音频", "M4A音频", "MP3", "M4A")
     # 支持 | 分隔的多格式(如 ts|MP3);单格式时退化为原白名单校验
