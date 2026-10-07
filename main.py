@@ -472,9 +472,24 @@ def hold_videos_for_bili(files: list) -> None:
 
 def process_bili_upload_task(video_path: str, md_path: str, record_name: str, record_url: str) -> None:
     """提取 MD 中的标题与简介，调用 biliup 上传视频，成功后按策略清理本地视频，并发送通知。"""
+    if not os.path.exists(video_path):
+        return
+    try:
+        file_size = os.path.getsize(video_path)
+        if file_size < 2 * 1024 * 1024:  # 小于 2MB 的极短残片跳过上传并清理占位
+            logger.info(f"视频文件过小 ({file_size} 字节)，跳过B站投稿: {video_path}")
+            handle_post_upload_cleanup(video_path, policy=bili_post_policy)
+            return
+    except OSError:
+        pass
+
     clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
     clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
-    streamer_type = streamer_types.get(clean_name.lower(), default_streamer_type)
+    streamer_type = default_streamer_type
+    for k, v in streamer_types.items():
+        if k in clean_name.lower() or clean_name.lower() in k:
+            streamer_type = v
+            break
 
     meta = extract_bili_metadata(
         md_path=md_path,
@@ -518,7 +533,10 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
                    f"文件: {video_name}")
         handle_post_upload_cleanup(video_path, policy=bili_post_policy)
     else:
-        err = output.strip()[:200]
+        # 智能提取关键错误行，避免只截取到开头无意义的启动日志
+        lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
+        err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
+        err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
         content = (f"[B站投稿失败{vis_label}] {record_name}\n"
                    f"文件: {video_name}\n"
                    f"错误: {err}")
@@ -665,6 +683,12 @@ def submit_transcribe(published_files: list, record_name: str, record_url: str =
     for published in published_files:
         if not is_transcribable_audio(published):
             continue
+        try:
+            if os.path.exists(published) and os.path.getsize(published) < 500 * 1024:
+                logger.info(f"音频文件过短 ({os.path.getsize(published)} 字节)，跳过转写: {published}")
+                continue
+        except OSError:
+            pass
         placeholder = published + ".transcribing"
         if os.path.exists(placeholder):
             continue
