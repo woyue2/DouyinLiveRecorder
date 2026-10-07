@@ -240,7 +240,9 @@ def extract_session_bili_metadata(
             record_name=record_name,
             streamer_type=streamer_type,
             default_tags=default_tags,
-            llm_api_key=None
+            llm_api_key=llm_api_key or os.getenv("BILI_LLM_API_KEY"),
+            llm_api_base=llm_api_base,
+            llm_model=llm_model
         )
         p_label = f"【P{idx+1}】"
         desc = meta["desc"]
@@ -478,47 +480,49 @@ def generate_bili_meta_with_llm(
     import json
     import urllib.request
 
-    try:
-        if is_anthropic_api:
-            # MiniMax Anthropic 兼容端点或原生 Anthropic 协议
-            url = base_url + "/v1/messages"
-            headers = {
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01"
-            }
-            payload = {
-                "model": model,
-                "max_tokens": 1024,
-                "system": system_prompt,
-                "messages": [
-                    {"role": "user", "content": f"直播内容文本如下：\n{user_content}"}
-                ]
-            }
-        else:
-            # 标准 OpenAI / DeepSeek / MiniMax v1 兼容端点
-            url = base_url + ("/v1/chat/completions" if not base_url.endswith("/v1") else "/chat/completions")
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
-            }
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"直播内容文本如下：\n{user_content}"}
-                ],
-                "temperature": 0.7
-            }
+    if is_anthropic_api:
+        # MiniMax Anthropic 兼容端点或原生 Anthropic 协议
+        url = base_url + "/v1/messages"
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 1024,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": f"直播内容文本如下：\n{user_content}"}
+            ]
+        }
+    else:
+        # 标准 OpenAI / DeepSeek / MiniMax v1 兼容端点
+        url = base_url + ("/v1/chat/completions" if not base_url.endswith("/v1") else "/chat/completions")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"直播内容文本如下：\n{user_content}"}
+            ],
+            "temperature": 0.7
+        }
 
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
+    last_error = None
+    for attempt in range(3):  # JSON 解析失败时最多重试 3 次
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
             if is_anthropic_api:
                 content = resp_data["content"][0]["text"]
             else:
@@ -527,15 +531,16 @@ def generate_bili_meta_with_llm(
             # 清理可能的 markdown 代码块标记 ```json ... ```
             content_cleaned = re.sub(r'^```(?:json)?\s*', '', content.strip(), flags=re.IGNORECASE)
             content_cleaned = re.sub(r'\s*```$', '', content_cleaned.strip())
-            # 尝试提取首个合法 JSON 对象并使用 strict=False 解析（允许字符串内存在原始换行与控制字符）
+            # 提取首个 JSON 对象并用 strict=False 解析（允许字符串内存在原始换行）
             json_match = re.search(r'\{[\s\S]*\}', content_cleaned)
             json_str = json_match.group(0) if json_match else content_cleaned
             try:
                 result = json.loads(json_str, strict=False)
             except Exception:
-                # 容错处理：清除异常不可见控制字符后重试
-                clean_str = re.sub(r'[\x00-\x09\x0b-\x1f]', '', json_str)
-                result = json.loads(clean_str, strict=False)
+                # 容错：把 JSON 字符串内部未转义的裸换行转义为 \n
+                escaped = re.sub(r'(?<!\\)"(\s*)\n(\s*)"', r'"\n"', json_str)
+                escaped = re.sub(r'[\x00-\x09\x0b-\x1f]', '', escaped)
+                result = json.loads(escaped, strict=False)
 
             title = str(result.get("title", "")).strip()
             desc = str(result.get("desc", "")).strip()
@@ -548,9 +553,11 @@ def generate_bili_meta_with_llm(
                 tag_list = [t.strip()[:20] for t in str(raw_tags).split(",") if t.strip()]
                 tags = ",".join(tag_list)
 
-            # 二次净化确保不包含直播链接与【直播精华】
-            title = re.sub(r'【直播[精核心]+】', '', title).strip()
-            desc = re.sub(r'https?://\S+', '', desc).strip()
+            # 净化：剥离 markdown 加粗标记、去除链接与【直播精华】等死板字眼
+            title = re.sub(r'【直播[精核心]+】', '', title).replace('**', '').strip()
+            desc = desc.replace('**', '')
+            desc = re.sub(r'https?://\S+', '', desc)
+            desc = re.sub(r'^[💡🎯✅❌]\s*', '', desc, flags=re.MULTILINE).strip()
             if len(desc) > 1000:
                 desc = desc[:997] + "..."
 
@@ -561,8 +568,10 @@ def generate_bili_meta_with_llm(
                     "desc": desc,
                     "tags": tags or f"{clean_streamer_name},搞笑,名场面",
                 }
-    except Exception as e:
-        logger.warning(f"调用 LLM 生成 B 站元数据失败: {e}，将回退到规则提取")
-
+            last_error = "LLM 返回内容缺少 title 字段"
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"LLM 调用第 {attempt + 1} 次失败: {e}")
+    logger.warning(f"调用 LLM 生成 B 站元数据失败（重试 3 次）: {last_error}，将回退到规则提取")
     return None
 
