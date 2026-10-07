@@ -51,6 +51,7 @@ from src.recording_config import (
 )
 from src.bili_uploader import (
     extract_bili_metadata,
+    extract_session_bili_metadata,
     upload_video_biliup,
     handle_post_upload_cleanup,
 )
@@ -436,6 +437,9 @@ def run_script(command: str) -> None:
 transcribe_script = ""
 # B站投稿全局配置项（从 config.ini [B站投稿] 读取）
 bili_upload_enabled = False
+bili_upload_mode = "整场多P投稿"
+bili_cooldown_minutes = 60
+bili_cooldown_until = 0.0
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
 bili_default_tid = 138
@@ -471,7 +475,13 @@ def hold_videos_for_bili(files: list) -> None:
 
 
 def process_bili_upload_task(video_path: str, md_path: str, record_name: str, record_url: str) -> None:
-    """提取 MD 中的标题与简介，调用 biliup 上传视频，成功后按策略清理本地视频，并发送通知。"""
+    """提取 MD 中的标题与简介，调用 biliup 上传单视频，成功后按策略清理本地视频，并发送通知。"""
+    global bili_cooldown_until
+    if time.time() < bili_cooldown_until:
+        rem = int((bili_cooldown_until - time.time()) // 60)
+        logger.warning(f"B站投稿处于风控冷却期中（剩余约 {rem} 分钟），暂缓提交: {video_path}")
+        return
+
     if not os.path.exists(video_path):
         return
     try:
@@ -533,13 +543,18 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
                    f"文件: {video_name}")
         handle_post_upload_cleanup(video_path, policy=bili_post_policy)
     else:
-        # 智能提取关键错误行，避免只截取到开头无意义的启动日志
-        lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
-        err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
-        err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
-        content = (f"[B站投稿失败{vis_label}] {record_name}\n"
-                   f"文件: {video_name}\n"
-                   f"错误: {err}")
+        if "RATE_LIMITED_21566" in output:
+            bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+            content = (f"[B站投稿触发风控冷却] {record_name}\n"
+                       f"原因: 检测到平台频繁投稿限制(code 21566/601)\n"
+                       f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
+        else:
+            lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
+            err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
+            err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
+            content = (f"[B站投稿失败{vis_label}] {record_name}\n"
+                       f"文件: {video_name}\n"
+                       f"错误: {err}")
         # 上传失败时，清理占位符，允许百度云脚本备份并清理，避免磁盘被占满
         placeholder = video_path + ".bili_uploading"
         if os.path.exists(placeholder):
@@ -551,6 +566,103 @@ def process_bili_upload_task(video_path: str, md_path: str, record_name: str, re
         push_message(record_name, "", content)
     except Exception as e:
         logger.error(f"B站投稿通知发送失败 {video_name}: {e}")
+
+
+def process_session_multi_p_upload(save_file_path: str, record_name: str, record_url: str) -> None:
+    """整场直播录制结束时，汇总该场次的所有 TS 分段，作为多 P 合集一次性投稿到 B 站。"""
+    global bili_cooldown_until
+    if time.time() < bili_cooldown_until:
+        rem = int((bili_cooldown_until - time.time()) // 60)
+        logger.warning(f"B站投稿处于风控冷却期中（剩余约 {rem} 分钟），暂缓整场多P提交: {save_file_path}")
+        return
+
+    session_dir = str(Path(save_file_path).parent)
+    p = Path(session_dir)
+    ts_files = sorted(p.glob("*.ts"))
+    valid_ts_paths = []
+    for f in ts_files:
+        try:
+            if f.stat().st_size >= 2 * 1024 * 1024:
+                valid_ts_paths.append(str(f))
+        except OSError:
+            pass
+
+    if not valid_ts_paths:
+        logger.info(f"整场多P投稿：未找到有效视频文件 ({session_dir})")
+        return
+
+    # 等待正在转写的占位符完成（最多等 120 秒）
+    wait_start = time.time()
+    while time.time() - wait_start < 120:
+        if not list(p.glob("*.transcribing")):
+            break
+        time.sleep(2)
+
+    clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
+    clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
+    streamer_type = default_streamer_type
+    for k, v in streamer_types.items():
+        if k in clean_name.lower() or clean_name.lower() in k:
+            streamer_type = v
+            break
+
+    meta = extract_session_bili_metadata(
+        session_dir=session_dir,
+        record_name=record_name,
+        streamer_type=streamer_type,
+        default_tags=bili_default_tags,
+        llm_api_key=bili_llm_api_key or None,
+        llm_api_base=bili_llm_api_base or None,
+        llm_model=bili_llm_model or "deepseek-chat"
+    )
+
+    is_only_self = False
+    if record_url in bili_self_only_urls:
+        is_only_self = True
+    elif streamer_visibility.get(clean_name.lower()) == '仅自己可见':
+        is_only_self = True
+    elif default_streamer_visibility == '仅自己可见':
+        is_only_self = True
+
+    success, output = upload_video_biliup(
+        video_path=valid_ts_paths,
+        title=meta["title"],
+        desc=meta["desc"],
+        tags=meta["tags"],
+        tid=bili_default_tid,
+        cookie_path=bili_cookie_path,
+        copyright_type=1,
+        source="",
+        biliup_bin=biliup_bin,
+        is_only_self=is_only_self
+    )
+
+    vis_label = " (仅自己可见)" if is_only_self else ""
+    if success:
+        bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
+        bvid = bvid_match.group(0) if bvid_match else "已提交"
+        content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
+                   f"标题: {meta['title']}\n"
+                   f"BV号: {bvid}\n"
+                   f"总集数: {len(valid_ts_paths)}P (全场自动合集)")
+        handle_post_upload_cleanup(valid_ts_paths, policy=bili_post_policy)
+    else:
+        if "RATE_LIMITED_21566" in output:
+            bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+            content = (f"[B站投稿触发风控冷却] {record_name}\n"
+                       f"原因: 检测到平台频繁投稿限制(code 21566/601)\n"
+                       f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
+        else:
+            lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
+            err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
+            err = ("\n".join(err_lines[-3:]) if err_lines else output.strip()[-300:])[:300]
+            content = (f"[B站整场多P投稿失败{vis_label}] {record_name}\n"
+                       f"集数: {len(valid_ts_paths)}P\n"
+                       f"错误: {err}")
+    try:
+        push_message(record_name, "", content)
+    except Exception as e:
+        logger.error(f"B站整场多P投稿通知发送失败: {e}")
 
 
 def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "") -> None:
@@ -601,37 +713,38 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                 else:
                     content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
 
-            # 触发B站投稿：转写完成后，如果该URL配置了传B站，立即提交投稿任务
+            # 触发B站投稿：转写完成后，如果该URL配置了传B站
             if record_url in bili_upload_urls and bili_upload_enabled:
-                ts_candidate = str(Path(mp3_path).with_suffix('.ts'))
-                mp4_candidate = str(Path(mp3_path).with_suffix('.mp4'))
-                video_target = ts_candidate if os.path.exists(ts_candidate) else (
-                    mp4_candidate if os.path.exists(mp4_candidate) else ""
-                )
-                if video_target:
-                    try:
-                        bili_upload_executor.submit(
-                            process_bili_upload_task,
-                            video_target,
-                            md_path,
-                            record_name,
-                            record_url
-                        )
-                    except RuntimeError as e:
-                        if "shutdown" in str(e).lower():
-                            logger.info(f"主程序退出中，跳过B站投稿提交: {video_target}")
-                        else:
-                            raise
-                else:
-                    logger.warning(f"B站投稿跳过 {mp3_name}：未找到同名视频文件 ({ts_candidate})")
-                    # 未找到同名视频，清理占位符，避免残留
-                    for ext in ('.ts', '.mp4'):
-                        v_hold = str(Path(mp3_path).with_suffix(ext)) + ".bili_uploading"
-                        if os.path.exists(v_hold):
-                            try:
-                                os.remove(v_hold)
-                            except OSError:
-                                pass
+                if bili_upload_mode != "整场多P投稿":
+                    ts_candidate = str(Path(mp3_path).with_suffix('.ts'))
+                    mp4_candidate = str(Path(mp3_path).with_suffix('.mp4'))
+                    video_target = ts_candidate if os.path.exists(ts_candidate) else (
+                        mp4_candidate if os.path.exists(mp4_candidate) else ""
+                    )
+                    if video_target:
+                        try:
+                            bili_upload_executor.submit(
+                                process_bili_upload_task,
+                                video_target,
+                                md_path,
+                                record_name,
+                                record_url
+                            )
+                        except RuntimeError as e:
+                            if "shutdown" in str(e).lower():
+                                logger.info(f"主程序退出中，跳过B站投稿提交: {video_target}")
+                            else:
+                                raise
+                    else:
+                        logger.warning(f"B站投稿跳过 {mp3_name}：未找到同名视频文件 ({ts_candidate})")
+                        # 未找到同名视频，清理占位符，避免残留
+                        for ext in ('.ts', '.mp4'):
+                            v_hold = str(Path(mp3_path).with_suffix(ext)) + ".bili_uploading"
+                            if os.path.exists(v_hold):
+                                try:
+                                    os.remove(v_hold)
+                                except OSError:
+                                    pass
         else:
             err = (result.stderr or result.stdout or f"退出码 {result.returncode}").strip()[:200]
             content = f"[直播转写] {record_name} 转写失败：{mp3_name} 错误：{err}"
@@ -950,6 +1063,19 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         print(f"\n{record_name} {stop_time} {status_text}\n")
         if record_url in bili_upload_urls and bili_upload_enabled:
             hold_videos_for_bili(published_files)
+            if bili_upload_mode == "整场多P投稿":
+                try:
+                    bili_upload_executor.submit(
+                        process_session_multi_p_upload,
+                        save_file_path,
+                        record_name,
+                        record_url
+                    )
+                except RuntimeError as e:
+                    if "shutdown" in str(e).lower():
+                        logger.info(f"主程序退出中，跳过整场多P投稿: {save_file_path}")
+                    else:
+                        raise
         # 转写触发：录制结束时最后一段(.part)发布后统一提交转写
         if should_transcribe:
             submit_transcribe(published_files, record_name, record_url)
@@ -2687,6 +2813,8 @@ while True:
     picarto_cookie = read_config_value(config, 'Cookie', 'picarto_cookie', '')
 
     bili_upload_enabled = options.get(read_config_value(config, 'B站投稿', '是否开启B站自动投稿', "否"), False)
+    bili_upload_mode = read_config_value(config, 'B站投稿', '投稿模式', "整场多P投稿").strip()
+    bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 60))
     bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
     bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
     bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))

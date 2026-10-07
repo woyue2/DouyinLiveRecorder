@@ -201,23 +201,103 @@ def extract_bili_metadata(
     }
 
 
+def extract_session_bili_metadata(
+    session_dir: str,
+    record_name: str,
+    streamer_type: str = "娱乐搞笑",
+    default_tags: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+    llm_api_base: Optional[str] = None,
+    llm_model: str = "deepseek-chat"
+) -> Dict[str, str]:
+    """汇总整场直播各个分段的 .md 文件，生成适合多 P 合集投稿的总体爆款标题与分 P 时间戳目录。"""
+    p = Path(session_dir)
+    md_files = sorted(p.glob("*.md"))
+    unique_mds = []
+    seen_stems = set()
+    for f in md_files:
+        stem = f.stem.replace("-敏感", "")
+        if stem not in seen_stems:
+            seen_stems.add(stem)
+            unique_mds.append(f)
+
+    if not unique_mds:
+        return extract_bili_metadata(
+            md_path=str(p / "dummy.md"),
+            record_name=record_name,
+            streamer_type=streamer_type,
+            default_tags=default_tags,
+            llm_api_key=llm_api_key,
+            llm_api_base=llm_api_base,
+            llm_model=llm_model
+        )
+
+    part_descs = []
+    combined_texts = []
+    for idx, md_path in enumerate(unique_mds):
+        meta = extract_bili_metadata(
+            md_path=str(md_path),
+            record_name=record_name,
+            streamer_type=streamer_type,
+            default_tags=default_tags,
+            llm_api_key=None
+        )
+        p_label = f"【P{idx+1}】"
+        desc = meta["desc"]
+        part_descs.append(f"{p_label}\n{desc}")
+        try:
+            combined_texts.append(md_path.read_text(encoding="utf-8")[:1000])
+        except Exception:
+            pass
+
+    full_desc = "\n\n".join(part_descs).strip()
+    if len(full_desc) > 1000:
+        full_desc = full_desc[:997] + "..."
+
+    clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
+    clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
+
+    overall_title = ""
+    active_api_key = llm_api_key or os.getenv("BILI_LLM_API_KEY")
+    if active_api_key and combined_texts:
+        llm_meta = generate_bili_meta_with_llm(
+            text_content="\n".join(combined_texts),
+            record_name=record_name,
+            streamer_type=streamer_type,
+            api_key=active_api_key,
+            api_base=llm_api_base,
+            model=llm_model
+        )
+        if llm_meta and llm_meta.get("title"):
+            overall_title = llm_meta["title"]
+
+    if not overall_title:
+        overall_title = f"{clean_name} 直播高能精彩合集"
+
+    return {
+        "title": overall_title[:80],
+        "desc": full_desc,
+        "tags": f"{clean_name},搞笑,名场面,主播日常,直播录像,合集",
+    }
+
+
 def upload_video_biliup(
-    video_path: str,
+    video_path: str | list[str],
     title: str,
     desc: str,
     tags: str,
     tid: int = 138,
     cookie_path: str = "cookies.json",
     line: Optional[str] = None,
-    copyright_type: int = 2,
+    copyright_type: int = 1,
     source: str = "",
     biliup_bin: str = "biliup",
     is_only_self: bool = False
 ) -> Tuple[bool, str]:
-    """调用 biliup 命令上传视频到 B 站。
+    """调用 biliup 命令上传视频到 B 站（支持单个视频或整场多 P 合集批量上传）。
 
     Args:
-        video_path: 本地视频绝对路径
+        video_path: 单个视频路径，或多个分段视频路径列表 (多P合集)
         title: 视频标题
         desc: 视频简介
         tags: 视频标签，英文逗号分隔
@@ -232,8 +312,11 @@ def upload_video_biliup(
     Returns:
         (是否成功, 日志/错误信息)
     """
-    if not os.path.exists(video_path):
-        return False, f"视频文件不存在: {video_path}"
+    video_paths = [video_path] if isinstance(video_path, str) else list(video_path)
+    valid_paths = [str(p) for p in video_paths if os.path.exists(str(p))]
+
+    if not valid_paths:
+        return False, f"视频文件不存在: {video_paths}"
 
     if not os.path.exists(cookie_path):
         return False, f"B 站 Cookie 文件不存在: {cookie_path}，请先执行 biliup login 登录"
@@ -254,7 +337,7 @@ def upload_video_biliup(
         resolved_bin,
         "-u", str(cookie_path),
         "upload",
-        str(video_path),
+    ] + valid_paths + [
         "--title", title,
         "--desc", desc,
         "--tag", tags,
@@ -271,7 +354,7 @@ def upload_video_biliup(
     if line:
         cmd.extend(["--line", line])
 
-    logger.info(f"开始执行 B 站上传: 标题={title}, 路径={video_path}")
+    logger.info(f"开始执行 B 站上传: 标题={title}, 视频数={len(valid_paths)}")
     try:
         result = subprocess.run(
             cmd,
@@ -286,6 +369,10 @@ def upload_video_biliup(
             logger.info(f"B 站上传成功: {title}")
             return True, output
         else:
+            is_rate_limited = any(k in output for k in ("21566", "过于频繁", "601"))
+            if is_rate_limited:
+                logger.warning("B 站投稿触发风控限制 (code 21566/601)")
+                return False, f"RATE_LIMITED_21566: {output.strip()[-300:]}"
             logger.error(f"B 站上传失败 (退出码 {result.returncode}): {output[:500]}")
             return False, output
     except subprocess.TimeoutExpired:
@@ -294,7 +381,7 @@ def upload_video_biliup(
         return False, f"biliup 执行异常: {type(e).__name__}: {e}"
 
 
-def handle_post_upload_cleanup(video_path: str, policy: str = "仅百度云上传md(删除ts)") -> None:
+def handle_post_upload_cleanup(video_path: str | list[str], policy: str = "仅百度云上传md(删除ts)") -> None:
     """根据 Setting 策略处理上传完成后的本地视频与占位文件。
 
     策略选项:
@@ -302,20 +389,22 @@ def handle_post_upload_cleanup(video_path: str, policy: str = "仅百度云上�
     - "百度云继续上传ts": 仅删除 .bili_uploading 占位，保留 TS 供百度云脚本搬运
     - "保留本地": 不删除 TS，移除占位
     """
-    placeholder = video_path + ".bili_uploading"
-    try:
-        if os.path.exists(placeholder):
-            os.remove(placeholder)
-    except OSError as e:
-        logger.warning(f"移除 B 站占位符失败 {placeholder}: {e}")
-
-    if policy == "仅百度云上传md(删除ts)":
+    paths = [video_path] if isinstance(video_path, str) else list(video_path)
+    for vp in paths:
+        placeholder = vp + ".bili_uploading"
         try:
-            if os.path.exists(video_path):
-                os.remove(video_path)
-                logger.info(f"[B站策略执行] 视频已上传B站，本地TS已按配置删除: {video_path}")
+            if os.path.exists(placeholder):
+                os.remove(placeholder)
         except OSError as e:
-            logger.error(f"删除已上传视频失败 {video_path}: {e}")
+            logger.warning(f"移除 B 站占位符失败 {placeholder}: {e}")
+
+        if policy == "仅百度云上传md(删除ts)":
+            try:
+                if os.path.exists(vp):
+                    os.remove(vp)
+                    logger.info(f"[B站策略执行] 视频已上传B站，本地TS已按配置删除(百度云不上传): {vp}")
+            except OSError as e:
+                logger.error(f"删除已上传视频失败 {vp}: {e}")
 
 
 def generate_bili_meta_with_llm(
