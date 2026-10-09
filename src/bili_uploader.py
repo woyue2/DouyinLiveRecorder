@@ -238,6 +238,16 @@ def extract_session_bili_metadata(
     part_descs = []
     combined_texts = []
     parts_index = []
+    # 分P越多，每P保留的行越少，确保索引评论能装下全部P
+    n_parts = len(unique_mds)
+    if n_parts > 18:
+        per_part_lines = 1
+    elif n_parts > 10:
+        per_part_lines = 2
+    elif n_parts > 6:
+        per_part_lines = 3
+    else:
+        per_part_lines = 6
     for idx, md_path in enumerate(unique_mds):
         meta = extract_bili_metadata(
             md_path=str(md_path),
@@ -250,7 +260,7 @@ def extract_session_bili_metadata(
         )
         p_label = f"【P{idx+1}】"
         desc = meta["desc"]
-        lines = _extract_index_lines(desc)
+        lines = _extract_index_lines(desc, limit=per_part_lines)
         part_descs.append(f"{p_label}\n{desc}")
         parts_index.append({
             "label": p_label,
@@ -314,16 +324,17 @@ def _make_part_title(index: int, lines: list, max_len: int = 60) -> str:
 
 
 def _extract_index_lines(desc: str, limit: int = 6) -> list:
-    """从分段简介中抽取用于置顶评论索引的精简行（优先带时间戳的行）。"""
+    """从分段简介中抽取用于分P标题/置顶评论的精简行（优先带时间戳的行）。"""
     timed, plain = [], []
     for raw in desc.splitlines():
-        line = raw.strip().lstrip("*# ").strip()
+        # 先剥离引用符/加粗标记，再判断是否为小标题行
+        line = raw.strip().lstrip("> *#").replace("**", "").strip()
         if not line:
             continue
-        # 跳过纯小标题行（如「精彩看点」「核心干货」）
-        if re.match(r'^[🎯💡✅❌📌\s]*(精彩看点|核心干货|高能看点|看点|干货)[:：]?$', line):
+        # 跳过纯小标题行（如「💡 精彩看点」「🎯 核心干货」）
+        if re.match(r'^[🎯💡✅❌📌⭐\s]*(精彩看点|核心干货|高能看点|看点|干货|本段看点|摘要)[:：]?$',
+                    line):
             continue
-        line = line.replace('**', '')
         if re.match(r'^\d{1,2}:\d{2}', line):
             timed.append(line)
         else:
