@@ -293,7 +293,7 @@ def extract_session_bili_metadata(
     }
 
 
-def _extract_index_lines(desc: str, limit: int = 4) -> list:
+def _extract_index_lines(desc: str, limit: int = 6) -> list:
     """从分段简介中抽取用于置顶评论索引的精简行（优先带时间戳的行）。"""
     timed, plain = [], []
     for raw in desc.splitlines():
@@ -611,8 +611,8 @@ def generate_bili_meta_with_llm(
 
 _BILI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-# B 站评论单条字数上限（超过会被接口拒绝）
-BILI_COMMENT_MAX_LEN = 1000
+# B 站评论单条字数上限（2026-10 实测 2000 字可通过）
+BILI_COMMENT_MAX_LEN = 2000
 
 
 def _load_cookie_header(cookie_path: str) -> Tuple[str, Dict[str, str]]:
@@ -684,8 +684,19 @@ def post_video_comment(bvid: str, message: str,
         if len(message) > BILI_COMMENT_MAX_LEN:
             message = message[:BILI_COMMENT_MAX_LEN - 3] + "..."
 
-        res = _bili_api("https://api.bilibili.com/x/v2/reply/add", header, {
-            "type": "1", "oid": str(aid), "message": message, "csrf": csrf})
+        # code 12051 = 重复评论/请勿刷屏；间隔后重试
+        res = {}
+        for attempt in range(3):
+            res = _bili_api("https://api.bilibili.com/x/v2/reply/add", header, {
+                "type": "1", "oid": str(aid), "message": message, "csrf": csrf})
+            if res.get("code") == 0:
+                break
+            if res.get("code") == 12051 and attempt < 2:
+                logger.warning(f"评论被防刷屏拦截(12051)，{15 * (attempt + 1)}s 后重试")
+                import time as _t
+                _t.sleep(15 * (attempt + 1))
+                continue
+            break
         if res.get("code") != 0:
             return False, f"发评论失败 code={res.get('code')} {res.get('message')}"
 
