@@ -681,24 +681,31 @@ def _bili_api(url: str, cookie_header: str, data: Optional[dict] = None,
         return json.loads(resp.read().decode("utf-8"))
 
 
-def get_aid_from_bvid(bvid: str, cookie_path: str = "cookies.json") -> Optional[int]:
-    """由 BV 号换取 aid。失败返回 None。"""
-    try:
-        header, _ = _load_cookie_header(cookie_path)
-        res = _bili_api(
-            f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}", header)
-        if res.get("code") == 0:
-            return int(res["data"]["aid"])
-        logger.warning(f"获取 aid 失败: {res.get('code')} {res.get('message')}")
-    except Exception as e:
-        logger.warning(f"获取 aid 异常: {type(e).__name__}: {e}")
+def get_aid_from_bvid(bvid: str, cookie_path: str = "cookies.json",
+                       retries: int = 6, delay: int = 5) -> Optional[int]:
+    """由 BV 号换取 aid。新投稿在 B 站数据库建立索引有几秒到几十秒延迟，增加轮询重试。"""
+    import time
+    for attempt in range(retries):
+        try:
+            header, _ = _load_cookie_header(cookie_path)
+            res = _bili_api(
+                f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}", header)
+            if res.get("code") == 0:
+                return int(res["data"]["aid"])
+            # code -404 说明视频数据尚未就绪，等待后重试
+            logger.info(f"等待 B 站同步视频索引 ({bvid})，第 {attempt + 1}/{retries} 次: {res.get('code')} {res.get('message')}")
+        except Exception as e:
+            logger.warning(f"获取 aid 异常 ({bvid}): {type(e).__name__}: {e}")
+        if attempt < retries - 1:
+            time.sleep(delay)
     return None
 
 
 def post_video_comment(bvid: str, message: str,
                        cookie_path: str = "cookies.json",
-                       pin: bool = True) -> Tuple[bool, str]:
-    """在指定稿件下发表一条新评论（可选置顶）。
+                       pin: bool = True,
+                       aid: Optional[int] = None) -> Tuple[bool, str]:
+    """在指定稿件下发表一条新评论（可选置顶）。若调用方已拿到 aid 可直接传入，避免重复查询。
 
     Returns:
         (是否成功, rpid 字符串 或 错误信息)
@@ -708,7 +715,8 @@ def post_video_comment(bvid: str, message: str,
         csrf = jar.get("bili_jct", "")
         if not csrf:
             return False, "cookies.json 中缺少 bili_jct（CSRF），无法发评论"
-        aid = get_aid_from_bvid(bvid, cookie_path)
+        if aid is None:
+            aid = get_aid_from_bvid(bvid, cookie_path)
         if not aid:
             return False, f"无法从 {bvid} 获取 aid"
 
