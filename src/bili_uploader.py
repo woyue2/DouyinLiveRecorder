@@ -250,10 +250,12 @@ def extract_session_bili_metadata(
         )
         p_label = f"【P{idx+1}】"
         desc = meta["desc"]
+        lines = _extract_index_lines(desc)
         part_descs.append(f"{p_label}\n{desc}")
         parts_index.append({
             "label": p_label,
-            "lines": _extract_index_lines(desc),
+            "lines": lines,
+            "title": _make_part_title(idx + 1, lines),
         })
         try:
             combined_texts.append(md_path.read_text(encoding="utf-8")[:1000])
@@ -291,6 +293,24 @@ def extract_session_bili_metadata(
         "tags": f"{clean_name},搞笑,名场面,主播日常,直播录像,合集",
         "parts": parts_index,
     }
+
+
+def _make_part_title(index: int, lines: list, max_len: int = 60) -> str:
+    """为一分P生成简短有信息量的标题（B站分P标题上限 80 字）。
+
+    分P标题是播放器列表中的高曝光位，比藏在简介/评论里的信息更易被看到。
+    """
+    seed = ""
+    for line in lines:
+        candidate = re.sub(r'^\d{1,2}:\d{2}\s*', '', line).strip()
+        candidate = re.sub(r'^[-*•\d+.\s、]+', '', candidate).strip()
+        if len(candidate) >= 6:
+            seed = candidate
+            break
+    if not seed:
+        seed = "直播录像"
+    seed = seed[:max_len].rstrip('，。,.、；;：: ')
+    return f"P{index} {seed}"[:80]
 
 
 def _extract_index_lines(desc: str, limit: int = 6) -> list:
@@ -730,6 +750,48 @@ def delete_video_comment(bvid: str, rpid: str,
     except Exception as e:
         logger.warning(f"删除评论异常: {type(e).__name__}: {e}")
         return False
+
+
+def build_part_links(ts_paths: list, parts: list) -> Tuple[list, str]:
+    """为分P创建带意义标题的硬链接，供 biliup 上传（biliup 以文件名作为分P标题）。
+
+    Returns:
+        (链接路径列表, 临时目录路径)。调用方上传完成后应删除临时目录。
+    """
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="bili_parts_")
+    links = []
+    used_names = set()
+    for i, src in enumerate(ts_paths):
+        title = parts[i].get("title", "") if i < len(parts) else ""
+        if not title:
+            title = f"P{i + 1}"
+        safe = re.sub(r'[\\/:*?"<>|\n\r\t]', '_', title).strip() or f"P{i + 1}"
+        safe = safe[:80]
+        # 避免同名冲突
+        base, n = safe, 2
+        while safe in used_names:
+            safe = f"{base}_{n}"
+            n += 1
+        used_names.add(safe)
+        link = os.path.join(tmp_dir, f"{safe}.ts")
+        try:
+            os.link(src, link)
+        except OSError:
+            shutil.copy2(src, link)
+        links.append(link)
+    logger.info(f"已创建 {len(links)} 个分P标题硬链接: {tmp_dir}")
+    return links, tmp_dir
+
+
+def cleanup_part_links(tmp_dir: str) -> None:
+    """清理分P标题硬链接的临时目录。"""
+    try:
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception as e:
+        logger.warning(f"清理分P硬链接目录失败 {tmp_dir}: {e}")
 
 
 def build_parts_index(parts: list, max_len: int = BILI_COMMENT_MAX_LEN) -> str:

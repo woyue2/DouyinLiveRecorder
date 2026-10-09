@@ -55,6 +55,8 @@ from src.bili_uploader import (
     upload_video_biliup,
     handle_post_upload_cleanup,
     build_parts_index,
+    build_part_links,
+    cleanup_part_links,
     post_video_comment,
 )
 from src.stream_selection import is_flv_preferred_platform, select_source_url
@@ -750,21 +752,27 @@ def run_bili_session_job(job: dict) -> None:
     is_only_self = _is_only_self(record_name, record_url, clean_name)
     vis_label = " (仅自己可见)" if is_only_self else ""
 
-    mark_bili_submitted()
-    success, output = upload_video_biliup(
-        video_path=valid_ts_paths,
-        title=meta["title"],
-        desc=meta["desc"],
-        tags=meta["tags"],
-        tid=bili_default_tid,
-        cookie_path=bili_cookie_path,
-        copyright_type=1,
-        source="",
-        biliup_bin=biliup_bin,
-        is_only_self=is_only_self
-    )
+    # biliup 以文件名作为分P标题，用带看点的硬链接上传，让播放器列表直接显示看点
+    link_paths, link_dir = build_part_links(valid_ts_paths, meta.get("parts") or [])
+    upload_targets = link_paths or valid_ts_paths
 
-    vis_label = " (仅自己可见)" if is_only_self else ""
+    mark_bili_submitted()
+    try:
+        success, output = upload_video_biliup(
+            video_path=upload_targets,
+            title=meta["title"],
+            desc=meta["desc"],
+            tags=meta["tags"],
+            tid=bili_default_tid,
+            cookie_path=bili_cookie_path,
+            copyright_type=1,
+            source="",
+            biliup_bin=biliup_bin,
+            is_only_self=is_only_self
+        )
+    finally:
+        cleanup_part_links(link_dir)
+
     if success:
         bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
         bvid = bvid_match.group(0) if bvid_match else "已提交"
