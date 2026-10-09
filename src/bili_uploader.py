@@ -10,9 +10,12 @@
 
 import os
 import re
+import json
 import subprocess
 import shutil
 import logging
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -234,6 +237,7 @@ def extract_session_bili_metadata(
 
     part_descs = []
     combined_texts = []
+    parts_index = []
     for idx, md_path in enumerate(unique_mds):
         meta = extract_bili_metadata(
             md_path=str(md_path),
@@ -247,14 +251,19 @@ def extract_session_bili_metadata(
         p_label = f"【P{idx+1}】"
         desc = meta["desc"]
         part_descs.append(f"{p_label}\n{desc}")
+        parts_index.append({
+            "label": p_label,
+            "lines": _extract_index_lines(desc),
+        })
         try:
             combined_texts.append(md_path.read_text(encoding="utf-8")[:1000])
         except Exception:
             pass
 
     full_desc = "\n\n".join(part_descs).strip()
-    if len(full_desc) > 1000:
-        full_desc = full_desc[:997] + "..."
+    # B 站简介上限 2000 字；超出部分由置顶评论承载
+    if len(full_desc) > 2000:
+        full_desc = full_desc[:1997] + "..."
 
     clean_name = record_name.split(" ", maxsplit=1)[-1].strip()
     clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
@@ -280,7 +289,29 @@ def extract_session_bili_metadata(
         "title": overall_title[:80],
         "desc": full_desc,
         "tags": f"{clean_name},搞笑,名场面,主播日常,直播录像,合集",
+        "parts": parts_index,
     }
+
+
+def _extract_index_lines(desc: str, limit: int = 4) -> list:
+    """从分段简介中抽取用于置顶评论索引的精简行（优先带时间戳的行）。"""
+    timed, plain = [], []
+    for raw in desc.splitlines():
+        line = raw.strip().lstrip("*# ").strip()
+        if not line:
+            continue
+        # 跳过纯小标题行（如「精彩看点」「核心干货」）
+        if re.match(r'^[🎯💡✅❌📌\s]*(精彩看点|核心干货|高能看点|看点|干货)[:：]?$', line):
+            continue
+        line = line.replace('**', '')
+        if re.match(r'^\d{1,2}:\d{2}', line):
+            timed.append(line)
+        else:
+            plain.append(line)
+    picked = timed[:limit]
+    if len(picked) < limit:
+        picked += plain[:limit - len(picked)]
+    return picked
 
 
 def upload_video_biliup(
@@ -574,4 +605,153 @@ def generate_bili_meta_with_llm(
             logger.warning(f"LLM 调用第 {attempt + 1} 次失败: {e}")
     logger.warning(f"调用 LLM 生成 B 站元数据失败（重试 3 次）: {last_error}，将回退到规则提取")
     return None
+
+
+# ------------------------- B 站评论接口 -------------------------
+
+_BILI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# B 站评论单条字数上限（超过会被接口拒绝）
+BILI_COMMENT_MAX_LEN = 1000
+
+
+def _load_cookie_header(cookie_path: str) -> Tuple[str, Dict[str, str]]:
+    """读取 biliup 保存的 cookies.json，返回 (Cookie 请求头, cookie 字典)。"""
+    with open(cookie_path, encoding="utf-8") as f:
+        data = json.load(f)
+    cookies = data.get("cookie_info", {}).get("cookies", {})
+    if isinstance(cookies, dict):
+        pairs = list(cookies.items())
+    else:
+        pairs = [(c["name"], c["value"]) for c in cookies]
+    header = "; ".join(f"{k}={v}" for k, v in pairs)
+    return header, dict(pairs)
+
+
+def _bili_api(url: str, cookie_header: str, data: Optional[dict] = None,
+              timeout: int = 20) -> dict:
+    """调用 B 站开放接口（带 cookie 认证）。"""
+    if data is not None:
+        req = urllib.request.Request(
+            url,
+            data=urllib.parse.urlencode(data).encode("utf-8"),
+            method="POST",
+            headers={
+                "User-Agent": _BILI_UA,
+                "Cookie": cookie_header,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.bilibili.com/",
+            },
+        )
+    else:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": _BILI_UA, "Cookie": cookie_header})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def get_aid_from_bvid(bvid: str, cookie_path: str = "cookies.json") -> Optional[int]:
+    """由 BV 号换取 aid。失败返回 None。"""
+    try:
+        header, _ = _load_cookie_header(cookie_path)
+        res = _bili_api(
+            f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}", header)
+        if res.get("code") == 0:
+            return int(res["data"]["aid"])
+        logger.warning(f"获取 aid 失败: {res.get('code')} {res.get('message')}")
+    except Exception as e:
+        logger.warning(f"获取 aid 异常: {type(e).__name__}: {e}")
+    return None
+
+
+def post_video_comment(bvid: str, message: str,
+                       cookie_path: str = "cookies.json",
+                       pin: bool = True) -> Tuple[bool, str]:
+    """在指定稿件下发表一条新评论（可选置顶）。
+
+    Returns:
+        (是否成功, rpid 字符串 或 错误信息)
+    """
+    try:
+        header, jar = _load_cookie_header(cookie_path)
+        csrf = jar.get("bili_jct", "")
+        if not csrf:
+            return False, "cookies.json 中缺少 bili_jct（CSRF），无法发评论"
+        aid = get_aid_from_bvid(bvid, cookie_path)
+        if not aid:
+            return False, f"无法从 {bvid} 获取 aid"
+
+        if len(message) > BILI_COMMENT_MAX_LEN:
+            message = message[:BILI_COMMENT_MAX_LEN - 3] + "..."
+
+        res = _bili_api("https://api.bilibili.com/x/v2/reply/add", header, {
+            "type": "1", "oid": str(aid), "message": message, "csrf": csrf})
+        if res.get("code") != 0:
+            return False, f"发评论失败 code={res.get('code')} {res.get('message')}"
+
+        rpid = (res.get("data") or {}).get("rpid")
+        if pin and rpid:
+            pres = _bili_api("https://api.bilibili.com/x/v2/reply/top", header, {
+                "type": "1", "oid": str(aid), "action": "1",
+                "rpid": str(rpid), "csrf": csrf})
+            if pres.get("code") != 0:
+                logger.warning(f"置顶失败 code={pres.get('code')} {pres.get('message')}")
+                return True, f"{rpid}（置顶失败）"
+        logger.info(f"B 站评论已发布{('并置顶' if pin else '')}: rpid={rpid}")
+        return True, str(rpid)
+    except Exception as e:
+        return False, f"发评论异常: {type(e).__name__}: {e}"
+
+
+def delete_video_comment(bvid: str, rpid: str,
+                         cookie_path: str = "cookies.json") -> bool:
+    """删除自己发的一条评论。"""
+    try:
+        header, jar = _load_cookie_header(cookie_path)
+        csrf = jar.get("bili_jct", "")
+        aid = get_aid_from_bvid(bvid, cookie_path)
+        if not aid:
+            return False
+        res = _bili_api("https://api.bilibili.com/x/v2/reply/action", header, {
+            "type": "1", "oid": str(aid), "rpid": str(rpid),
+            "action": "0", "csrf": csrf})
+        return res.get("code") == 0
+    except Exception as e:
+        logger.warning(f"删除评论异常: {type(e).__name__}: {e}")
+        return False
+
+
+def build_parts_index(parts: list, max_len: int = BILI_COMMENT_MAX_LEN) -> str:
+    """把各分 P 的时间戳看点压缩成一条可置顶的索引评论。
+
+    parts: [{'label': '【P1】', 'lines': ['01:30 xxx', ...]}, ...]
+    """
+    header = "📌 分P看点索引（点击时间戳可跳转到对应分P内的位置）"
+    blocks = []
+    for part in parts:
+        label = part.get("label", "")
+        lines = [l.strip() for l in part.get("lines", []) if l.strip()]
+        if not lines:
+            continue
+        blocks.append(label + "\n" + "\n".join(lines))
+    if not blocks:
+        return header
+    body = "\n\n".join(blocks)
+    total = f"{header}\n\n{body}"
+    if len(total) <= max_len:
+        return total
+    # 超长时逐块裁剪，保留尽可能多的分P
+    kept = []
+    used = len(header) + 2
+    for block in blocks:
+        add = len(block) + 2
+        if used + add > max_len - 4:
+            break
+        kept.append(block)
+        used += add
+    if kept:
+        omitted = len(blocks) - len(kept)
+        suffix = f"\n\n...（其余 {omitted} 个分P看点见简介）" if omitted > 0 else ""
+        return f"{header}\n\n" + "\n\n".join(kept) + suffix
+    return header
 

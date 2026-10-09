@@ -54,6 +54,8 @@ from src.bili_uploader import (
     extract_session_bili_metadata,
     upload_video_biliup,
     handle_post_upload_cleanup,
+    build_parts_index,
+    post_video_comment,
 )
 from src.stream_selection import is_flv_preferred_platform, select_source_url
 from src.proxy import ProxyDetector
@@ -447,6 +449,7 @@ bili_submit_lock = threading.Lock()
 bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
 bili_queue_worker_started = False
+bili_auto_comment = True
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
 bili_default_tid = 138
@@ -630,6 +633,25 @@ def _rate_limit_notice(record_name: str) -> str:
             f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
 
 
+def post_bili_index_comment(bvid: str, meta: dict) -> tuple[bool, str]:
+    """在多P稿件下发布并置顶分P看点索引评论。"""
+    parts = meta.get("parts") or []
+    if not parts:
+        return False, "无可用的分P索引内容"
+    index_text = build_parts_index(parts)
+    ok, info = post_video_comment(
+        bvid=bvid,
+        message=index_text,
+        cookie_path=bili_cookie_path,
+        pin=True,
+    )
+    if ok:
+        logger.info(f"分P索引评论已发布并置顶: BV={bvid} rpid={info}")
+    else:
+        logger.warning(f"分P索引评论发布失败: BV={bvid} {info}")
+    return ok, info
+
+
 def run_bili_single_job(job: dict) -> None:
     """单分段投稿（兼容模式）。"""
     global bili_cooldown_until
@@ -746,10 +768,14 @@ def run_bili_session_job(job: dict) -> None:
     if success:
         bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
         bvid = bvid_match.group(0) if bvid_match else "已提交"
+        comment_note = ""
+        if bili_auto_comment and bvid.startswith("BV"):
+            ok_c, info_c = post_bili_index_comment(bvid, meta)
+            comment_note = f"\n置顶评论: {'已发布 rpid=' + info_c if ok_c else '失败 - ' + info_c}"
         content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
                    f"标题: {meta['title']}\n"
                    f"BV号: {bvid}\n"
-                   f"总集数: {len(valid_ts_paths)}P (全场自动合集)")
+                   f"总集数: {len(valid_ts_paths)}P (全场自动合集){comment_note}")
         handle_post_upload_cleanup(valid_ts_paths, policy=bili_post_policy)
     else:
         content = _handle_bili_failure(output, record_name, f"集数: {len(valid_ts_paths)}P", vis_label)
@@ -2953,6 +2979,7 @@ while True:
     bili_upload_mode = read_config_value(config, 'B站投稿', '投稿模式', "整场多P投稿").strip()
     bili_min_interval_seconds = int(read_config_value(config, 'B站投稿', '最小投稿间隔(分钟)', 360)) * 60
     bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 360))
+    bili_auto_comment = options.get(read_config_value(config, 'B站投稿', '投稿后自动发置顶评论(是/否)', "是"), True)
     bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
     bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
     bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))
