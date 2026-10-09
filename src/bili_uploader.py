@@ -755,3 +755,37 @@ def build_parts_index(parts: list, max_len: int = BILI_COMMENT_MAX_LEN) -> str:
         return f"{header}\n\n" + "\n\n".join(kept) + suffix
     return header
 
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="B站评论接口诊断工具")
+    parser.add_argument("bvid", help="稿件 BV 号")
+    parser.add_argument("--cookie", default="cookies.json", help="cookies.json 路径")
+    parser.add_argument("--probe-limit", action="store_true",
+                        help="探测评论字数上限（发完自动删除）")
+    parser.add_argument("--post", metavar="TEXT", help="发布一条评论")
+    parser.add_argument("--pin", action="store_true", help="发布后置顶")
+    parser.add_argument("--delete", metavar="RPID", help="删除指定 rpid 的评论")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if args.delete:
+        print("删除结果:", delete_video_comment(args.bvid, args.delete, args.cookie))
+    elif args.post:
+        ok, info = post_video_comment(args.bvid, args.post, args.cookie, pin=args.pin)
+        print(f"{'成功' if ok else '失败'}: {info}")
+    elif args.probe_limit:
+        import time as _t
+        for n in (2000, 1500, 1001, 1000, 999):
+            text = "字数上限探测" + "测" * max(0, n - 16) + f"[{n}]"
+            ok, info = post_video_comment(args.bvid, text, args.cookie, pin=False)
+            print(f"长度 {n:>5}: {'✅成功' if ok else '❌失败'}  {info[:80]}")
+            if ok and info.isdigit():
+                _t.sleep(2)
+                print(f"          已删除: {delete_video_comment(args.bvid, info, args.cookie)}")
+            _t.sleep(3)
+    else:
+        parser.print_help()
+
