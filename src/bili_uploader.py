@@ -682,8 +682,8 @@ def _bili_api(url: str, cookie_header: str, data: Optional[dict] = None,
 
 
 def get_aid_from_bvid(bvid: str, cookie_path: str = "cookies.json",
-                       retries: int = 6, delay: int = 5) -> Optional[int]:
-    """由 BV 号换取 aid。新投稿在 B 站数据库建立索引有几秒到几十秒延迟，增加轮询重试。"""
+                       retries: int = 6, delay: int = 180) -> Optional[int]:
+    """由 BV 号换取 aid。新投稿需等待审核与数据库建立索引，按用户要求每 3 分钟重试一次，最多 6 次 (18分钟)。"""
     import time
     for attempt in range(retries):
         try:
@@ -692,7 +692,6 @@ def get_aid_from_bvid(bvid: str, cookie_path: str = "cookies.json",
                 f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}", header)
             if res.get("code") == 0:
                 return int(res["data"]["aid"])
-            # code -404 说明视频数据尚未就绪，等待后重试
             logger.info(f"等待 B 站同步视频索引 ({bvid})，第 {attempt + 1}/{retries} 次: {res.get('code')} {res.get('message')}")
         except Exception as e:
             logger.warning(f"获取 aid 异常 ({bvid}): {type(e).__name__}: {e}")
