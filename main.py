@@ -112,9 +112,68 @@ first_run = True
 not_record_list = []
 start_display_time = datetime.datetime.now()
 global_proxy = False
+record_finished_flag = None
 recording_time_list = {}
 batch_start_times = {}
 batch_end_times = {}
+
+# ------------------- 断流续接：同一场次内沿用文件系列 -------------------
+# 抖音等平台的直播源地址失效会让 ffmpeg 退出；若每次都生成新的时间戳文件名，
+# 一场直播会被切成若干互不相干的小系列，多P合集的分P标题与简介也随之错乱。
+# 这里在复用窗口内沿用上一次的 base_name 并接续分段编号。
+record_serial_lock = threading.Lock()
+record_serial: dict[str, dict] = {}
+RECORD_SERIAL_REUSE_WINDOW = 1800  # 秒；断流后在此时间内视为同一场次
+
+
+def _next_segment_index(full_path: str, base_name: str) -> int:
+    """扫描目录里已有的分段文件，返回下一个可用的分段编号。"""
+    max_idx = -1
+    try:
+        for name in os.listdir(full_path):
+            if not name.startswith(f"{base_name}_"):
+                continue
+            m = re.search(r'_(\d{3,})\.[A-Za-z0-9]+$', name)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+    except OSError:
+        pass
+    return max_idx + 1
+
+
+def resolve_record_series(record_name: str, full_path: str, anchor_name: str,
+                          title_in_name: str, reuse: bool = True) -> tuple:
+    """返回 (base_name, 起始分段编号)。断流重启时沿用同一文件系列。
+
+    reuse=False（未开启分段录制）时不复用，避免单文件模式下互相覆盖。
+    """
+    if not reuse:
+        base = f"{anchor_name}_{title_in_name}{time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())}"
+        return base, 0
+
+    now_ts = time.time()
+    with record_serial_lock:
+        entry = record_serial.get(record_name)
+        if entry and (now_ts - entry.get("last_start", 0)) <= RECORD_SERIAL_REUSE_WINDOW:
+            entry["last_start"] = now_ts
+            base = entry["base"]
+            start_index = _next_segment_index(full_path, base)
+            if start_index > 0:
+                logger.info(
+                    f"{anchor_name} 断流续接：沿用文件系列 {base}，从分段 {start_index:03d} 继续录制"
+                )
+            return base, start_index
+
+    base = f"{anchor_name}_{title_in_name}{time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())}"
+    with record_serial_lock:
+        record_serial[record_name] = {"base": base, "last_start": now_ts}
+    return base, 0
+
+
+def segment_start_number_opt(start_index: int) -> list:
+    """分段续接时让 segment muxer 从指定编号开始，避免覆盖已有分段。"""
+    return ["-segment_start_number", str(start_index)] if start_index > 0 else []
+
 script_path = os.path.split(os.path.realpath(sys.argv[0]))[0]
 config_file = f'{script_path}/config/config.ini'
 url_config_file = f'{script_path}/config/URL_config.ini'
@@ -2177,11 +2236,14 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                 if record_format.audio_only and not is_ts_mp3_dual:
                                     try:
-                                        now = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
                                         extension = record_format.extension
+                                        base_name, seg_start = resolve_record_series(
+                                            record_name, full_path, anchor_name, title_in_name,
+                                            reuse=split_video_by_time,
+                                        )
                                         name_format = "_%03d" if split_video_by_time else ""
-                                        save_file_path = (f"{full_path}/{anchor_name}_{title_in_name}{now}"
-                                                          f"{name_format}.{extension}")
+                                        save_file_path = f"{full_path}/{base_name}{name_format}.{extension}"
+                                        resume_opt = segment_start_number_opt(seg_start)
 
                                         if split_video_by_time:
                                             print(f'\r{anchor_name} 准备开始录制音频: {save_file_path}')
@@ -2195,6 +2257,7 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                                     "-segment_time", split_time,
                                                     "-segment_format", "mp3",
                                                     "-reset_timestamps", "1",
+                                                ] + resume_opt + [
                                                     save_file_path,
                                                 ]
                                             else:
@@ -2209,6 +2272,7 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                                     "-segment_format_options",
                                                     "movflags=+frag_keyframe+empty_moov",
                                                     "-reset_timestamps", "1",
+                                                ] + resume_opt + [
                                                     save_file_path,
                                                 ]
 
@@ -2255,22 +2319,26 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                 if is_ts_mp3_dual and not only_flv_record:
                                     # TS + MP3 单进程双输出:源只拉一次,TS 流拷贝,MP3 重编码音频
-                                    base_name = f"{anchor_name}_{title_in_name}{now}"
+                                    base_name, seg_start = resolve_record_series(
+                                        record_name, full_path, anchor_name, title_in_name,
+                                        reuse=split_video_by_time,
+                                    )
                                     if split_video_by_time:
                                         ts_path = f"{full_path}/{base_name}_%03d.ts"
                                         mp3_path = f"{full_path}/{base_name}_%03d.mp3"
+                                        resume_opt = segment_start_number_opt(seg_start)
                                         ts_seg_opt = [
                                             "-f", "segment",
                                             "-segment_time", split_time,
                                             "-segment_format", "mpegts",
                                             "-reset_timestamps", "1",
-                                        ]
+                                        ] + resume_opt
                                         mp3_seg_opt = [
                                             "-f", "segment",
                                             "-segment_time", split_time,
                                             "-segment_format", "mp3",
                                             "-reset_timestamps", "1",
-                                        ]
+                                        ] + resume_opt
                                     else:
                                         ts_path = f"{full_path}/{base_name}.ts"
                                         mp3_path = f"{full_path}/{base_name}.mp3"
@@ -2511,12 +2579,15 @@ def start_record(url_data: tuple, count_variable: int = -1,
 
                                 else:
                                     if split_video_by_time:
-                                        now = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-                                        filename = anchor_name + f'_{title_in_name}' + now + ".ts"
+                                        base_name, seg_start = resolve_record_series(
+                                            record_name, full_path, anchor_name, title_in_name,
+                                            reuse=split_video_by_time,
+                                        )
+                                        filename = base_name + ".ts"
                                         print(f'{rec_info}/{filename}')
 
                                         try:
-                                            save_file_path = f"{full_path}/{anchor_name}_{title_in_name}{now}_%03d.ts"
+                                            save_file_path = f"{full_path}/{base_name}_%03d.ts"
                                             command = [
                                                 "-c:v", "copy",
                                                 "-c:a", "copy",
@@ -2525,6 +2596,7 @@ def start_record(url_data: tuple, count_variable: int = -1,
                                                 "-segment_time", split_time,
                                                 "-segment_format", 'mpegts',
                                                 "-reset_timestamps", "1",
+                                            ] + segment_start_number_opt(seg_start) + [
                                                 save_file_path,
                                             ]
 
