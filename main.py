@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import urllib.request
 from urllib.error import URLError, HTTPError
-from typing import Any
+from typing import Any, Optional
 import configparser
 import httpx
 from src import spider, stream
