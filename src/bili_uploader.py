@@ -211,20 +211,29 @@ def extract_session_bili_metadata(
     default_tags: Optional[str] = None,
     llm_api_key: Optional[str] = None,
     llm_api_base: Optional[str] = None,
-    llm_model: str = "deepseek-chat"
+    llm_model: str = "deepseek-chat",
+    ts_paths: Optional[list] = None
 ) -> Dict[str, str]:
-    """汇总整场直播各个分段的 .md 文件，生成适合多 P 合集投稿的总体爆款标题与分 P 时间戳目录。"""
-    p = Path(session_dir)
-    md_files = sorted(p.glob("*.md"))
-    unique_mds = []
-    seen_stems = set()
-    for f in md_files:
-        stem = f.stem.replace("-敏感", "")
-        if stem not in seen_stems:
-            seen_stems.add(stem)
-            unique_mds.append(f)
+    """汇总整场直播各分段，生成多 P 合集的总标题与分 P 看点。
 
-    if not unique_mds:
+    分P目录以**实际上传的 TS 文件**为准（而非 .md）。断流会产生没有 .md 的
+    TS 分段，若按 .md 构建会导致分P标题与分P错位、后续分P没有简介。
+    """
+    p = Path(session_dir)
+
+    if ts_paths:
+        ts_list = [Path(t) for t in ts_paths]
+    else:
+        ts_list = []
+        for f in sorted(p.glob("*.ts")):
+            try:
+                if f.stat().st_size >= 2 * 1024 * 1024:
+                    ts_list.append(f)
+            except OSError:
+                pass
+    ts_list.sort(key=lambda x: x.name)
+
+    if not ts_list:
         return extract_bili_metadata(
             md_path=str(p / "dummy.md"),
             record_name=record_name,
@@ -235,11 +244,16 @@ def extract_session_bili_metadata(
             llm_model=llm_model
         )
 
+    # stem -> 转写 md 映射（-敏感.md 归一化到同一 stem）
+    md_map: Dict[str, Path] = {}
+    for f in p.glob("*.md"):
+        md_map.setdefault(f.stem.replace("-敏感", ""), f)
+
     part_descs = []
     combined_texts = []
     parts_index = []
     # 分P越多，每P保留的行越少，确保索引评论能装下全部P
-    n_parts = len(unique_mds)
+    n_parts = len(ts_list)
     if n_parts > 18:
         per_part_lines = 1
     elif n_parts > 10:
@@ -248,29 +262,40 @@ def extract_session_bili_metadata(
         per_part_lines = 3
     else:
         per_part_lines = 6
-    for idx, md_path in enumerate(unique_mds):
-        meta = extract_bili_metadata(
-            md_path=str(md_path),
-            record_name=record_name,
-            streamer_type=streamer_type,
-            default_tags=default_tags,
-            llm_api_key=llm_api_key or os.getenv("BILI_LLM_API_KEY"),
-            llm_api_base=llm_api_base,
-            llm_model=llm_model
-        )
+
+    for idx, ts_path in enumerate(ts_list):
         p_label = f"【P{idx+1}】"
-        desc = meta["desc"]
+        md_path = md_map.get(ts_path.stem)
+        if md_path:
+            meta = extract_bili_metadata(
+                md_path=str(md_path),
+                record_name=record_name,
+                streamer_type=streamer_type,
+                default_tags=default_tags,
+                llm_api_key=llm_api_key or os.getenv("BILI_LLM_API_KEY"),
+                llm_api_base=llm_api_base,
+                llm_model=llm_model
+            )
+            desc = meta["desc"]
+            try:
+                combined_texts.append(md_path.read_text(encoding="utf-8")[:1000])
+            except Exception:
+                pass
+        else:
+            # 该分段无转写结果（断流中断或时长过短被跳过）
+            desc = f"{p_label} 本段无转写内容（录制中断或时长过短）"
+
         lines = _extract_index_lines(desc, limit=per_part_lines)
         part_descs.append(f"{p_label}\n{desc}")
+        title = _make_part_title(
+            idx + 1, lines,
+            fallback=("直播录像" if md_path else "录制中断片段"),
+        )
         parts_index.append({
             "label": p_label,
             "lines": lines,
-            "title": _make_part_title(idx + 1, lines),
+            "title": title,
         })
-        try:
-            combined_texts.append(md_path.read_text(encoding="utf-8")[:1000])
-        except Exception:
-            pass
 
     full_desc = "\n\n".join(part_descs).strip()
     # B 站简介上限 2000 字；超出部分由置顶评论承载
@@ -305,7 +330,8 @@ def extract_session_bili_metadata(
     }
 
 
-def _make_part_title(index: int, lines: list, max_len: int = 60) -> str:
+def _make_part_title(index: int, lines: list, max_len: int = 60,
+                     fallback: str = "直播录像") -> str:
     """为一分P生成简短有信息量的标题（B站分P标题上限 80 字）。
 
     分P标题是播放器列表中的高曝光位，比藏在简介/评论里的信息更易被看到。
@@ -318,7 +344,7 @@ def _make_part_title(index: int, lines: list, max_len: int = 60) -> str:
             seed = candidate
             break
     if not seed:
-        seed = "直播录像"
+        seed = fallback
     seed = seed[:max_len].rstrip('，。,.、；;：: ')
     return f"P{index} {seed}"[:80]
 

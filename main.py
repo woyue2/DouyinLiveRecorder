@@ -748,7 +748,8 @@ def run_bili_session_job(job: dict) -> None:
         default_tags=bili_default_tags,
         llm_api_key=bili_llm_api_key or None,
         llm_api_base=bili_llm_api_base or None,
-        llm_model=bili_llm_model or "deepseek-chat"
+        llm_model=bili_llm_model or "deepseek-chat",
+        ts_paths=valid_ts_paths
     )
     is_only_self = _is_only_self(record_name, record_url, clean_name)
     vis_label = " (仅自己可见)" if is_only_self else ""
