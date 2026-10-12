@@ -398,6 +398,24 @@ pending_bytes=0
 if [ -d ./converted ]; then
     while IFS= read -r -d '' pending_file; do
         relative_file="${pending_file#./converted/}"
+        # 即使误入 converted，若为传B站主播的视频文件，也跳过百度云上传，保留给B站
+        case "$relative_file" in
+            *.ts|*.mp4|*.flv|*.mkv)
+                if [ -f "$SCRIPT_DIR/config/URL_config.ini" ]; then
+                    is_bili_streamer_converted=0
+                    while IFS= read -r b_anchor; do
+                        [ -z "$b_anchor" ] && continue
+                        if [[ "$relative_file" == *"$b_anchor"* ]]; then
+                            is_bili_streamer_converted=1
+                            break
+                        fi
+                    done < <(grep "传B站" "$SCRIPT_DIR/config/URL_config.ini" | grep -v '^[[:space:]]*#' | sed -n 's/.*主播:[[:space:]]*\([^,]*\).*/\1/p')
+                    if [ "$is_bili_streamer_converted" -eq 1 ]; then
+                        continue
+                    fi
+                fi
+                ;;
+        esac
         file_size="$(stat -c %s "$pending_file")"
         pending_local_files+=("$pending_file")
         pending_relative_files+=("$relative_file")
