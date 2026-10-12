@@ -510,6 +510,41 @@ bili_submit_lock = threading.Lock()
 bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
 bili_queue_worker_started = False
+bili_queue_file = f"{script_path}/bili_pending_queue.json"
+
+
+def _save_bili_queue() -> None:
+    """持久化待投稿队列到磁盘，避免主程序重启导致排队任务丢失。"""
+    try:
+        data = {
+            "queue": bili_pending_queue,
+            "last_submit_time": bili_last_submit_time,
+            "cooldown_until": bili_cooldown_until,
+        }
+        with open(bili_queue_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存B站队列状态失败: {e}")
+
+
+def _load_bili_queue() -> None:
+    """启动时从磁盘加载未完成的待投稿队列。"""
+    global bili_last_submit_time, bili_cooldown_until
+    if not os.path.exists(bili_queue_file):
+        return
+    try:
+        with open(bili_queue_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bili_last_submit_time = data.get("last_submit_time", 0.0)
+        bili_cooldown_until = data.get("cooldown_until", 0.0)
+        loaded = data.get("queue", [])
+        with bili_queue_lock:
+            bili_pending_queue.clear()
+            bili_pending_queue.extend(loaded)
+        if loaded:
+            logger.info(f"成功从磁盘恢复 {len(loaded)} 个B站待投稿任务")
+    except Exception as e:
+        logger.warning(f"恢复B站队列状态失败: {e}")
 bili_auto_comment = True
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
@@ -562,6 +597,7 @@ def mark_bili_submitted() -> None:
     global bili_last_submit_time
     with bili_submit_lock:
         bili_last_submit_time = time.time()
+    _save_bili_queue()
 
 
 def enqueue_bili_job(job: dict) -> None:
@@ -569,6 +605,7 @@ def enqueue_bili_job(job: dict) -> None:
     with bili_queue_lock:
         bili_pending_queue.append(job)
         position = len(bili_pending_queue)
+    _save_bili_queue()
     logger.info(f"B站投稿已入队（队列第 {position} 位）: {job.get('record_name')}")
     try:
         raw_name = job.get("record_name", "B站投稿")
@@ -605,6 +642,7 @@ def bili_queue_worker() -> None:
         with bili_queue_lock:
             if bili_pending_queue:
                 bili_pending_queue.pop(0)
+        _save_bili_queue()
         logger.info(f"B站队列开始提交: {job.get('record_name')}")
         try:
             run_bili_job(job)
@@ -613,11 +651,12 @@ def bili_queue_worker() -> None:
 
 
 def ensure_bili_queue_worker() -> None:
-    """确保投稿后台线程已启动（只启动一次）。"""
+    """确保投稿后台线程已启动（只启动一次），并从磁盘恢复未完成的任务。"""
     global bili_queue_worker_started
     if bili_queue_worker_started:
         return
     bili_queue_worker_started = True
+    _load_bili_queue()
     threading.Thread(target=bili_queue_worker, name="bili-queue", daemon=True).start()
     logger.info("B站投稿队列后台线程已启动")
 
@@ -780,6 +819,7 @@ def run_bili_single_job(job: dict) -> None:
         content = _handle_bili_failure(output, record_name, f"文件: {video_name}", vis_label)
         if content is None:
             bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+            _save_bili_queue()
             content = _rate_limit_notice(record_name)
         placeholder = video_path + ".bili_uploading"
         if os.path.exists(placeholder):
@@ -858,6 +898,7 @@ def run_bili_session_job(job: dict) -> None:
         content = _handle_bili_failure(output, record_name, f"集数: {len(valid_ts_paths)}P", vis_label)
         if content is None:
             bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+            _save_bili_queue()
             content = _rate_limit_notice(record_name)
     try:
         push_message(record_name, "", content)
@@ -884,6 +925,22 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
                 valid_ts_paths.append(str(f))
         except OSError:
             pass
+
+    if not valid_ts_paths:
+        # 兼容：如果 TS 文件曾被移动到 converted 目录，从 converted 目录检索
+        rel_parts = p.parts
+        if "downloads" in rel_parts:
+            idx = rel_parts.index("downloads")
+            conv_dir = Path(*rel_parts[:idx+1]) / "converted" / Path(*rel_parts[idx+1:])
+            if conv_dir.exists():
+                for f in sorted(conv_dir.glob("*.ts")):
+                    try:
+                        if f.stat().st_size >= 2 * 1024 * 1024:
+                            valid_ts_paths.append(str(f))
+                    except OSError:
+                        pass
+                if valid_ts_paths:
+                    logger.info(f"整场多P投稿：从 converted 目录检索到 {len(valid_ts_paths)} 个视频")
 
     if not valid_ts_paths:
         logger.info(f"整场多P投稿：未找到有效视频文件 ({session_dir})")
@@ -1063,23 +1120,24 @@ def submit_transcribe(published_files: list, record_name: str, record_url: str =
 
 
 def cleanup_stale_transcribe_placeholders(save_root: str) -> None:
-    """启动时清理残留的 *.transcribing 与 *.bili_uploading 占位文件，避免程序崩溃后对应文件被永久跳过上传。"""
+    """启动时仅清理残留的 *.transcribing 占位文件，避免程序崩溃后对应音频被永久跳过上传。
+    注意：绝不清理 *.bili_uploading，因为在等6小时排队的视频需要靠它阻止百度云抢先上传。"""
     removed = 0
     try:
         for root, _dirs, files in os.walk(save_root):
             for name in files:
-                if name.endswith(".transcribing") or name.endswith(".bili_uploading"):
+                if name.endswith(".transcribing"):
                     placeholder = os.path.join(root, name)
                     try:
                         os.remove(placeholder)
                         removed += 1
-                        logger.info(f"清理残留占位文件: {placeholder}")
+                        logger.info(f"清理残留转写占位文件: {placeholder}")
                     except OSError as e:
                         logger.warning(f"清理占位失败 {placeholder}: {e}")
     except Exception as e:
         logger.error(f"清理残留占位文件异常: {e}")
     if removed:
-        logger.info(f"共清理 {removed} 个残留占位文件")
+        logger.info(f"共清理 {removed} 个残留转写占位文件")
 
 
 def clear_record_info(record_name: str, record_url: str) -> None:

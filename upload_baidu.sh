@@ -342,6 +342,25 @@ while IFS= read -r -d '' file; do
         continue
     fi
 
+    # B站上传主播策略：若该主播配置了传B站，则视频文件由B站托管，百度云绝不上传视频（仅上传mp3和md备份）
+    case "$file" in
+        *.ts|*.mp4|*.flv|*.mkv)
+            if [ -f "$SCRIPT_DIR/config/URL_config.ini" ]; then
+                is_bili_streamer_video=0
+                while IFS= read -r b_anchor; do
+                    [ -z "$b_anchor" ] && continue
+                    if [[ "$file" == *"$b_anchor"* ]]; then
+                        is_bili_streamer_video=1
+                        break
+                    fi
+                done < <(grep "传B站" "$SCRIPT_DIR/config/URL_config.ini" | grep -v '^[[:space:]]*#' | sed -n 's/.*主播:[[:space:]]*\([^,]*\).*/\1/p')
+                if [ "$is_bili_streamer_video" -eq 1 ]; then
+                    continue
+                fi
+            fi
+            ;;
+    esac
+
     # B站上传占位：视频或同名文件正在等待转写/正在上传B站（main.py 创建 .bili_uploading），跳过避免抢先上传删除
     file_stem="${file%.*}"
     if [ -e "${file}.bili_uploading" ] || [ -e "${file_stem}.ts.bili_uploading" ] || [ -e "${file_stem}.mp4.bili_uploading" ]; then
