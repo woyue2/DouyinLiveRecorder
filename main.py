@@ -571,10 +571,16 @@ def enqueue_bili_job(job: dict) -> None:
         position = len(bili_pending_queue)
     logger.info(f"B站投稿已入队（队列第 {position} 位）: {job.get('record_name')}")
     try:
+        raw_name = job.get("record_name", "B站投稿")
+        clean_name = raw_name.split(" ", 1)[-1].strip()
+        clean_name = re.sub(r'^(主播|anchor)[:：]\s*', '', clean_name).strip()
+        session_time = job.get('session_dir', '').split('/')[-1]
+        part_count = len(job.get('ts_paths', []))
+        part_info = f"（共 {part_count}P）" if part_count > 0 else ""
         push_message(
-            job.get("record_name", "B站投稿"),
+            raw_name,
             "",
-            f"[B站投稿排队] 场次《{job.get('session_dir', '').split('/')[-1]}》已进入待投稿队列"
+            f"[B站投稿排队] 【{clean_name}】场次《{session_time}》{part_info}已进入待投稿队列"
             f"（第 {position} 位）。新号限制每 6 小时仅可投稿一次，"
             f"视频全程加锁保护，不会被删除或上传网盘。",
         )

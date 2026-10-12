@@ -244,10 +244,14 @@ def extract_session_bili_metadata(
             llm_model=llm_model
         )
 
-    # stem -> 转写 md 映射（-敏感.md 归一化到同一 stem）
+    # stem -> 转写 md 映射（-敏感.md 归一化到同一 stem，过滤 0 字节损坏文件）
     md_map: Dict[str, Path] = {}
     for f in p.glob("*.md"):
-        md_map.setdefault(f.stem.replace("-敏感", ""), f)
+        try:
+            if f.stat().st_size > 0:
+                md_map.setdefault(f.stem.replace("-敏感", ""), f)
+        except OSError:
+            pass
 
     part_descs = []
     combined_texts = []
@@ -543,7 +547,7 @@ def generate_bili_meta_with_llm(
             f"5. 标题：必须极具网感、爆笑或反转名场面，包含主播名或简称，30字内吸引点击。\n"
             f"6. 简介：提炼2~4个本段高能笑点/名场面（每行一个）。若文本中包含时间戳信息，每行开头必须附带时间戳（格式如 02:15、08:30），B站观众点击时间戳可直接跳转进度条！\n"
             f"7. 标签：以英文逗号分隔5~8个热门标签，首个标签为主播名。\n"
-            f"必须以合法JSON格式输出，字段包含: title, desc, tags。请确保JSON字符串中的换行用\\n表示，不要使用未转义的特殊字符。"
+            f"必须以合法JSON格式输出，字段包含: title, desc, tags。请确保JSON字符串中的换行用\\n表示，严禁在 title 和 desc 字符串内部使用英文半角双引号 \"，如果需要引用请使用中文双引号“ ”或单引号‘ ’！"
         ),
         "知识干货": (
             f"你是一位资深B站商业与知识内容高级主编。\n"
@@ -555,7 +559,7 @@ def generate_bili_meta_with_llm(
             f"4. 标题：突出最具颠覆性认知或核心方法论，必须包含主播名（如【{clean_streamer_name}】），30字内极具启发感与点击欲望。\n"
             f"5. 简介：条理清晰罗列3~5个核心干货观点。若文本包含时间戳，每行开头必须附带时间戳（如 02:15、08:30），B站观众点击时间戳可直接跳转进度条！\n"
             f"6. 标签：以英文逗号分隔5~8个高价值知识标签，首个标签为主播名（如 {clean_streamer_name},商业思维,认知升级,个人成长）。\n"
-            f"必须以合法JSON格式输出，字段包含: title, desc, tags。请确保JSON字符串中的换行用\\n表示，不要使用未转义的特殊字符。"
+            f"必须以合法JSON格式输出，字段包含: title, desc, tags。请确保JSON字符串中的换行用\\n表示，严禁在 title 和 desc 字符串内部使用英文半角双引号 \"，如果需要引用请使用中文双引号“ ”或单引号‘ ’！"
         ),
     }
 
@@ -622,13 +626,32 @@ def generate_bili_meta_with_llm(
             # 提取首个 JSON 对象并用 strict=False 解析（允许字符串内存在原始换行）
             json_match = re.search(r'\{[\s\S]*\}', content_cleaned)
             json_str = json_match.group(0) if json_match else content_cleaned
+            result = None
             try:
                 result = json.loads(json_str, strict=False)
             except Exception:
-                # 容错：把 JSON 字符串内部未转义的裸换行转义为 \n
-                escaped = re.sub(r'(?<!\\)"(\s*)\n(\s*)"', r'"\n"', json_str)
-                escaped = re.sub(r'[\x00-\x09\x0b-\x1f]', '', escaped)
-                result = json.loads(escaped, strict=False)
+                try:
+                    # 容错 1：把 JSON 字符串内部未转义的裸换行转义为 \n
+                    escaped = re.sub(r'(?<!\\)"(\s*)\n(\s*)"', r'"\n"', json_str)
+                    escaped = re.sub(r'[\x00-\x09\x0b-\x1f]', '', escaped)
+                    result = json.loads(escaped, strict=False)
+                except Exception:
+                    # 容错 2：正则表达式抽取字段（彻底免疫内部未转义双引号）
+                    title_m = re.search(r'"title"\s*:\s*"(.*?)"\s*,\s*"(?:desc|tags)"', json_str, re.DOTALL)
+                    desc_m = re.search(r'"desc"\s*:\s*"(.*?)"\s*,\s*"tags"', json_str, re.DOTALL)
+                    if not desc_m:
+                        desc_m = re.search(r'"desc"\s*:\s*"(.*?)"\s*\}', json_str, re.DOTALL)
+                    tags_m = re.search(r'"tags"\s*:\s*"(.*?)"', json_str, re.DOTALL)
+                    if not tags_m:
+                        tags_m = re.search(r'"tags"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
+                    if title_m or desc_m:
+                        result = {
+                            "title": title_m.group(1).replace('"', '”') if title_m else "",
+                            "desc": desc_m.group(1).replace('\\n', '\n') if desc_m else "",
+                            "tags": tags_m.group(1).replace('"', '') if tags_m else ""
+                        }
+                    else:
+                        raise
 
             title = str(result.get("title", "")).strip()
             desc = str(result.get("desc", "")).strip()
