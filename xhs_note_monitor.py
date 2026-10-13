@@ -601,7 +601,7 @@ def process_monitor_once(
                         with open(note_md_path, "w", encoding="utf-8") as nf:
                             nf.write("\n".join(note_md))
 
-                        doc_title = f"【{author_name}】{title[:35]}"
+                        doc_title = f"{detail['publish_time'][:10]}【{author_name}】{title[:30]}"
                         author_folder = feishu_mgr.get_or_create_author_folder(author_name)
                         doc_url, _ = feishu_mgr.create_docx_from_markdown(
                             note_md_path, doc_title=doc_title, folder_token=author_folder

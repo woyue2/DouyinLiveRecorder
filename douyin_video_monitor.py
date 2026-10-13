@@ -718,7 +718,7 @@ def process_blogger_videos(
                                     app_secret=config_settings.get("feishu_app_secret", ""),
                                     folder_token=config_settings.get("feishu_folder_token", "")
                                 )
-                                doc_title = f"【{author_name}】{v['title'][:40]}"
+                                doc_title = f"{v['publish_time'][:10]}【{author_name}】{v['title'][:30]}"
                                 # 文章歸入以主播命名的子資料夾
                                 author_folder = feishu_mgr.get_or_create_author_folder(author_name)
                                 doc_url, doc_token = feishu_mgr.create_docx_from_markdown(

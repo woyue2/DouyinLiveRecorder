@@ -49,7 +49,6 @@ def html_to_markdown(html_path):
 
     time_m = re.search(r'<span>📅\s*([\d\-:\s]+)</span>', c)
     pub_time = time_m.group(1).strip() if time_m else ""
-
     summary_md = ""
     summary_card_m = re.search(r'<div class="summary-card">(.*?)</div>', c, re.DOTALL)
     if summary_card_m:
@@ -100,12 +99,12 @@ def main():
         if fname in ("index.html", "portal.html"):
             continue
 
-        author, title, md_content = html_to_markdown(hf)
+        author, title, pub_time, md_content = html_to_markdown(hf)
         tmp_path = os.path.join("/tmp", f"feishu_{fname}.md")
         with open(tmp_path, "w", encoding="utf-8") as tf:
             tf.write(md_content)
 
-        doc_title = f"【{author}】{title[:35]}"
+        doc_title = f"{pub_time[:10]}【{author}】{title[:30]}".strip()
         print(f"匯入飛書: {doc_title} ...")
         author_folder = mgr.get_or_create_author_folder(author, parent_folder_token=cfg["folder_token"])
         url, _ = mgr.create_docx_from_markdown(tmp_path, doc_title=doc_title, folder_token=author_folder)
