@@ -54,6 +54,13 @@ cover/
 *.ts
 *.flv
 downloads/
+# Local secrets and credentials
+*secret*
+*.secrets
+local_*.ini
+config/local_secrets.ini
+config/*auth*.json
+xhs_auth.json
 # Translations
 *.pot
 

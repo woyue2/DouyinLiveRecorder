@@ -502,6 +502,11 @@ def run_script(command: str) -> None:
 
 # 转写封装脚本路径（从 config.ini [录制设置] mp3转写md脚本路径 读取）：mp3→txt→md 一体化
 transcribe_script = ""
+# 飞书云文档配置项（从 config.ini [飞书文档配置] 读取）
+feishu_doc_enabled = False
+feishu_app_id = ""
+feishu_app_secret = ""
+feishu_folder_token = ""
 # B站投稿全局配置项（从 config.ini [B站投稿] 读取）
 bili_upload_enabled = False
 bili_upload_mode = "整场多P投稿"
@@ -1061,12 +1066,26 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                 except Exception as e:
                     logger.warning(f"读取摘要失败 {mp3_name}: {e}")
 
+                feishu_doc_line = ""
+                if feishu_doc_enabled and feishu_app_id and feishu_app_secret and os.path.exists(md_path):
+                    try:
+                        from src.feishu_uploader import FeishuDocManager
+                        feishu_mgr = FeishuDocManager(feishu_app_id, feishu_app_secret, folder_token=feishu_folder_token)
+                        doc_title = f"【{record_name}】{Path(md_path).stem}"
+                        doc_url, _ = feishu_mgr.create_docx_from_markdown(md_path, doc_title=doc_title)
+                        if doc_url:
+                            feishu_doc_line = f"\n📄 飞书云文档（划线与收藏）：\n{doc_url}\n"
+                    except Exception as e:
+                        logger.warning(f"生成飞书云文档异常: {e}")
+
                 if summary_display:
                     content = (f"{summary_display}\n\n"
+                               f"{feishu_doc_line}"
                                f"--------------------\n"
                                f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传")
                 else:
-                    content = f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传"
+                    content = (f"{feishu_doc_line}"
+                               f"[直播转写] {record_name} 录制转写完成：{mp3_name}，md 已生成待上传")
 
             # 触发B站投稿：转写完成后，如果该URL配置了传B站
             if record_url in bili_upload_urls and bili_upload_enabled:
@@ -3194,6 +3213,10 @@ while True:
     bili_llm_api_base = read_config_value(config, 'B站投稿', '大模型api_base', "https://api.deepseek.com").strip()
     bili_llm_model = read_config_value(config, 'B站投稿', '大模型model', "deepseek-chat").strip()
     biliup_bin = read_config_value(config, 'B站投稿', 'biliup可执行文件路径', "biliup").strip()
+    feishu_doc_enabled = options.get(read_config_value(config, '飞书文档配置', '启用飞书文档', "否"), False)
+    feishu_app_id = read_config_value(config, '飞书文档配置', '飞书app_id', "").strip()
+    feishu_app_secret = read_config_value(config, '飞书文档配置', '飞书app_secret', "").strip()
+    feishu_folder_token = read_config_value(config, '飞书文档配置', '飞书文件夹_token', "").strip()
     streamer_types = {}
     if '主播类型配置' in config.sections():
         for k, v in config.items('主播类型配置'):

@@ -67,6 +67,13 @@ def load_project_config() -> Dict[str, Any]:
             loaded = True
             break
 
+    # 若存在本地私密設定檔 (例如 local_secrets.ini，已被 gitignore 忽略)，一併讀入覆蓋
+    for sp in [os.path.join(_CURRENT_DIR, "config", "local_secrets.ini"), os.path.join(_CURRENT_DIR, "local_secrets.ini")]:
+        if os.path.exists(sp):
+            config.read(sp, encoding="utf-8-sig")
+            loaded = True
+            break
+
     settings = {
         "transcribe_script": "",
         "dingtalk_webhook": "",
@@ -102,6 +109,18 @@ def load_project_config() -> Dict[str, Any]:
         settings["web_outdir"] = "./web_posts"
         settings["web_base_url"] = "http://101.35.47.249:8080/posts"
         settings["web_retention_days"] = 30
+
+    # 飛書文檔設定
+    if config.has_section("飞书文档配置"):
+        settings["feishu_enabled"] = config.get("飞书文档配置", "启用飞书文档", fallback="是").strip() in {"是", "true", "1", "yes"}
+        settings["feishu_app_id"] = config.get("飞书文档配置", "飞书app_id", fallback="").strip()
+        settings["feishu_app_secret"] = config.get("飞书文档配置", "飞书app_secret", fallback="").strip()
+        settings["feishu_folder_token"] = config.get("飞书文档配置", "飞书文件夹_token", fallback="").strip()
+    else:
+        settings["feishu_enabled"] = False
+        settings["feishu_app_id"] = ""
+        settings["feishu_app_secret"] = ""
+        settings["feishu_folder_token"] = ""
 
     return settings
 
@@ -420,15 +439,21 @@ class DouyinVideoMonitor:
         mp3_name: str,
         summary: str = "",
         read_url: str = "",
+        feishu_url: str = "",
         phone: str = "",
         is_atall: bool = False
     ) -> bool:
-        """推送作品更新與 AI 轉寫看點至釘釘，含在線精編閱讀直達連結"""
+        """推送作品更新與 AI 轉寫看點至釘釘，含網頁直達與飛書雲文檔連結"""
         if not webhook:
             logger.warning("未配置釘釘 Webhook，跳過推送")
             return False
 
-        link_section = f"📖 手机在线精编阅读：\n{read_url}\n\n" if read_url else ""
+        links = []
+        if feishu_url:
+            links.append(f"📄 飞书云文档（划线与收藏）：\n{feishu_url}")
+        if read_url:
+            links.append(f"📖 手机网页版精编：\n{read_url}")
+        link_section = "\n\n".join(links) + "\n\n" if links else ""
 
         if summary:
             msg_content = (
@@ -682,6 +707,24 @@ def process_blogger_videos(
                                     cleanup_expired_web_posts(web_outdir, config_settings.get("web_retention_days", 30))
                             except Exception as e:
                                 logger.error(f"生成 HTML 網頁異常: {e}")
+
+                        # 3.2 匯入飛書雲文檔 (Feishu Docx)
+                        feishu_url = ""
+                        if config_settings.get("feishu_enabled", True) and config_settings.get("feishu_app_id"):
+                            try:
+                                from feishu_uploader import FeishuDocManager
+                                feishu_mgr = FeishuDocManager(
+                                    app_id=config_settings.get("feishu_app_id", ""),
+                                    app_secret=config_settings.get("feishu_app_secret", ""),
+                                    folder_token=config_settings.get("feishu_folder_token", "")
+                                )
+                                doc_title = f"【{author_name}】{v['title'][:40]}"
+                                doc_url, doc_token = feishu_mgr.create_docx_from_markdown(md_file, doc_title=doc_title)
+                                if doc_url:
+                                    feishu_url = doc_url
+                                    logger.info(f"成功創建飛書雲文檔: {feishu_url}")
+                            except Exception as fe:
+                                logger.error(f"創建飛書雲文檔異常: {fe}")
                 else:
                     logger.info("未配置轉寫腳本路徑，跳過本機轉寫 (若在伺服器上會由後台處理)")
 
@@ -695,6 +738,7 @@ def process_blogger_videos(
                     mp3_name=os.path.basename(mp3_file),
                     summary=summary_text,
                     read_url=read_url,
+                    feishu_url=feishu_url,
                     phone=dingtalk_phone,
                     is_atall=dingtalk_is_atall
                 )

@@ -138,6 +138,12 @@ def load_project_config() -> Dict[str, Any]:
             config.read(p, encoding="utf-8-sig")
             break
 
+    # 若存在本地私密設定檔 (例如 local_secrets.ini)，一併讀入覆蓋
+    for sp in [os.path.join(_CURRENT_DIR, "config", "local_secrets.ini"), os.path.join(_CURRENT_DIR, "local_secrets.ini")]:
+        if os.path.exists(sp):
+            config.read(sp, encoding="utf-8-sig")
+            break
+
     settings = {
         "xhs_cookie": "",
         "transcribe_script": "",
