@@ -566,7 +566,13 @@ def process_monitor_once(
                         hf.write(html_content)
 
                     logger.info(f"成功生成小紅書圖文網頁: {html_path}")
-                    read_url = f"{web_base_url}/{urllib.parse.quote(html_filename)}"
+                    quoted_name = urllib.parse.quote(html_filename)
+                    read_url = f"{web_base_url}/index.html#/{quoted_name}"
+                    try:
+                        from web_portal import update_portal
+                        update_portal(web_outdir)
+                    except Exception as pe:
+                        logger.warning(f"更新閱讀館門戶索引失敗: {pe}")
 
                 # 釘釘通知
                 if dingtalk_webhook:
