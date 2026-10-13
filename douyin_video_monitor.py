@@ -669,7 +669,16 @@ def process_blogger_videos(
                                 if html_path and html_filename:
                                     logger.info(f"成功生成手機版 HTML 網頁: {html_path}")
                                     quoted_filename = urllib.parse.quote(html_filename)
-                                    read_url = f"{web_base_url}/{quoted_filename}"
+                                    # 產生帶錨點的閱讀館門戶連結，點擊直達並支援側邊欄切換
+                                    read_url = f"{web_base_url}/index.html#/{quoted_filename}"
+
+                                    # 3.2 刷新閱讀館門戶與二級側邊欄索引
+                                    try:
+                                        from web_portal import update_portal
+                                        update_portal(web_outdir)
+                                    except Exception as pe:
+                                        logger.warning(f"刷新閱讀館門戶索引失敗: {pe}")
+
                                     cleanup_expired_web_posts(web_outdir, config_settings.get("web_retention_days", 30))
                             except Exception as e:
                                 logger.error(f"生成 HTML 網頁異常: {e}")

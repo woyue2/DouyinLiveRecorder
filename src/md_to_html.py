@@ -198,11 +198,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="progress-bar" id="progressBar"></div>
   <div class="container">
     <div class="meta-bar">
-      <span class="badge">🎙️ {author}</span>
-      <span>•</span>
-      <span>📅 {publish_time}</span>
-      <span>•</span>
-      <span>⏱️ 视频转写精修</span>
+      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+        <span class="badge">🎙️ {author}</span>
+        <span>•</span>
+        <span>📅 {publish_time}</span>
+        <span>•</span>
+        <span>⏱️ 视频转写精修</span>
+      </div>
+      <a id="backPortalBtn" href="index.html" target="_top" style="text-decoration: none; font-size: 12px; font-weight: 600; color: var(--primary); background: var(--primary-light); padding: 4px 10px; border-radius: 6px; border: 1px solid var(--primary); margin-left: auto;">📚 全部主播與目錄</a>
     </div>
     <h1 class="article-title">{article_title}</h1>
 
@@ -225,6 +228,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       var scrolled = (height > 0) ? (winScroll / height) * 100 : 0;
       document.getElementById("progressBar").style.width = scrolled + "%";
     }};
+
+    // 如果是在門戶 iframe 內嵌展示，隱藏返回目錄按鈕
+    if (window.self !== window.top) {{
+      var backBtn = document.getElementById("backPortalBtn");
+      if (backBtn) backBtn.style.display = "none";
+    }}
 
     function copyShareLink() {{
       if (navigator.clipboard) {{
