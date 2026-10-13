@@ -538,10 +538,20 @@ def process_monitor_once(
             notes = monitor.fetch_user_notes(user_id, count=args.count)
             logger.info(f"取得作品筆記清單: {len(notes)} 篇")
 
+            max_new = getattr(args, "max_new", 0) or 0
+            processed_this_author = 0
+
             for n in notes:
                 note_id = n["note_id"]
                 if not note_id or note_id in history:
                     continue
+
+                # 限制單次每位博主最多處理幾篇新筆記；未處理的留待下次巡檢
+                if max_new > 0 and processed_this_author >= max_new:
+                    logger.info(
+                        f"已達單次處理上限 {max_new} 篇，其餘新筆記留待下次巡檢: 【{custom_name or user_id}】"
+                    )
+                    break
 
                 # 筆記詳情抓取至少間隔 3 分鐘（隨機 3~5 分鐘）
                 detail_jitter = random.uniform(180.0, 300.0)
@@ -636,6 +646,7 @@ def process_monitor_once(
 
                 history.add(note_id)
                 save_history(args.history_file, history)
+                processed_this_author += 1
 
         except XhsRiskControlError as rce:
             # 捕獲風控異常，立即激活 24 小時冷卻熔斷
@@ -657,6 +668,10 @@ def main():
     parser.add_argument("--url-config", type=str, default="config/xhs_URL_config.ini", help="小紅書博主列表設定檔")
     parser.add_argument("--cookie", type=str, default="", help="小紅書測試小號 Cookie (若不填則讀取 config.ini)")
     parser.add_argument("--count", type=int, default=15, help="查詢最新作品數量 (預設 15 部)")
+    parser.add_argument(
+        "--max-new", type=int, default=0,
+        help="單次每位博主最多處理幾篇新筆記 (0 表示不限制)；未處理的留待下次巡檢，不會遺漏"
+    )
     parser.add_argument("--history-file", type=str, default="./downloads/xhs_download_history.json", help="去重歷史紀錄檔案")
     parser.add_argument("--cooldown-file", type=str, default="./downloads/xhs_cooldown.json", help="風控熔斷記錄檔案")
     parser.add_argument("--daemon", action="store_true", help="啟用常駐輪詢模式 (預設 12 小時檢查一次)")
