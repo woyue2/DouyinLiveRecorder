@@ -325,7 +325,6 @@ class XhsNoteMonitor:
         full_url = f"https://edith.xiaohongshu.com{uri}"
         payload = {
             "source_note_id": note_id,
-            "image_scenes": ["CR_PRV", "CR_WM_WEBP"],
             "extra": {"need_body_topic": "1"},
             "xsec_token": xsec_token
         }
@@ -415,21 +414,12 @@ def render_photo_note_html(
     author: str,
     summary_text: str = ""
 ) -> str:
-    """將小紅書圖文筆記直接渲染為手機端高顏值 HTML"""
+    """將小紅書圖文筆記渲染為純文字精編 HTML（不抓取、不渲染圖片，專注文字沉浸閱讀）"""
     title = note_detail.get("title", "")
     desc = note_detail.get("desc", "")
     publish_time = note_detail.get("publish_time", "")
-    images = note_detail.get("image_list", [])
 
-    img_html_list = []
-    for idx, img_url in enumerate(images, 1):
-        img_html_list.append(
-            f'<div style="margin: 16px 0; text-align: center;">'
-            f'<img src="{img_url}" style="max-width: 100%; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);" loading="lazy">'
-            f'</div>'
-        )
-    gallery_html = "\n".join(img_html_list)
-
+    # 構造正文段落（純文字排版，無圖片防盜鏈破碎圖標干擾）
     desc_html_list = []
     for line in desc.splitlines():
         line = line.strip()
@@ -437,6 +427,7 @@ def render_photo_note_html(
             desc_html_list.append(f"<p>{render_markdown_inline(line)}</p>")
     desc_html = "\n".join(desc_html_list)
 
+    # 構造摘要卡片
     summary_card = ""
     if summary_text:
         summary_card = f"""<div class="summary-card">
@@ -445,8 +436,7 @@ def render_photo_note_html(
         </div>"""
 
     body_html = f"""
-    {gallery_html}
-    <div style="margin-top: 24px; font-size: 16px; line-height: 1.85;">
+    <div style="margin-top: 12px; font-size: 16px; line-height: 1.85;">
       {desc_html}
     </div>
     """
