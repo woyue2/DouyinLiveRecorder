@@ -571,8 +571,9 @@ def process_blogger_videos(
             date_prefix = v["publish_time"][:10].replace("-", "")
             base_name = f"{date_prefix}_{safe_title}_{v['aweme_id']}"
 
-            # 保存路徑：downloads/作者名/xxx.mp4，無縫相容現有 upload_baidu.sh
-            target_dir = os.path.join(args.outdir, author_name)
+            # 保存路徑：downloads/{作者名}_作品/xxx.mp4，上傳至百度雲時自動歸入 /live_audio/{作者名}_作品/，與直播目錄隔離
+            folder_name = f"{author_name}_作品"
+            target_dir = os.path.join(args.outdir, folder_name)
             mp4_file = os.path.join(target_dir, f"{base_name}.mp4")
             mp3_file = os.path.join(target_dir, f"{base_name}.mp3")
 
