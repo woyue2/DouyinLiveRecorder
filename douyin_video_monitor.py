@@ -91,6 +91,18 @@ def load_project_config() -> Dict[str, Any]:
         settings["dingtalk_is_atall"] = at_all_str in {"是", "true", "1", "yes"}
         settings["dingtalk_enabled"] = bool("钉钉" in push_types and settings["dingtalk_webhook"])
 
+    # Web 服務設定
+    if config.has_section("Web服务配置"):
+        settings["web_enabled"] = config.get("Web服务配置", "启用网页生成", fallback="是").strip() in {"是", "true", "1", "yes"}
+        settings["web_outdir"] = config.get("Web服务配置", "网页输出目录", fallback="./web_posts").strip()
+        settings["web_base_url"] = config.get("Web服务配置", "网页访问地址", fallback="http://101.35.47.249:8080/posts").strip()
+        settings["web_retention_days"] = config.getint("Web服务配置", "网页保留天数", fallback=30)
+    else:
+        settings["web_enabled"] = True
+        settings["web_outdir"] = "./web_posts"
+        settings["web_base_url"] = "http://101.35.47.249:8080/posts"
+        settings["web_retention_days"] = 30
+
     return settings
 
 
@@ -403,28 +415,33 @@ class DouyinVideoMonitor:
         publish_time: str,
         mp3_name: str,
         summary: str = "",
+        read_url: str = "",
         phone: str = "",
         is_atall: bool = False
     ) -> bool:
-        """推送作品更新與 AI 轉寫看點至釘釘"""
+        """推送作品更新與 AI 轉寫看點至釘釘，含在線精編閱讀直達連結"""
         if not webhook:
             logger.warning("未配置釘釘 Webhook，跳過推送")
             return False
 
+        link_section = f"📖 手机在线精编阅读：\n{read_url}\n\n" if read_url else ""
+
         if summary:
             msg_content = (
                 f"【精彩看点】\n{summary}\n\n"
+                f"{link_section}"
                 f"--------------------\n"
                 f"[抖音视频更新] 【{author}】\n"
                 f"标题：{title}\n"
                 f"发布时间：{publish_time}\n"
                 f"音频：{mp3_name}\n"
-                f"状态：已转写完成，待上传百度网盘"
+                f"状态：已转写完成并发布网页，待上传百度网盘"
             )
         else:
             msg_content = (
                 f"[抖音视频更新] 【{author}】\n"
                 f"标题：{title}\n"
+                f"{link_section}"
                 f"发布时间：{publish_time}\n"
                 f"音频：{mp3_name}\n"
                 f"状态：音频提取完成，待上传百度网盘"
@@ -438,6 +455,23 @@ class DouyinVideoMonitor:
         else:
             logger.error(f"釘釘推送失敗: {res.get('error')}")
         return success
+
+
+def cleanup_expired_web_posts(posts_dir: str, retention_days: int = 30):
+    """清理過期的 Web HTML 檔案 (預設保留 30 天)"""
+    if not os.path.exists(posts_dir) or retention_days <= 0:
+        return
+    now = time.time()
+    cutoff_time = now - (retention_days * 86400)
+    for fname in os.listdir(posts_dir):
+        if fname.endswith(".html"):
+            fpath = os.path.join(posts_dir, fname)
+            try:
+                if os.path.getmtime(fpath) < cutoff_time:
+                    os.remove(fpath)
+                    logger.info(f"已清理過期 HTML 網頁 (超過 {retention_days} 天): {fname}")
+            except OSError:
+                pass
 
     @staticmethod
     def trigger_baidu_upload(script_path: str = "upload_baidu.sh") -> bool:
@@ -607,12 +641,34 @@ def process_blogger_videos(
             # 3. 轉寫 MP3 -> MD (注意：傳遞絕對路徑給 transcribe_one.sh)
             md_file = None
             summary_text = ""
+            read_url = ""
             if args.transcribe and os.path.exists(mp3_file):
                 if transcribe_script:
                     abs_mp3_file = os.path.abspath(mp3_file)
                     md_file = monitor.transcribe_mp3_to_md(abs_mp3_file, transcribe_script)
                     if md_file:
                         summary_text = monitor.extract_summary_from_md(md_file)
+
+                        # 3.1 生成手機版在線閱讀 HTML 網頁
+                        if config_settings.get("web_enabled", True):
+                            try:
+                                from md_to_html import convert_md_file_to_html
+                                web_outdir = getattr(args, "web_outdir", "") or config_settings.get("web_outdir", "./web_posts")
+                                web_base_url = getattr(args, "web_base_url", "") or config_settings.get("web_base_url", "http://101.35.47.249:8080/posts").rstrip("/")
+                                html_path, html_filename = convert_md_file_to_html(
+                                    md_path=md_file,
+                                    output_dir=web_outdir,
+                                    author=author_name,
+                                    title=v["title"],
+                                    publish_time=v["publish_time"]
+                                )
+                                if html_path and html_filename:
+                                    logger.info(f"成功生成手機版 HTML 網頁: {html_path}")
+                                    quoted_filename = urllib.parse.quote(html_filename)
+                                    read_url = f"{web_base_url}/{quoted_filename}"
+                                    cleanup_expired_web_posts(web_outdir, config_settings.get("web_retention_days", 30))
+                            except Exception as e:
+                                logger.error(f"生成 HTML 網頁異常: {e}")
                 else:
                     logger.info("未配置轉寫腳本路徑，跳過本機轉寫 (若在伺服器上會由後台處理)")
 
@@ -625,6 +681,7 @@ def process_blogger_videos(
                     publish_time=v["publish_time"],
                     mp3_name=os.path.basename(mp3_file),
                     summary=summary_text,
+                    read_url=read_url,
                     phone=dingtalk_phone,
                     is_atall=dingtalk_is_atall
                 )
@@ -677,6 +734,8 @@ def main():
     parser.add_argument("--outdir", type=str, default="./downloads", help="下載保存目錄")
     parser.add_argument("--history-file", type=str, default="./downloads/download_history.json", help="去重歷史紀錄檔案")
     parser.add_argument("--transcribe-script", type=str, default="", help="指定轉寫腳本路徑")
+    parser.add_argument("--web-outdir", type=str, default="", help="HTML 網頁輸出目錄 (預設讀取 config.ini [Web服务配置])")
+    parser.add_argument("--web-base-url", type=str, default="", help="HTML 網頁對外訪問 URL 前綴 (預設讀取 config.ini [Web服务配置])")
     parser.add_argument("--dingtalk-webhook", type=str, default="", help="指定釘釘推送 Webhook")
     parser.add_argument("--daemon", action="store_true", help="啟用常駐模式 (每隔指定時長循環檢查)")
     parser.add_argument("--interval-hours", type=float, default=12.0, help="常駐模式檢查間隔小時數 (預設 12 小時)")
