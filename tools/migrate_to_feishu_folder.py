@@ -107,7 +107,8 @@ def main():
 
         doc_title = f"【{author}】{title[:35]}"
         print(f"匯入飛書: {doc_title} ...")
-        url, _ = mgr.create_docx_from_markdown(tmp_path, doc_title=doc_title, folder_token=cfg["folder_token"])
+        author_folder = mgr.get_or_create_author_folder(author, parent_folder_token=cfg["folder_token"])
+        url, _ = mgr.create_docx_from_markdown(tmp_path, doc_title=doc_title, folder_token=author_folder)
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 

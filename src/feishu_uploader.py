@@ -28,7 +28,80 @@ class FeishuDocManager:
         self.folder_token = folder_token.strip()
         self._token: Optional[str] = None
         self._token_expire_at: float = 0
+        # 父資料夾 token -> {子資料夾名稱: 子資料夾 token} 快取，避免同一次執行重複查詢
+        self._subfolder_cache: Dict[str, Dict[str, str]] = {}
         self.client = httpx.Client(timeout=30.0)
+
+    def _list_subfolders(self, parent_token: str) -> Dict[str, str]:
+        """列出父資料夾下的所有子資料夾 {名稱: token}"""
+        token = self.get_tenant_access_token()
+        if not token:
+            return {}
+
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{FEISHU_HOST}/open-apis/drive/v1/files"
+        params = {"folder_token": parent_token, "page_size": 200}
+        folders: Dict[str, str] = {}
+
+        try:
+            resp = self.client.get(url, headers=headers, params=params)
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(f"列出飛書子資料夾失敗: {data.get('msg')}")
+                return {}
+            for item in data.get("data", {}).get("files", []):
+                if item.get("type") == "folder":
+                    folders[item.get("name", "")] = item.get("token", "")
+        except Exception as e:
+            logger.warning(f"列出飛書子資料夾異常: {e}")
+
+        return folders
+
+    def _create_folder(self, name: str, parent_token: str) -> Optional[str]:
+        """在父資料夾下建立子資料夾，返回新資料夾 token"""
+        token = self.get_tenant_access_token()
+        if not token:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        url = f"{FEISHU_HOST}/open-apis/drive/v1/files/create_folder"
+        try:
+            resp = self.client.post(url, headers=headers, json={"name": name, "folder_token": parent_token})
+            data = resp.json()
+            if data.get("code") == 0:
+                return data.get("data", {}).get("token")
+            logger.warning(f"建立飛書子資料夾失敗 ({name}): {data.get('msg')}")
+        except Exception as e:
+            logger.warning(f"建立飛書子資料夾異常 ({name}): {e}")
+        return None
+
+    def get_or_create_author_folder(self, author: str, parent_folder_token: str = "") -> str:
+        """
+        取得或建立以主播命名的子資料夾，讓每位主播的文章歸類在自己的資料夾下。
+        失敗時回退至父資料夾，確保不影響文檔創建。
+        """
+        parent = parent_folder_token or self.folder_token
+        clean_author = (author or "").strip()
+        if not parent or not clean_author:
+            return parent
+
+        if parent not in self._subfolder_cache:
+            self._subfolder_cache[parent] = self._list_subfolders(parent)
+
+        folders = self._subfolder_cache[parent]
+        if clean_author in folders and folders[clean_author]:
+            return folders[clean_author]
+
+        new_token = self._create_folder(clean_author, parent)
+        if new_token:
+            folders[clean_author] = new_token
+            logger.info(f"已建立主播子資料夾: {clean_author}")
+            return new_token
+
+        return parent
 
     def is_configured(self) -> bool:
         """檢查是否已配置 App ID 與 App Secret"""

@@ -1072,7 +1072,11 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                         from src.feishu_uploader import FeishuDocManager
                         feishu_mgr = FeishuDocManager(feishu_app_id, feishu_app_secret, folder_token=feishu_folder_token)
                         doc_title = f"【{record_name}】{Path(md_path).stem}"
-                        doc_url, _ = feishu_mgr.create_docx_from_markdown(md_path, doc_title=doc_title)
+                        # 文章歸入以主播命名的子資料夾
+                        author_folder = feishu_mgr.get_or_create_author_folder(record_name)
+                        doc_url, _ = feishu_mgr.create_docx_from_markdown(
+                            md_path, doc_title=doc_title, folder_token=author_folder
+                        )
                         if doc_url:
                             feishu_doc_line = f"\n📄 飞书云文档（划线与收藏）：\n{doc_url}\n"
                     except Exception as e:

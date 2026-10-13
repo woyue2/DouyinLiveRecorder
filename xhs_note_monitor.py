@@ -158,6 +158,10 @@ def load_project_config() -> Dict[str, Any]:
         "llm_api_key": "",
         "llm_api_base": "https://api.minimaxi.com/anthropic",
         "llm_model": "MiniMax-M3",
+        "feishu_enabled": False,
+        "feishu_app_id": "",
+        "feishu_app_secret": "",
+        "feishu_folder_token": "",
     }
 
     if config.has_section("Cookie"):
@@ -184,6 +188,12 @@ def load_project_config() -> Dict[str, Any]:
         settings["llm_api_key"] = config.get("B站投稿", "大模型api_key", fallback="").strip()
         settings["llm_api_base"] = config.get("B站投稿", "大模型api_base", fallback="https://api.minimaxi.com/anthropic").strip()
         settings["llm_model"] = config.get("B站投稿", "大模型model", fallback="MiniMax-M3").strip()
+
+    if config.has_section("飞书文档配置"):
+        settings["feishu_enabled"] = config.get("飞书文档配置", "启用飞书文档", fallback="是").strip() in {"是", "true", "1", "yes"}
+        settings["feishu_app_id"] = config.get("飞书文档配置", "飞书app_id", fallback="").strip()
+        settings["feishu_app_secret"] = config.get("飞书文档配置", "飞书app_secret", fallback="").strip()
+        settings["feishu_folder_token"] = config.get("飞书文档配置", "飞书文件夹_token", fallback="").strip()
 
     return settings
 
@@ -570,9 +580,48 @@ def process_monitor_once(
                     except Exception as pe:
                         logger.warning(f"更新閱讀館門戶索引失敗: {pe}")
 
+                # 生成飛書雲文檔（圖文筆記：直接以標題、正文與配圖生成 Docx）
+                feishu_url = ""
+                if config_settings.get("feishu_enabled", True) and config_settings.get("feishu_app_id"):
+                    try:
+                        from feishu_uploader import FeishuDocManager
+                        feishu_mgr = FeishuDocManager(
+                            app_id=config_settings.get("feishu_app_id", ""),
+                            app_secret=config_settings.get("feishu_app_secret", ""),
+                            folder_token=config_settings.get("feishu_folder_token", "")
+                        )
+                        note_md = [f"# {title}", ""]
+                        note_md.append(f"> 📕 **作者**：{author_name}  |  📅 **发布时间**：{detail['publish_time']}  |  👍 **点赞**：{n.get('liked_count', '0')}")
+                        note_md.append("")
+                        for img_url in detail.get("image_list", []):
+                            note_md.append(f"![]({img_url})")
+                            note_md.append("")
+                        note_md.append(detail.get("desc", ""))
+                        note_md_path = os.path.join("/tmp", f"xhs_feishu_{note_id}.md")
+                        with open(note_md_path, "w", encoding="utf-8") as nf:
+                            nf.write("\n".join(note_md))
+
+                        doc_title = f"【{author_name}】{title[:35]}"
+                        author_folder = feishu_mgr.get_or_create_author_folder(author_name)
+                        doc_url, _ = feishu_mgr.create_docx_from_markdown(
+                            note_md_path, doc_title=doc_title, folder_token=author_folder
+                        )
+                        if os.path.exists(note_md_path):
+                            os.remove(note_md_path)
+                        if doc_url:
+                            feishu_url = doc_url
+                            logger.info(f"成功創建飛書雲文檔: {feishu_url}")
+                    except Exception as fe:
+                        logger.error(f"創建飛書雲文檔異常: {fe}")
+
                 # 釘釘通知
                 if dingtalk_webhook:
-                    link_sec = f"📖 手机在线图文精编：\n{read_url}\n\n" if read_url else ""
+                    links = []
+                    if feishu_url:
+                        links.append(f"📄 飞书云文档（划线与收藏）：\n{feishu_url}")
+                    if read_url:
+                        links.append(f"📖 手机在线图文精编：\n{read_url}")
+                    link_sec = "\n\n".join(links) + "\n\n" if links else ""
                     msg_content = (
                         f"📕 【小红书更新】 【{author_name}】\n"
                         f"标题：{title}\n"
