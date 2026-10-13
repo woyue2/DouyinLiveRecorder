@@ -170,6 +170,14 @@ class FeishuDocManager:
                     doc_url = poll_data.get("url")
                     doc_token = poll_data.get("token")
                     logger.info(f"🎉 飛書 Docx 雲文檔創建成功！URL: {doc_url}")
+                    # 清理雲空間中殘留的中間 .md 來源檔，僅保留最終 Docx
+                    try:
+                        self.client.delete(
+                            f"{FEISHU_HOST}/open-apis/drive/v1/files/{file_token}?type=file",
+                            headers=headers
+                        )
+                    except Exception:
+                        pass
                     return doc_url, doc_token
                 elif job_status in (1, 2):  # 隊列中或轉換中
                     continue
