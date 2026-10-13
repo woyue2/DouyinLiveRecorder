@@ -15,6 +15,7 @@ import time
 import json
 import logging
 import argparse
+import subprocess
 import configparser
 
 from playwright.sync_api import sync_playwright
@@ -89,16 +90,36 @@ def run_local_login(timeout_seconds: int = 180) -> bool:
         logged_in = False
 
         while time.time() - start_time < timeout_seconds:
-            cookies = context.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in cookies}
+            # 判斷登入成功的真正標準：
+            # 1. 前端狀態 window.__INITIAL_STATE__.user.loggedIn 變為 True
+            try:
+                is_logged = page.evaluate("""() => {
+                    try {
+                        if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user && window.__INITIAL_STATE__.user.loggedIn === true) {
+                            return true;
+                        }
+                    } catch (e) {}
+                    return false;
+                }""")
+                if is_logged:
+                    logger.info("🎉 檢測到小紅書登入成功 (loggedIn=true)！")
+                    logged_in = True
+                    break
+            except Exception:
+                pass
 
-            # 判斷登入成功的核心標誌：出現 web_session 且 a1 存在
-            if "web_session" in cookie_dict and cookie_dict.get("web_session"):
-                logger.info("🎉 檢測到登入成功憑證 (web_session)！")
-                logged_in = True
-                break
+            # 2. 檢測頭像或用戶中心標識
+            try:
+                user_el = page.locator(".user-avatar, .side-bar .user, [class*='avatar']").first
+                login_btn = page.locator(".login-btn, button:has-text('登录')").first
+                if user_el.is_visible(timeout=500) and not login_btn.is_visible(timeout=500):
+                    logger.info("🎉 檢測到用戶頭像已顯示，登入成功！")
+                    logged_in = True
+                    break
+            except Exception:
+                pass
 
-            time.sleep(1.5)
+            time.sleep(2.0)
 
         if not logged_in:
             logger.error("登入超時或未檢測到登入憑證，請稍後重試。")
