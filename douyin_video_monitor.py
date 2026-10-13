@@ -280,8 +280,12 @@ class DouyinVideoMonitor:
         temp_path = save_path + ".tmp"
 
         logger.info(f"開始下載 MP4 -> {save_path}")
+        headers = {
+            "User-Agent": self.ua,
+            "Referer": "https://www.douyin.com/",
+        }
         try:
-            with self.client.stream("GET", video_url) as r:
+            with self.client.stream("GET", video_url, headers=headers) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
                 downloaded = 0
