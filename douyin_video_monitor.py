@@ -566,8 +566,8 @@ def process_blogger_videos(
                 break
 
             author_raw = custom_name or v["author"]
-            author_name = re.sub(r'[\\/*?:"<>|]', "_", author_raw).strip() or "抖音博主"
-            safe_title = re.sub(r'[\\/*?:"<>|]', "_", v["title"][:30]).strip() or v["aweme_id"]
+            author_name = re.sub(r'[\s#\\/*?:"<>|]', "_", author_raw).strip("_") or "抖音博主"
+            safe_title = re.sub(r'[\s#\\/*?:"<>|]', "_", v["title"][:25]).strip("_") or v["aweme_id"]
             date_prefix = v["publish_time"][:10].replace("-", "")
             base_name = f"{date_prefix}_{safe_title}_{v['aweme_id']}"
 
@@ -579,11 +579,15 @@ def process_blogger_videos(
 
             # 1. 下載 MP4
             success = False
-            if not os.path.exists(mp4_file):
+            if not os.path.exists(mp4_file) and not os.path.exists(mp3_file):
                 success = monitor.download_video(v["video_url"], mp4_file)
             else:
-                logger.info(f"MP4 已存在: {mp4_file}")
-                success = True
+                if os.path.exists(mp3_file):
+                    logger.info(f"MP3 已存在，跳過下載 MP4: {mp3_file}")
+                    success = True
+                else:
+                    logger.info(f"MP4 已存在: {mp4_file}")
+                    success = True
 
             if not success:
                 continue
@@ -592,12 +596,21 @@ def process_blogger_videos(
             if args.extract_mp3 and not os.path.exists(mp3_file):
                 monitor.extract_mp3_from_mp4(mp4_file, mp3_file)
 
-            # 3. 轉寫 MP3 -> MD
+            # 依使用者需求：不保存視頻，提取出 MP3 後立即刪除 MP4（節省伺服器空間，百度雲僅備份 MP3 與 MD）
+            if not getattr(args, "keep_video", False) and os.path.exists(mp4_file) and os.path.exists(mp3_file):
+                try:
+                    os.remove(mp4_file)
+                    logger.info(f"已清理暫存 MP4 視頻，僅保留音訊與 Markdown: {mp4_file}")
+                except OSError as e:
+                    logger.warning(f"刪除 MP4 失敗: {e}")
+
+            # 3. 轉寫 MP3 -> MD (注意：傳遞絕對路徑給 transcribe_one.sh)
             md_file = None
             summary_text = ""
             if args.transcribe and os.path.exists(mp3_file):
                 if transcribe_script:
-                    md_file = monitor.transcribe_mp3_to_md(mp3_file, transcribe_script)
+                    abs_mp3_file = os.path.abspath(mp3_file)
+                    md_file = monitor.transcribe_mp3_to_md(abs_mp3_file, transcribe_script)
                     if md_file:
                         summary_text = monitor.extract_summary_from_md(md_file)
                 else:
@@ -656,6 +669,7 @@ def main():
     parser.add_argument("--no-top", action="store_true", help="排除置頂作品")
     parser.add_argument("--download", action="store_true", default=True, help="自動下載篩選出的視頻")
     parser.add_argument("--extract-mp3", action="store_true", default=True, help="下載後提取 MP3 音頻")
+    parser.add_argument("--keep-video", action="store_true", help="保留下載的 MP4 視頻 (預設提取 MP3 後自動刪除 MP4)")
     parser.add_argument("--transcribe", action="store_true", default=True, help="提取音頻後呼叫腳本轉寫為 MD")
     parser.add_argument("--notify-dingtalk", action="store_true", default=True, help="轉寫完成後推送釘釘看點通知")
     parser.add_argument("--upload-baidu", action="store_true", help="主動觸發 upload_baidu.sh 上傳")
