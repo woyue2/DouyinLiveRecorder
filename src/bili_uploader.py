@@ -691,8 +691,8 @@ def generate_bili_meta_with_llm(
 
 _BILI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-# B 站评论单条字数上限（2026-10 实测 2000 字可通过）
-BILI_COMMENT_MAX_LEN = 2000
+# B 站评论单条字数上限（B站接口硬限制1000字，超出报错 code=12025；设为950预留安全边界）
+BILI_COMMENT_MAX_LEN = 950
 
 
 def _load_cookie_header(cookie_path: str) -> Tuple[str, Dict[str, str]]:
@@ -747,6 +747,23 @@ def get_aid_from_bvid(bvid: str, cookie_path: str = "cookies.json",
         if attempt < retries - 1:
             time.sleep(delay)
     return None
+
+
+def get_video_status(bvid: str, cookie_path: str = "cookies.json") -> Tuple[int, Optional[int]]:
+    """查询视频当前审核转码状态与 aid。
+    Returns:
+        (state, aid)
+        state: >=0 (已发布/通过), -50 (转码/审核中), -40 (审核锁定), -999 (未索引/失败)
+    """
+    try:
+        header, _ = _load_cookie_header(cookie_path)
+        res = _bili_api(f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}", header)
+        if res.get("code") == 0:
+            data = res.get("data", {})
+            return int(data.get("state", -999)), int(data.get("aid")) if data.get("aid") else None
+    except Exception as e:
+        logger.warning(f"查询视频状态异常 ({bvid}): {e}")
+    return -999, None
 
 
 def post_video_comment(bvid: str, message: str,
@@ -861,39 +878,90 @@ def cleanup_part_links(tmp_dir: str) -> None:
         logger.warning(f"清理分P硬链接目录失败 {tmp_dir}: {e}")
 
 
-def build_parts_index(parts: list, max_len: int = BILI_COMMENT_MAX_LEN) -> str:
-    """把各分 P 的时间戳看点压缩成一条可置顶的索引评论。
+def build_parts_index_chunks(parts: list, max_len_per_chunk: int = BILI_COMMENT_MAX_LEN, max_chunks: int = 3) -> list:
+    """把各分 P 的时间戳看点切分成多条（1~3条）严格不超过 max_len_per_chunk 的索引评论。
 
     parts: [{'label': '【P1】', 'lines': ['01:30 xxx', ...]}, ...]
     """
-    header = "📌 分P看点索引（点击时间戳可跳转到对应分P内的位置）"
+    header_base = "📌 分P看点索引"
     blocks = []
     for part in parts:
         label = part.get("label", "")
         lines = [l.strip() for l in part.get("lines", []) if l.strip()]
-        if not lines:
-            continue
-        blocks.append(label + "\n" + "\n".join(lines))
+        if lines:
+            blocks.append(label + "\n" + "\n".join(lines))
     if not blocks:
-        return header
-    body = "\n\n".join(blocks)
-    total = f"{header}\n\n{body}"
-    if len(total) <= max_len:
-        return total
-    # 超长时逐块裁剪，保留尽可能多的分P
-    kept = []
-    used = len(header) + 2
-    for block in blocks:
-        add = len(block) + 2
-        if used + add > max_len - 4:
-            break
-        kept.append(block)
-        used += add
-    if kept:
-        omitted = len(blocks) - len(kept)
-        suffix = f"\n\n...（其余 {omitted} 个分P看点见简介）" if omitted > 0 else ""
-        return f"{header}\n\n" + "\n\n".join(kept) + suffix
-    return header
+        return [header_base]
+
+    chunks = []
+    current_blocks = []
+    header_overhead = len(header_base) + 30
+    current_len = header_overhead
+
+    for b in blocks:
+        add_len = len(b) + 2
+        if current_blocks and (current_len + add_len > max_len_per_chunk):
+            chunks.append(current_blocks)
+            if len(chunks) >= max_chunks - 1:
+                break
+            current_blocks = [b]
+            current_len = header_overhead + add_len
+        else:
+            current_blocks.append(b)
+            current_len += add_len
+
+    if current_blocks and len(chunks) < max_chunks:
+        chunks.append(current_blocks)
+
+    results = []
+    total_chunks = len(chunks)
+    for idx, c_blocks in enumerate(chunks, 1):
+        if total_chunks == 1:
+            hdr = f"{header_base}（点击时间戳可跳转播放进度）"
+        else:
+            hdr = f"{header_base} [{idx}/{total_chunks}]（点击时间戳可跳转播放进度）"
+        content = hdr + "\n\n" + "\n\n".join(c_blocks)
+        if len(content) > max_len_per_chunk:
+            content = content[:max_len_per_chunk - 3] + "..."
+        results.append(content)
+    return results
+
+
+def build_parts_index(parts: list, max_len: int = BILI_COMMENT_MAX_LEN) -> str:
+    """把各分 P 的时间戳看点压缩成一条可置顶的索引评论（兼容接口）。"""
+    chunks = build_parts_index_chunks(parts, max_len_per_chunk=max_len)
+    return chunks[0] if chunks else "📌 分P看点索引"
+
+
+def post_multi_chunk_comments(bvid: str, chunks: list,
+                              cookie_path: str = "cookies.json",
+                              aid: Optional[int] = None,
+                              pin_first: bool = True,
+                              delay_between: int = 30) -> list:
+    """按顺序发布多条分卷看点评论，第 1 条置顶，后续每条间隔 delay_between 秒（默认30秒）。
+    Returns:
+        [{"chunk": 1, "ok": True, "info": "3169..."}, ...]
+    """
+    import time
+    results = []
+    for idx, msg in enumerate(chunks, 1):
+        if idx > 1:
+            logger.info(f"等待 {delay_between} 秒后发布下一条分P索引评论 [{idx}/{len(chunks)}]")
+            time.sleep(delay_between)
+        is_pin = pin_first and (idx == 1)
+        ok, info = post_video_comment(
+            bvid=bvid,
+            message=msg,
+            cookie_path=cookie_path,
+            pin=is_pin,
+            aid=aid,
+        )
+        results.append({"chunk": idx, "ok": ok, "info": info})
+        if ok:
+            logger.info(f"分P索引评论 [{idx}/{len(chunks)}] 发布成功: BV={bvid} {info}")
+        else:
+            logger.warning(f"分P索引评论 [{idx}/{len(chunks)}] 发布失败: BV={bvid} {info}")
+    return results
 
 
 if __name__ == "__main__":

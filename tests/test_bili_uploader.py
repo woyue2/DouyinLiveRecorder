@@ -220,3 +220,28 @@ def test_upload_is_only_self(monkeypatch):
         os.remove(temp_ts)
         os.remove(temp_cookie)
 
+
+def test_build_parts_index_chunks():
+    # 测试较少 P 时单条
+    short_parts = [
+        {"label": "【P1】", "lines": ["01:30 搞笑名场面1", "03:45 搞笑名场面2"]},
+        {"label": "【P2】", "lines": ["02:10 搞怪PK局", "05:00 表情包截屏"]},
+    ]
+    chunks1 = bili_uploader.build_parts_index_chunks(short_parts, max_len_per_chunk=900)
+    assert len(chunks1) == 1
+    assert "【P1】" in chunks1[0]
+    assert "【P2】" in chunks1[0]
+    assert len(chunks1[0]) <= 900
+
+    # 测试较多 P 时自动切分为多条（每条 <= 900 字）
+    long_parts = [
+        {"label": f"【P{i}】", "lines": [f"0{i}:15 核心观点第{i}段详细解析，方法论与启发", f"0{i}:45 补充案例第{i}段金句说明"]}
+        for i in range(1, 15)
+    ]
+    chunks2 = bili_uploader.build_parts_index_chunks(long_parts, max_len_per_chunk=400)
+    assert len(chunks2) >= 2
+    for c in chunks2:
+        assert len(c) <= 400
+        assert "📌 分P看点索引" in c
+
+

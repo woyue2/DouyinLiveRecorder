@@ -56,9 +56,12 @@ from src.bili_uploader import (
     upload_video_biliup,
     handle_post_upload_cleanup,
     build_parts_index,
+    build_parts_index_chunks,
     build_part_links,
     cleanup_part_links,
     post_video_comment,
+    post_multi_chunk_comments,
+    get_video_status,
 )
 from src.stream_selection import is_flv_preferred_platform, select_source_url
 from src.proxy import ProxyDetector
@@ -740,23 +743,74 @@ def _rate_limit_notice(record_name: str) -> str:
             f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
 
 
+def schedule_delayed_bili_comments(bvid: str, meta: dict, aid: Optional[int],
+                                    record_name: str, clean_name: str) -> None:
+    """在独立后台守护线程中延迟发布评论（等待1小时转码审核通过后再发布置顶，多条间间隔30秒）。"""
+    parts = meta.get("parts") or []
+    if not parts:
+        logger.info(f"B站延迟评论跳过 ({bvid})：无可用的分P索引内容")
+        return
+    chunks = build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3)
+
+    def _worker():
+        try:
+            logger.info(f"开启B站评论发布守护线程: BV={bvid}，等待 3600 秒以完成转码审核...")
+            time.sleep(3600)
+
+            state, curr_aid = get_video_status(bvid, bili_cookie_path)
+            effective_aid = aid or curr_aid
+
+            if state < 0:
+                logger.info(f"B站视频目前仍未过审/转码中 (state={state})，等待 7200 秒后重试: BV={bvid}")
+                time.sleep(7200)
+                state, curr_aid = get_video_status(bvid, bili_cookie_path)
+                effective_aid = effective_aid or curr_aid
+
+            results = post_multi_chunk_comments(
+                bvid=bvid,
+                chunks=chunks,
+                cookie_path=bili_cookie_path,
+                aid=effective_aid,
+                pin_first=True,
+                delay_between=30
+            )
+            success_count = sum(1 for r in results if r.get("ok"))
+            if success_count > 0:
+                logger.info(f"B站分P看点评论已发布: BV={bvid} 成功={success_count}/{len(chunks)}")
+                try:
+                    push_message(
+                        record_name,
+                        "",
+                        f"[B站分P看点评论发布完成] 【{clean_name}】{bvid}\n"
+                        f"已自动发布 {success_count}/{len(chunks)} 条看点评论（第1条已置顶，每条间隔30秒依次发布）"
+                    )
+                except Exception as e:
+                    logger.warning(f"推送分P看点评论完成通知失败: {e}")
+            else:
+                logger.warning(f"B站分P看点评论全部失败: BV={bvid}")
+        except Exception as e:
+            logger.error(f"B站评论发布守护线程异常 ({bvid}): {e}")
+
+    t = threading.Thread(target=_worker, daemon=True, name=f"bili-comment-{bvid}")
+    t.start()
+
+
 def post_bili_index_comment(bvid: str, meta: dict, aid: Optional[int] = None) -> tuple[bool, str]:
-    """在多P稿件下发布并置顶分P看点索引评论。"""
+    """在多P稿件下立即尝试发布分P看点索引评论（兼容直接调用）。"""
     parts = meta.get("parts") or []
     if not parts:
         return False, "无可用的分P索引内容"
-    index_text = build_parts_index(parts)
-    ok, info = post_video_comment(
+    chunks = build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3)
+    results = post_multi_chunk_comments(
         bvid=bvid,
-        message=index_text,
+        chunks=chunks,
         cookie_path=bili_cookie_path,
-        pin=True,
         aid=aid,
+        pin_first=True,
+        delay_between=30
     )
-    if ok:
-        logger.info(f"分P索引评论已发布并置顶: BV={bvid} rpid={info}")
-    else:
-        logger.warning(f"分P索引评论发布失败: BV={bvid} {info}")
+    ok = any(r.get("ok") for r in results)
+    info = "; ".join(f"[{r.get('chunk')}] {r.get('info')}" for r in results)
     return ok, info
 
 
@@ -888,8 +942,11 @@ def run_bili_session_job(job: dict) -> None:
         parsed_aid = int(aid_match.group(1)) if aid_match else None
         comment_note = ""
         if bili_auto_comment and bvid.startswith("BV"):
-            ok_c, info_c = post_bili_index_comment(bvid, meta, aid=parsed_aid)
-            comment_note = f"\n置顶评论: {'已发布 rpid=' + info_c if ok_c else '失败 - ' + info_c}"
+            parts = meta.get("parts") or []
+            if parts:
+                schedule_delayed_bili_comments(bvid, meta, parsed_aid, record_name, clean_name)
+                chunks_count = len(build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3))
+                comment_note = f"\n置顶评论: 后台已安排（共 {chunks_count} 条，等待1小时转码审核完成后置顶发出，每条间隔30秒）"
         content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
                    f"标题: {meta['title']}\n"
                    f"BV号: {bvid}\n"
