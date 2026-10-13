@@ -76,7 +76,7 @@ def html_to_markdown(html_path):
     if summary_md:
         md += f"---\n\n### 💡 核心精彩看点\n\n{summary_md}\n\n---\n\n"
     md += f"{body_md}\n"
-    return author, title, md
+    return author, title, pub_time, md
 
 
 def main():
