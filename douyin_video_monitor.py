@@ -671,12 +671,21 @@ def process_blogger_videos(
             md_file = None
             summary_text = ""
             read_url = ""
+            feishu_url = ""
+            effective_title = v["title"]
             if args.transcribe and os.path.exists(mp3_file):
                 if transcribe_script:
                     abs_mp3_file = os.path.abspath(mp3_file)
                     md_file = monitor.transcribe_mp3_to_md(abs_mp3_file, transcribe_script)
                     if md_file:
                         summary_text = monitor.extract_summary_from_md(md_file)
+
+                        # 標題優先採用 LLM 生成的標題；平台文案（常為純 hashtag）僅作回退
+                        try:
+                            from md_to_html import extract_article_title
+                            effective_title = extract_article_title(md_file) or v["title"]
+                        except Exception:
+                            effective_title = v["title"]
 
                         # 3.1 生成手機版在線閱讀 HTML 網頁
                         if config_settings.get("web_enabled", True):
@@ -688,7 +697,7 @@ def process_blogger_videos(
                                     md_path=md_file,
                                     output_dir=web_outdir,
                                     author=author_name,
-                                    title=v["title"],
+                                    title=effective_title,
                                     publish_time=v["publish_time"]
                                 )
                                 if html_path and html_filename:
@@ -709,7 +718,6 @@ def process_blogger_videos(
                                 logger.error(f"生成 HTML 網頁異常: {e}")
 
                         # 3.2 匯入飛書雲文檔 (Feishu Docx)
-                        feishu_url = ""
                         if config_settings.get("feishu_enabled", True) and config_settings.get("feishu_app_id"):
                             try:
                                 from feishu_uploader import FeishuDocManager
@@ -718,7 +726,7 @@ def process_blogger_videos(
                                     app_secret=config_settings.get("feishu_app_secret", ""),
                                     folder_token=config_settings.get("feishu_folder_token", "")
                                 )
-                                doc_title = f"{v['publish_time'][:10]}【{author_name}】{v['title'][:30]}"
+                                doc_title = f"{v['publish_time'][:10]}【{author_name}】{effective_title[:30]}"
                                 # 文章歸入以主播命名的子資料夾
                                 author_folder = feishu_mgr.get_or_create_author_folder(author_name)
                                 doc_url, doc_token = feishu_mgr.create_docx_from_markdown(
@@ -737,7 +745,7 @@ def process_blogger_videos(
                 monitor.send_dingtalk_notification(
                     webhook=dingtalk_webhook,
                     author=author_name,
-                    title=v["title"],
+                    title=effective_title,
                     publish_time=v["publish_time"],
                     mp3_name=os.path.basename(mp3_file),
                     summary=summary_text,

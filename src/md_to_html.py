@@ -322,6 +322,37 @@ def parse_summary_block(summary_text: str) -> str:
 </div>"""
 
 
+def is_meaningful_title(candidate: str) -> bool:
+    """判斷標題是否具備實際語意（排除空字串與純 hashtag 文案）"""
+    if not candidate or not candidate.strip():
+        return False
+    without_tags = re.sub(r'#[^\s#]+', '', candidate).strip()
+    return bool(without_tags)
+
+
+def extract_article_title(md_path: str) -> str:
+    """
+    讀取 Markdown 中 LLM 生成的 H1 總標題。
+    若該標題不存在或只是純 hashtag 文案，回傳空字串，交由呼叫方回退。
+    """
+    if not os.path.exists(md_path):
+        return ""
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return ""
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('## '):
+            continue
+        if stripped.startswith('# '):
+            candidate = stripped[2:].strip()
+            return candidate if is_meaningful_title(candidate) else ""
+    return ""
+
+
 def md_to_html(md_content: str, author: str = "", title: str = "", publish_time: str = "") -> str:
     """核心轉換邏輯：Markdown 字符串 -> 完整 HTML 頁面"""
     # 1. 提取 <!--SUMMARY_START--> 區塊
@@ -333,8 +364,8 @@ def md_to_html(md_content: str, author: str = "", title: str = "", publish_time:
         # 移除已提取的摘要部分
         md_content = md_content.replace(summary_match.group(0), "")
 
-    # 2. 提取一級標題 # Title
-    article_title = title
+    # 2. 提取一級標題 # Title（優先採用 LLM 生成的標題，平台文案僅作為回退）
+    md_h1_title = ""
     lines = md_content.strip().splitlines()
     body_lines = []
 
@@ -344,8 +375,8 @@ def md_to_html(md_content: str, author: str = "", title: str = "", publish_time:
             continue
 
         if stripped.startswith('# '):
-            if not article_title:
-                article_title = stripped[2:].strip()
+            if not md_h1_title:
+                md_h1_title = stripped[2:].strip()
             continue  # 主標題已由模板的 h1.article-title 呈現
         elif stripped.startswith('## '):
             h2_text = render_markdown_inline(stripped[3:].strip())
@@ -362,6 +393,9 @@ def md_to_html(md_content: str, author: str = "", title: str = "", publish_time:
 
     article_body_html = "\n".join(body_lines)
     now_str = time.strftime("%Y-%m-%d %H:%M")
+
+    # 優先採用 LLM 生成的標題；僅在其缺失或為純 hashtag 文案時回退至平台文案
+    article_title = md_h1_title if is_meaningful_title(md_h1_title) else title
 
     return HTML_TEMPLATE.format(
         page_title=f"{article_title or author or '精華轉寫'} - 在線閱讀",
