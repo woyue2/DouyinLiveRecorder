@@ -525,10 +525,10 @@ def process_monitor_once(
         url = target["url"]
         custom_name = target["name"]
 
-        # 博主之間增加 5~12 秒隨機抖動延遲，防範批量爬蟲特徵
+        # 博主之間至少間隔 10 分鐘（隨機 10~15 分鐘），防止批量抓取特徵
         if t_idx > 1:
-            jitter = random.uniform(5.0, 12.0)
-            logger.info(f"防風控隨機延遲: 休眠 {jitter:.1f} 秒後檢查下一位博主...")
+            jitter = random.uniform(600.0, 900.0)
+            logger.info(f"防風控隨機延遲: 休眠 {jitter / 60:.1f} 分鐘後檢查下一位博主...")
             time.sleep(jitter)
 
         try:
@@ -543,8 +543,9 @@ def process_monitor_once(
                 if not note_id or note_id in history:
                     continue
 
-                # 筆記詳情抓取間隔 2.5~6 秒隨機抖動
-                detail_jitter = random.uniform(2.5, 6.0)
+                # 筆記詳情抓取至少間隔 3 分鐘（隨機 3~5 分鐘）
+                detail_jitter = random.uniform(180.0, 300.0)
+                logger.info(f"防風控隨機延遲: 休眠 {detail_jitter / 60:.1f} 分鐘後抓取下一篇筆記...")
                 time.sleep(detail_jitter)
 
                 detail = monitor.fetch_note_detail(note_id, xsec_token=n.get("xsec_token", ""))
