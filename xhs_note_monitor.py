@@ -395,10 +395,16 @@ class XhsNoteMonitor:
 
         video_info = card.get("video", {})
         video_url = ""
-        media_stream = video_info.get("media", {}).get("stream", {})
-        h264_streams = media_stream.get("h264", [])
-        if h264_streams:
-            video_url = h264_streams[0].get("master_url", "")
+        media_stream = video_info.get("media", {}).get("stream", {}) or {}
+        # 依序嘗試常見編碼；小紅書不一定提供 h264（部分只有 h265/av1）
+        for codec in ("h264", "h265", "h266", "av1"):
+            streams = media_stream.get(codec) or []
+            for st in streams:
+                if st.get("master_url"):
+                    video_url = st["master_url"]
+                    break
+            if video_url:
+                break
 
         return {
             "note_id": note_id,
@@ -409,6 +415,53 @@ class XhsNoteMonitor:
             "video_url": video_url,
             "note_type": card.get("type", "normal")
         }
+
+    def download_video(self, video_url: str, save_path: str) -> bool:
+        """下載小紅書視頻。小紅書 CDN 會檢查 Referer，缺少時回 403。"""
+        if not video_url:
+            logger.error("視頻下載連結為空")
+            return False
+
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        temp_path = save_path + ".tmp"
+        headers = {
+            "User-Agent": self.client.headers.get("User-Agent", ""),
+            "Referer": "https://www.xiaohongshu.com/",
+        }
+
+        logger.info(f"開始下載視頻 -> {save_path}")
+        try:
+            with self.client.stream("GET", video_url, headers=headers) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0) or 0)
+                downloaded = 0
+                last_log = time.time()
+                with open(temp_path, "wb") as f:
+                    for chunk in r.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if time.time() - last_log > 5:
+                            mb = downloaded / (1024 * 1024)
+                            if total > 0:
+                                logger.info(f"下載進度: {mb:.1f}MB / {total / (1024 * 1024):.1f}MB")
+                            else:
+                                logger.info(f"已下載: {mb:.1f}MB")
+                            last_log = time.time()
+
+            if total > 0 and downloaded < total:
+                raise IOError(f"下載不完整：{downloaded}/{total} 位元組")
+
+            os.replace(temp_path, save_path)
+            logger.info(f"視頻下載完成: {save_path} ({os.path.getsize(save_path) / (1024 * 1024):.1f}MB)")
+            return True
+        except Exception as e:
+            logger.error(f"視頻下載失敗: {type(e).__name__}: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            return False
 
 
 def load_urls_from_config(config_file: str) -> List[Dict[str, str]]:
@@ -482,6 +535,75 @@ def render_photo_note_html(
     )
 
 
+def process_video_note(monitor, detail: Dict[str, Any], author_name: str, title: str,
+                       note_id: str, outdir: str, transcribe_script: str) -> Optional[str]:
+    """影片筆記：下載視頻 → 抽 MP3 → 轉寫為 Markdown，回傳 md 路徑（任一步失敗回 None）。
+
+    與抖音作品走同一條鏈路；提取出 MP3 後即刪除 MP4（不保留視頻本體，節省空間）。
+    """
+    from douyin_video_monitor import DouyinVideoMonitor
+
+    media_dir = os.path.join(outdir, f"{author_name}_作品")
+    os.makedirs(media_dir, exist_ok=True)
+    date_prefix = detail["publish_time"][:10].replace("-", "")
+    clean_title = re.sub(r'[\s#\\/*?:"<>|]', "_", title[:25]).strip("_") or note_id
+    base = f"xhs_{date_prefix}_{clean_title}_{note_id}"
+    mp4_path = os.path.join(media_dir, base + ".mp4")
+    mp3_path = os.path.join(media_dir, base + ".mp3")
+
+    if not monitor.download_video(detail["video_url"], mp4_path):
+        return None
+
+    if not DouyinVideoMonitor.extract_mp3_from_mp4(mp4_path, mp3_path):
+        return None
+
+    # 不保留視頻本體：與抖音作品一致，僅留 MP3 與 Markdown 供後續備份
+    if os.path.exists(mp4_path):
+        try:
+            os.remove(mp4_path)
+            logger.info(f"已清理暫存視頻，僅保留音訊與 Markdown: {mp4_path}")
+        except OSError as e:
+            logger.warning(f"刪除 MP4 失敗: {e}")
+
+    if not transcribe_script:
+        logger.warning("未配置 [录制设置] mp3转写md脚本路径，跳過影片轉寫")
+        return None
+
+    return DouyinVideoMonitor.transcribe_mp3_to_md(os.path.abspath(mp3_path), transcribe_script)
+
+
+def build_note_feishu_markdown(detail: Dict[str, Any], author_name: str, title: str,
+                               liked_count: str, transcript_md_path: Optional[str] = None) -> str:
+    """組出要匯入飛書的 Markdown。
+
+    影片筆記有轉寫結果時，直接採用逐字稿（含 AI 提煉看點）；
+    否則（圖文，或影片轉寫失敗）以標題、正文與配圖組成。
+    """
+    header = [
+        f"# {title}",
+        "",
+        f"> 📕 **作者**：{author_name}  |  📅 **发布时间**：{detail['publish_time']}  |  👍 **点赞**：{liked_count}",
+        "",
+    ]
+
+    if transcript_md_path and os.path.exists(transcript_md_path):
+        try:
+            with open(transcript_md_path, "r", encoding="utf-8") as f:
+                body = f.read().strip()
+            # 逐字稿自帶 H1 標題，改用統一的飛書標題，避免重複
+            body = re.sub(r'^#\s+.*$', '', body, count=1, flags=re.MULTILINE).strip()
+            return "\n".join(header) + "\n" + body + "\n"
+        except Exception as e:
+            logger.warning(f"讀取轉寫 Markdown 失敗，回退為圖文內容: {e}")
+
+    parts = list(header)
+    for img_url in detail.get("image_list", []):
+        parts.append(f"![]({img_url})")
+        parts.append("")
+    parts.append(detail.get("desc", ""))
+    return "\n".join(parts)
+
+
 def load_history(filepath: str) -> set:
     if os.path.exists(filepath):
         try:
@@ -533,6 +655,8 @@ def process_monitor_once(
     dingtalk_webhook = args.dingtalk_webhook or config_settings.get("dingtalk_webhook", "")
     dingtalk_phone = config_settings.get("dingtalk_phone", "")
     dingtalk_is_atall = config_settings.get("dingtalk_is_atall", False)
+    transcribe_script = config_settings.get("transcribe_script", "")
+    outdir = getattr(args, "outdir", "./downloads")
 
     for t_idx, target in enumerate(targets, 1):
         url = target["url"]
@@ -604,7 +728,18 @@ def process_monitor_once(
                     except Exception as pe:
                         logger.warning(f"更新閱讀館門戶索引失敗: {pe}")
 
-                # 生成飛書雲文檔（圖文筆記：直接以標題、正文與配圖生成 Docx）
+                # 影片筆記：下載 → 抽 MP3 → 轉寫 → Markdown（與抖音作品同一條鏈路）
+                transcript_md_path = None
+                if detail["note_type"] == "video" and detail.get("video_url"):
+                    transcript_md_path = process_video_note(
+                        monitor, detail, author_name, title, note_id, outdir, transcribe_script
+                    )
+                    if not transcript_md_path:
+                        logger.warning(
+                            f"影片轉寫未完成，飛書文檔將改以封面與文案生成: {title[:30]}"
+                        )
+
+                # 生成飛書雲文檔（影片有逐字稿則用逐字稿；否則用標題、正文與配圖）
                 feishu_url = ""
                 if config_settings.get("feishu_enabled", True) and config_settings.get("feishu_app_id"):
                     try:
@@ -617,16 +752,13 @@ def process_monitor_once(
                             wiki_root_node=config_settings.get("feishu_wiki_root_node", ""),
                             wiki_domain=config_settings.get("feishu_wiki_domain", "my.feishu.cn"),
                         )
-                        note_md = [f"# {title}", ""]
-                        note_md.append(f"> 📕 **作者**：{author_name}  |  📅 **发布时间**：{detail['publish_time']}  |  👍 **点赞**：{n.get('liked_count', '0')}")
-                        note_md.append("")
-                        for img_url in detail.get("image_list", []):
-                            note_md.append(f"![]({img_url})")
-                            note_md.append("")
-                        note_md.append(detail.get("desc", ""))
+                        note_md = build_note_feishu_markdown(
+                            detail, author_name, title, n.get("liked_count", "0"),
+                            transcript_md_path=transcript_md_path,
+                        )
                         note_md_path = os.path.join("/tmp", f"xhs_feishu_{note_id}.md")
                         with open(note_md_path, "w", encoding="utf-8") as nf:
-                            nf.write("\n".join(note_md))
+                            nf.write(note_md)
 
                         doc_title = f"{detail['publish_time'][:10]}【{author_name}】{title[:30]}"
                         doc_url, _ = feishu_mgr.create_article_docx(
@@ -688,6 +820,7 @@ def main():
         help="單次每位博主最多處理幾篇新筆記 (0 表示不限制)；未處理的留待下次巡檢，不會遺漏"
     )
     parser.add_argument("--history-file", type=str, default="./downloads/xhs_download_history.json", help="去重歷史紀錄檔案")
+    parser.add_argument("--outdir", type=str, default="./downloads", help="影片/音訊保存目錄（影片筆記轉寫用）")
     parser.add_argument("--cooldown-file", type=str, default="./downloads/xhs_cooldown.json", help="風控熔斷記錄檔案")
     parser.add_argument("--daemon", action="store_true", help="啟用常駐輪詢模式 (預設 12 小時檢查一次)")
     parser.add_argument("--interval-hours", type=float, default=12.0, help="常駐檢查間隔小時數")
