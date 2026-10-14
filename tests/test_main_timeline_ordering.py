@@ -24,6 +24,30 @@ def test_start_times_are_computed_before_ts_cleanup():
     )
 
 
+def test_live_transcription_archives_to_timeline_not_works_library():
+    """直播轉寫必須歸入「直播時間軸」，不可混進抖音/小紅書作品的「主播文檔庫」。"""
+    tree = ast.parse(MAIN_SRC)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "transcribe_and_notify"
+    )
+    body = ast.get_source_segment(MAIN_SRC, fn) or ""
+    assert "wiki_root_node=bili_timeline_node" in body, (
+        "直播轉寫的飛書歸檔根節點應為 bili_timeline_node（直播時間軸）"
+    )
+    # 主播節點名要去掉 URL_config.ini 的「序号N」前綴
+    assert "display_name" in body and "_resolve_streamer_type" in body
+
+
+def test_work_monitors_archive_to_works_library():
+    """抖音作品與小紅書筆記應歸入「主播文檔庫」(feishu_wiki_root_node)。"""
+    for path in ("douyin_video_monitor.py", "xhs_note_monitor.py"):
+        src = (Path(__file__).parents[1] / path).read_text(encoding="utf-8")
+        assert "wiki_root_node=config_settings.get(\"feishu_wiki_root_node\"" in src, (
+            f"{path} 應以 feishu_wiki_root_node（主播文檔庫）作為歸檔根節點"
+        )
+
+
 def test_timeline_doc_builder_does_not_probe_files_itself():
     """build_bili_timeline_doc 只接受算好的 start_times，不在執行緒內探測檔案。"""
     tree = ast.parse(MAIN_SRC)

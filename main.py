@@ -1085,16 +1085,19 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                 if feishu_doc_enabled and feishu_app_id and feishu_app_secret and os.path.exists(md_path):
                     try:
                         from src.feishu_uploader import FeishuDocManager
+                        # 直播轉寫歸入「直播時間軸」，與抖音/小紅書作品的「主播文檔庫」分開歸檔
                         feishu_mgr = FeishuDocManager(
                             feishu_app_id, feishu_app_secret,
                             folder_token=feishu_folder_token,
                             wiki_space_id=feishu_wiki_space_id,
-                            wiki_root_node=feishu_wiki_root_node,
+                            wiki_root_node=bili_timeline_node or feishu_wiki_root_node,
                             wiki_domain=feishu_wiki_domain,
                         )
-                        doc_title = f"【{record_name}】{Path(md_path).stem}"
+                        # 去掉 URL_config.ini 的「序号N」前綴，避免節點名變成「序号3 袁大帥哥布林族長」
+                        display_name, _ = _resolve_streamer_type(record_name)
+                        doc_title = f"【{display_name}】{Path(md_path).stem}"
                         doc_url, _ = feishu_mgr.create_article_docx(
-                            md_path, author=record_name, doc_title=doc_title
+                            md_path, author=display_name, doc_title=doc_title
                         )
                         if doc_url:
                             feishu_doc_line = f"\n📄 飞书云文档（划线与收藏）：\n{doc_url}\n"
