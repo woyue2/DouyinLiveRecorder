@@ -619,6 +619,24 @@ def build_note_feishu_markdown(detail: Dict[str, Any], author_name: str, title: 
     return "\n".join(parts)
 
 
+def build_note_doc_title(publish_time: str, author: str, note_title: str,
+                         transcript_md_path: Optional[str] = None) -> str:
+    """組出飛書文檔標題：`{日期}【{作者}】{主題}`。
+
+    影片筆記有轉寫時，優先採用轉寫 Markdown 的 H1（AI 提煉標題），
+    與抖音作品的做法一致；圖文筆記或轉寫失敗時，用筆記本身的標題。
+    """
+    topic = ""
+    if transcript_md_path:
+        try:
+            from md_to_html import extract_article_title
+            topic = extract_article_title(transcript_md_path)
+        except Exception as e:
+            logger.warning(f"讀取轉寫標題失敗，改用筆記標題: {e}")
+    topic = topic or note_title or "未命名"
+    return f"{publish_time[:10]}【{author}】{topic[:40]}"
+
+
 def load_history(filepath: str) -> set:
     if os.path.exists(filepath):
         try:
@@ -775,7 +793,11 @@ def process_monitor_once(
                         with open(note_md_path, "w", encoding="utf-8") as nf:
                             nf.write(note_md)
 
-                        doc_title = f"{detail['publish_time'][:10]}【{author_name}】{title[:30]}"
+                        # 影片筆記有轉寫時優先採用 AI 提煉標題（與抖音作品一致）
+                        doc_title = build_note_doc_title(
+                            detail['publish_time'], author_name, title,
+                            transcript_md_path=transcript_md_path,
+                        )
                         doc_url, _ = feishu_mgr.create_article_docx(
                             note_md_path, author=author_name, doc_title=doc_title
                         )

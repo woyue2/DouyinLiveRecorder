@@ -61,6 +61,23 @@ def test_extract_video_url_handles_missing_or_empty():
     assert xhs.extract_note_video_url({"video": {"media": {"stream": {"EF4": []}}}}) == ""
 
 
+def test_doc_title_prefers_ai_title_when_transcript_exists(tmp_path):
+    md = tmp_path / "t.md"
+    md.write_text("# AI 提煉的標題\n\n## 章節\n正文\n", encoding="utf-8")
+    title = xhs.build_note_doc_title("2026-10-14 12:00:00", "文主任", "原筆記標題",
+                                     transcript_md_path=str(md))
+    assert title == "2026-10-14【文主任】AI 提煉的標題"
+
+
+def test_doc_title_falls_back_to_note_title_without_transcript():
+    assert xhs.build_note_doc_title("2026-10-14 12:00:00", "文主任", "原筆記標題") == \
+        "2026-10-14【文主任】原筆記標題"
+    # 轉寫檔不存在時也應回退
+    assert xhs.build_note_doc_title("2026-10-14 12:00:00", "文主任", "原筆記標題",
+                                    transcript_md_path="/nope/missing.md") == \
+        "2026-10-14【文主任】原筆記標題"
+
+
 def test_feishu_markdown_uses_transcript_when_available(tmp_path):
     transcript = tmp_path / "t.md"
     transcript.write_text("# 原標題\n\n## 章節\n逐字稿內容\n", encoding="utf-8")
