@@ -376,3 +376,65 @@ def test_build_parts_index_chunks():
         assert "📌 分P看点索引" in c
 
 
+
+
+def _mk_session_meta(n: int) -> dict:
+    return {
+        "title": "整場高能合集",
+        "desc": "whole desc",
+        "tags": "主播,搞笑",
+        "parts": [
+            {"label": f"【P{i + 1}】", "lines": [f"0{i}:15 看點{i + 1}"], "title": f"P{i + 1} 看點{i + 1}"}
+            for i in range(n)
+        ],
+        "part_descs": [f"第{i + 1}段簡介" for i in range(n)],
+    }
+
+
+def test_chunk_session_meta_splits_when_over_limit():
+    """19P 超過單稿上限 8 時應切成 8/8/3 三份，標題加 1/2/3 後綴。"""
+    ts = [f"/d/{i}.ts" for i in range(19)]
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 8)
+    assert [len(c["ts_paths"]) for c in chunks] == [8, 8, 3]
+    assert [c["total"] for c in chunks] == [3, 3, 3]
+    assert [c["title"] for c in chunks] == ["整場高能合集 1", "整場高能合集 2", "整場高能合集 3"]
+    # TS 依序切分：不重疊、不遺漏
+    assert [p for c in chunks for p in c["ts_paths"]] == ts
+
+
+def test_chunk_session_meta_renumbers_parts_within_each_chunk():
+    """第 2 份的分P必須從 P1 重新編號，否則播放器列表會從 P9 起跳。"""
+    ts = [f"/d/{i}.ts" for i in range(19)]
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 8)
+    second = chunks[1]
+    assert second["parts"][0]["label"] == "【P1】"
+    assert second["parts"][0]["title"].startswith("P1 ")
+    assert second["parts"][-1]["label"] == "【P8】"
+    assert second["parts"][0]["lines"] == ["08:15 看點9"]
+
+
+def test_chunk_session_meta_desc_only_covers_own_parts():
+    """每份的簡介只能涵蓋自己那幾個分P，不可照抄整場簡介。"""
+    ts = [f"/d/{i}.ts" for i in range(19)]
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 8)
+    assert "第1段簡介" in chunks[0]["desc"]
+    assert "第9段簡介" not in chunks[0]["desc"]
+    assert "第9段簡介" in chunks[1]["desc"]
+    assert "第1段簡介" not in chunks[1]["desc"]
+
+
+def test_chunk_session_meta_no_split_when_within_limit():
+    """未超過上限時維持單稿件原貌，標題不加後綴。"""
+    ts = [f"/d/{i}.ts" for i in range(5)]
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(5), ts, 8)
+    assert len(chunks) == 1
+    assert chunks[0]["title"] == "整場高能合集"
+    assert chunks[0]["desc"] == "whole desc"
+    assert chunks[0]["ts_paths"] == ts
+
+
+def test_chunk_session_meta_zero_limit_disables_splitting():
+    ts = [f"/d/{i}.ts" for i in range(19)]
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 0)
+    assert len(chunks) == 1
+    assert chunks[0]["title"] == "整場高能合集"

@@ -59,6 +59,7 @@ from src.bili_uploader import (
     build_parts_index_chunks,
     build_parts_timeline_markdown,
     compute_part_start_times,
+    chunk_session_meta,
     build_part_links,
     cleanup_part_links,
     get_video_status,
@@ -523,6 +524,10 @@ bili_submit_lock = threading.Lock()
 bili_timeline_node = ""
 bili_timeline_enabled = False
 bili_timeline_domain = "my.feishu.cn"
+# 拆稿保护：单稿件分P数超过上限时切成多份独立稿件（标题加 1/2/3 后缀），
+# 否则整包体积超出上行带宽在 biliup 超时窗口内能传完的量，上传会被掐断、整场丢失。
+bili_max_parts_per_submission = 8
+bili_split_interval_seconds = 90 * 60
 # B站待投稿队列：满足最小间隔后由后台线程依次提交，避免阻塞录制主流程
 bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
@@ -904,8 +909,30 @@ def run_bili_single_job(job: dict) -> None:
         logger.error(f"B站投稿通知发送失败 {video_name}: {e}")
 
 
+def _upload_one_chunk(chunk: dict, is_only_self: bool) -> tuple[bool, str]:
+    """提交单个稿件分片（分P标题用带看点的硬链接，biliup 以文件名作分P标题）。"""
+    link_paths, link_dir = build_part_links(chunk["ts_paths"], chunk["parts"])
+    upload_targets = link_paths or chunk["ts_paths"]
+    mark_bili_submitted()
+    try:
+        return upload_video_biliup(
+            video_path=upload_targets,
+            title=chunk["title"],
+            desc=chunk["desc"],
+            tags=chunk["tags"],
+            tid=bili_default_tid,
+            cookie_path=bili_cookie_path,
+            copyright_type=1,
+            source="",
+            biliup_bin=biliup_bin,
+            is_only_self=is_only_self
+        )
+    finally:
+        cleanup_part_links(link_dir)
+
+
 def run_bili_session_job(job: dict) -> None:
-    """整场多 P 合集投稿。"""
+    """整场多 P 合集投稿；分P过多会自动拆成多份独立稿件，避免整包上传超时丢场。"""
     global bili_cooldown_until
     session_dir = job["session_dir"]
     record_name = job["record_name"]
@@ -930,56 +957,70 @@ def run_bili_session_job(job: dict) -> None:
     is_only_self = _is_only_self(record_name, record_url, clean_name)
     vis_label = " (仅自己可见)" if is_only_self else ""
 
-    # biliup 以文件名作为分P标题，用带看点的硬链接上传，让播放器列表直接显示看点
-    link_paths, link_dir = build_part_links(valid_ts_paths, meta.get("parts") or [])
-    upload_targets = link_paths or valid_ts_paths
+    # 时间轴描述整场，必须在任何本地 TS 被清理前算好：清理策略会删除 TS，
+    # 事后才 ffprobe 会读不到文件，导致所有分P起始时间退化成 00:00。
+    timeline_start_times = None
+    if bili_timeline_enabled and (meta.get("parts") or []):
+        try:
+            _seg_fallback = int(str(split_time).strip())
+        except Exception:
+            _seg_fallback = 0
+        timeline_start_times = compute_part_start_times(valid_ts_paths, fallback_seconds=_seg_fallback)
 
-    mark_bili_submitted()
-    try:
-        success, output = upload_video_biliup(
-            video_path=upload_targets,
-            title=meta["title"],
-            desc=meta["desc"],
-            tags=meta["tags"],
-            tid=bili_default_tid,
-            cookie_path=bili_cookie_path,
-            copyright_type=1,
-            source="",
-            biliup_bin=biliup_bin,
-            is_only_self=is_only_self
+    chunks = chunk_session_meta(meta, valid_ts_paths, bili_max_parts_per_submission)
+    multi = len(chunks) > 1
+    if multi:
+        logger.info(
+            f"整场多P投稿：{len(valid_ts_paths)}P 超过单稿上限 {bili_max_parts_per_submission}，"
+            f"拆成 {len(chunks)} 份稿件 ({record_name})"
         )
-    finally:
-        cleanup_part_links(link_dir)
 
-    if success:
-        bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
-        bvid = bvid_match.group(0) if bvid_match else "已提交"
-        timeline_note = ""
-        if bili_timeline_enabled and (meta.get("parts") or []):
-            # 必須在 handle_post_upload_cleanup 刪除 TS 之前算好分P時間戳：
-            # 清理策略會移除本地 TS，事後才 ffprobe 會讀不到檔案，
-            # 導致所有分P起始時間退化成 00:00。
-            try:
-                _seg_fallback = int(str(split_time).strip())
-            except Exception:
-                _seg_fallback = 0
-            start_times = compute_part_start_times(valid_ts_paths, fallback_seconds=_seg_fallback)
-            # 生成飞书「直播时间轴」文档（不含任何 B 站评论操作）
-            schedule_bili_timeline(meta, record_name, clean_name, start_times)
-            timeline_note = "\n直播时间轴: 后台生成飞书文档中（完成后推送链接）"
-        content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
-                   f"标题: {meta['title']}\n"
-                   f"BV号: {bvid}\n"
-                   f"总集数: {len(valid_ts_paths)}P (全场自动合集){timeline_note}")
-        handle_post_upload_cleanup(valid_ts_paths, policy=bili_post_policy)
-    else:
-        content = _handle_bili_failure(output, record_name, f"集数: {len(valid_ts_paths)}P", vis_label)
-        if content is None:
-            bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
-            _save_bili_queue()
-            content = _rate_limit_notice(record_name)
+    notifications = []
+    timeline_scheduled = False
+    for chunk in chunks:
+        if chunk["index"] > 1 and bili_split_interval_seconds > 0:
+            # 拆稿之间按配置间隔，避免短时间内连投触发风控
+            logger.info(
+                f"拆稿投稿：等待 {bili_split_interval_seconds // 60} 分钟后提交第 "
+                f"{chunk['index']}/{chunk['total']} 份 ({record_name})"
+            )
+            time.sleep(bili_split_interval_seconds)
+
+        success, output = _upload_one_chunk(chunk, is_only_self)
+        part_note = f"\n集数: {len(chunk['ts_paths'])}P" + (
+            f" (第 {chunk['index']}/{chunk['total']} 份)" if multi else " (全场自动合集)"
+        )
+        if success:
+            bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
+            bvid = bvid_match.group(0) if bvid_match else "已提交"
+            timeline_note = ""
+            if timeline_start_times is not None and not timeline_scheduled:
+                # 生成飞书「直播时间轴」文档（不含任何 B 站评论操作），整场只生成一次
+                schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)
+                timeline_scheduled = True
+                timeline_note = "\n直播时间轴: 后台生成飞书文档中（完成后推送链接）"
+            notifications.append(
+                f"[B站投稿成功{vis_label}] {record_name}\n"
+                f"标题: {chunk['title']}\n"
+                f"BV号: {bvid}{part_note}{timeline_note}"
+            )
+            handle_post_upload_cleanup(chunk["ts_paths"], policy=bili_post_policy)
+        else:
+            content = _handle_bili_failure(
+                output, record_name, f"集数: {len(chunk['ts_paths'])}P", vis_label
+            )
+            if content is None:
+                # 风控：立即冷却，并停止后续分片投稿
+                bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+                _save_bili_queue()
+                notifications.append(_rate_limit_notice(record_name))
+                break
+            notifications.append(content)
+
+    if not notifications:
+        return
     try:
-        push_message(record_name, "", content)
+        push_message(record_name, "", "\n\n".join(notifications))
     except Exception as e:
         logger.error(f"B站整场多P投稿通知发送失败: {e}")
 
@@ -3274,6 +3315,9 @@ while True:
     bili_timeline_node = read_config_value(config, 'B站投稿', '直播时间轴节点', "").strip()
     bili_timeline_domain = read_config_value(config, 'B站投稿', '直播时间轴域名', "").strip() or feishu_wiki_domain or "my.feishu.cn"
     bili_timeline_enabled = bool(bili_timeline_node and feishu_app_id and feishu_app_secret)
+    # 拆稿保护：单稿分P上限与拆稿之间的投稿间隔（0 = 不在拆稿之间额外等待）
+    bili_max_parts_per_submission = int(read_config_value(config, 'B站投稿', '单稿最大分P数', 8))
+    bili_split_interval_seconds = int(read_config_value(config, 'B站投稿', '拆稿投稿间隔(分钟)', 90)) * 60
     streamer_types = {}
     if '主播类型配置' in config.sections():
         for k, v in config.items('主播类型配置'):

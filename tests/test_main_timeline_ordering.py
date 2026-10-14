@@ -14,10 +14,10 @@ MAIN_SRC = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
 
 def test_start_times_are_computed_before_ts_cleanup():
     i_compute = MAIN_SRC.index("compute_part_start_times(valid_ts_paths")
-    i_schedule = MAIN_SRC.index("schedule_bili_timeline(meta, record_name, clean_name, start_times)")
-    i_cleanup = MAIN_SRC.index(
-        "handle_post_upload_cleanup(valid_ts_paths, policy=bili_post_policy)", i_schedule
+    i_schedule = MAIN_SRC.index(
+        "schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)"
     )
+    i_cleanup = MAIN_SRC.index("handle_post_upload_cleanup(", i_schedule)
     assert i_compute < i_schedule < i_cleanup, (
         "必須先在清理本地 TS 之前算好分P起始時間，再排程生成時間軸文件，"
         "否則 ffprobe 讀不到被刪除的檔案，時間戳會全部變成 00:00"

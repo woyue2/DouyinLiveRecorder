@@ -254,6 +254,7 @@ def extract_session_bili_metadata(
             pass
 
     part_descs = []
+    raw_part_descs = []
     combined_texts = []
     parts_index = []
     # 分P越多，每P保留的行越少，确保索引评论能装下全部P
@@ -291,6 +292,7 @@ def extract_session_bili_metadata(
 
         lines = _extract_index_lines(desc, limit=per_part_lines)
         part_descs.append(f"{p_label}\n{desc}")
+        raw_part_descs.append(desc)
         title = _make_part_title(
             idx + 1, lines,
             fallback=("直播录像" if md_path else "录制中断片段"),
@@ -331,7 +333,67 @@ def extract_session_bili_metadata(
         "desc": full_desc,
         "tags": f"{clean_name},搞笑,名场面,主播日常,直播录像,合集",
         "parts": parts_index,
+        "part_descs": raw_part_descs,
     }
+
+
+def chunk_session_meta(meta: dict, ts_paths: list, max_parts: int) -> list:
+    """把整场直播切成多份稿件（超时保护），每份重排分P编号并加 1/2/3 标题后缀。
+
+    背景：单稿件分P过多时，整包体积会远超服务器上行带宽在 biliup 超时窗口内
+    传得完的量，导致上传被掐断、整场丢失。切成多份后每份都能在超时内传完。
+
+    分P编号在同场内整体重排（第 2 份从 P1 开始），否则播放器里会从 P11 起跳。
+    不重新调用大模型：标题共用一个整场标题，简介按分片重新拼装。
+    """
+    total_parts = len(ts_paths)
+    src_parts = list(meta.get("parts") or [])
+    src_descs = list(meta.get("part_descs") or [])
+
+    def _single() -> list:
+        return [{
+            "index": 1,
+            "total": 1,
+            "ts_paths": list(ts_paths),
+            "title": meta["title"],
+            "desc": meta["desc"],
+            "tags": meta["tags"],
+            "parts": src_parts,
+        }]
+
+    if max_parts <= 0 or total_parts <= max_parts:
+        return _single()
+
+    starts = list(range(0, total_parts, max_parts))
+    total = len(starts)
+    chunks = []
+    for n, start in enumerate(starts, start=1):
+        end = min(start + max_parts, total_parts)
+        parts, descs = [], []
+        for offset, i in enumerate(range(start, end), start=1):
+            label = f"【P{offset}】"
+            p = src_parts[i] if i < len(src_parts) else {}
+            seed = re.sub(r'^P\d+\s*', '', (p.get("title") or "").strip()).strip()
+            parts.append({
+                "label": label,
+                "lines": list(p.get("lines") or []),
+                "title": (f"P{offset} {seed}" if seed else f"P{offset}")[:80],
+            })
+            if i < len(src_descs):
+                descs.append(f"{label}\n{src_descs[i]}")
+        desc = "\n\n".join(descs).strip()
+        if len(desc) > 2000:
+            desc = desc[:1997] + "..."
+        chunks.append({
+            "index": n,
+            "total": total,
+            "ts_paths": list(ts_paths[start:end]),
+            "title": f"{meta['title']} {n}"[:80],
+            "desc": desc,
+            "tags": meta["tags"],
+            "parts": parts,
+        })
+    return chunks
 
 
 def _make_part_title(index: int, lines: list, max_len: int = 60,
