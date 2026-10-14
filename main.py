@@ -518,6 +518,11 @@ bili_cooldown_minutes = 360
 bili_cooldown_until = 0.0
 bili_last_submit_time = 0.0
 bili_submit_lock = threading.Lock()
+# B站分P看点评论发送节奏（秒）：轮询影片就绪 → 再等 1 小时 → 发首条 → 后续每条随机间隔
+bili_comment_ready_timeout = 4 * 3600      # 轮询「影片可评论」的最长等待
+bili_comment_ready_poll = 300              # 影片状态轮询间隔
+bili_comment_first_delay = 3600            # 影片就绪后、首条评论前再等多久
+bili_comment_gap_range = (180, 360)        # 后续每两条评论之间的随机间隔（3~6 分钟）
 # B站待投稿队列：满足最小间隔后由后台线程依次提交，避免阻塞录制主流程
 bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
@@ -751,9 +756,39 @@ def _rate_limit_notice(record_name: str) -> str:
             f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
 
 
+def _wait_until_bili_commentable(bvid: str, fallback_aid: Optional[int]) -> tuple[Optional[int], int]:
+    """轮询影片状态，直到可评论（已过审/转码完成且有 aid）。
+
+    返回 (effective_aid, state)。超过 bili_comment_ready_timeout 仍不就绪时，
+    仍返回最后一次结果，由调用方决定是否照样尝试发布（best effort）。
+    """
+    deadline = time.time() + bili_comment_ready_timeout
+    state, effective_aid, attempt = -999, fallback_aid, 0
+    while True:
+        attempt += 1
+        state, curr_aid = get_video_status(bvid, bili_cookie_path)
+        effective_aid = fallback_aid or curr_aid
+        if state >= 0 and effective_aid:
+            logger.info(f"B站影片已就绪可评论 (state={state}, aid={effective_aid})，第 {attempt} 次查询: BV={bvid}")
+            return effective_aid, state
+        if time.time() >= deadline:
+            logger.warning(
+                f"等待影片就绪超时（{bili_comment_ready_timeout // 60} 分钟，查询 {attempt} 次），"
+                f"仍尝试发布评论: BV={bvid} state={state}"
+            )
+            return effective_aid, state
+        logger.info(f"B站影片尚未就绪 (state={state})，{bili_comment_ready_poll} 秒后重查 [{attempt}]: BV={bvid}")
+        time.sleep(bili_comment_ready_poll)
+
+
 def schedule_delayed_bili_comments(bvid: str, meta: dict, aid: Optional[int],
                                     record_name: str, clean_name: str) -> None:
-    """在独立后台守护线程中延迟发布评论（等待1小时转码审核通过后再发布置顶，多条间间隔30秒）。"""
+    """在独立后台守护线程中发送分P看点评论。
+
+    节奏：轮询影片直至就绪 → 再等 1 小时 → 发第 1 条（置顶）
+          → 校验确实出现在评论区 → 后续每条间隔随机 3~6 分钟。
+    首条发送失败或评论区查不到时立即中止后续序列，避免无效连发。
+    """
     parts = meta.get("parts") or []
     if not parts:
         logger.info(f"B站延迟评论跳过 ({bvid})：无可用的分P索引内容")
@@ -762,17 +797,13 @@ def schedule_delayed_bili_comments(bvid: str, meta: dict, aid: Optional[int],
 
     def _worker():
         try:
-            logger.info(f"开启B站评论发布守护线程: BV={bvid}，等待 3600 秒以完成转码审核...")
-            time.sleep(3600)
+            logger.info(f"开启B站评论发布守护线程: BV={bvid}，先轮询影片状态直至可评论...")
+            effective_aid, _state = _wait_until_bili_commentable(bvid, aid)
 
-            state, curr_aid = get_video_status(bvid, bili_cookie_path)
-            effective_aid = aid or curr_aid
-
-            if state < 0:
-                logger.info(f"B站视频目前仍未过审/转码中 (state={state})，等待 7200 秒后重试: BV={bvid}")
-                time.sleep(7200)
-                state, curr_aid = get_video_status(bvid, bili_cookie_path)
-                effective_aid = effective_aid or curr_aid
+            logger.info(
+                f"影片就绪后再等 {bili_comment_first_delay // 60} 分钟，让审核充分完成: BV={bvid}"
+            )
+            time.sleep(bili_comment_first_delay)
 
             results = post_multi_chunk_comments(
                 bvid=bvid,
@@ -780,20 +811,30 @@ def schedule_delayed_bili_comments(bvid: str, meta: dict, aid: Optional[int],
                 cookie_path=bili_cookie_path,
                 aid=effective_aid,
                 pin_first=True,
-                delay_between=30
+                delay_between=bili_comment_gap_range,
+                verify_first=True,
             )
             success_count = sum(1 for r in results if r.get("ok"))
+            posted = len(results)
             if success_count > 0:
-                logger.info(f"B站分P看点评论已发布: BV={bvid} 成功={success_count}/{len(chunks)}")
+                logger.info(
+                    f"B站分P看点评论已发布: BV={bvid} 成功={success_count}/{posted}（计划 {len(chunks)} 条）"
+                )
+                gap_label = f"{bili_comment_gap_range[0] // 60}~{bili_comment_gap_range[1] // 60}"
                 try:
                     push_message(
                         record_name,
                         "",
                         f"[B站分P看点评论发布完成] 【{clean_name}】{bvid}\n"
-                        f"已自动发布 {success_count}/{len(chunks)} 条看点评论（第1条已置顶，每条间隔30秒依次发布）"
+                        f"已发布 {success_count}/{posted} 条看点评论"
+                        f"（第1条置顶，后续每条间隔 {gap_label} 分钟随机）"
                     )
                 except Exception as e:
                     logger.warning(f"推送分P看点评论完成通知失败: {e}")
+            elif posted < len(chunks):
+                logger.warning(
+                    f"B站分P看点评论已中止: BV={bvid}（首条异常，未继续发送后续 {len(chunks) - posted} 条）"
+                )
             else:
                 logger.warning(f"B站分P看点评论全部失败: BV={bvid}")
         except Exception as e:
@@ -815,7 +856,8 @@ def post_bili_index_comment(bvid: str, meta: dict, aid: Optional[int] = None) ->
         cookie_path=bili_cookie_path,
         aid=aid,
         pin_first=True,
-        delay_between=30
+        delay_between=bili_comment_gap_range,
+        verify_first=True,
     )
     ok = any(r.get("ok") for r in results)
     info = "; ".join(f"[{r.get('chunk')}] {r.get('info')}" for r in results)
@@ -954,7 +996,12 @@ def run_bili_session_job(job: dict) -> None:
             if parts:
                 schedule_delayed_bili_comments(bvid, meta, parsed_aid, record_name, clean_name)
                 chunks_count = len(build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3))
-                comment_note = f"\n置顶评论: 后台已安排（共 {chunks_count} 条，等待1小时转码审核完成后置顶发出，每条间隔30秒）"
+                gap_label = f"{bili_comment_gap_range[0] // 60}~{bili_comment_gap_range[1] // 60}"
+                comment_note = (
+                    f"\n置顶评论: 后台已安排（共 {chunks_count} 条，"
+                    f"等待影片过审后再等 {bili_comment_first_delay // 60} 分钟发出第1条，"
+                    f"首条失败即中止，后续每条间隔 {gap_label} 分钟随机）"
+                )
         content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
                    f"标题: {meta['title']}\n"
                    f"BV号: {bvid}\n"

@@ -837,6 +837,53 @@ def post_video_comment(bvid: str, message: str,
         return False, f"发评论异常: {type(e).__name__}: {e}"
 
 
+def comment_exists(bvid: str, rpid: str, cookie_path: str = "cookies.json",
+                   aid: Optional[int] = None) -> bool:
+    """查询稿件评论区，确认指定 rpid 的评论确实存在（含置顶与 UP 主置顶位）。
+
+    接口返回成功不代表评论真的出现在评论区（可能被吞或仍在审核），
+    因此发布后需要再校验一次，避免后续评论白发。
+    """
+    try:
+        header, _ = _load_cookie_header(cookie_path)
+        if aid is None:
+            aid = get_aid_from_bvid(bvid, cookie_path)
+        if not aid:
+            return False
+
+        res = _bili_api(
+            f"https://api.bilibili.com/x/v2/reply?type=1&oid={aid}&pn=1&ps=20&sort=2",
+            header,
+        )
+        if res.get("code") != 0:
+            logger.warning(f"查询评论区失败 code={res.get('code')} {res.get('message')}")
+            return False
+
+        data = res.get("data") or {}
+        candidates: list = []
+        for key in ("top", "top_replies", "replies", "hots"):
+            value = data.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+            elif isinstance(value, list):
+                candidates.extend(value)
+        upper = data.get("upper") or {}
+        if isinstance(upper, dict):
+            for key in ("top", "top_replies"):
+                value = upper.get(key)
+                if isinstance(value, dict):
+                    candidates.append(value)
+                elif isinstance(value, list):
+                    candidates.extend(value)
+
+        return any(
+            isinstance(c, dict) and str(c.get("rpid")) == str(rpid) for c in candidates
+        )
+    except Exception as e:
+        logger.warning(f"校验评论是否存在异常 ({bvid}): {type(e).__name__}: {e}")
+        return False
+
+
 def delete_video_comment(bvid: str, rpid: str,
                          cookie_path: str = "cookies.json") -> bool:
     """删除自己发的一条评论。"""
@@ -956,17 +1003,36 @@ def post_multi_chunk_comments(bvid: str, chunks: list,
                               cookie_path: str = "cookies.json",
                               aid: Optional[int] = None,
                               pin_first: bool = True,
-                              delay_between: int = 30) -> list:
-    """按顺序发布多条分卷看点评论，第 1 条置顶，后续每条间隔 delay_between 秒（默认30秒）。
+                              delay_between=30,
+                              verify_first: bool = True,
+                              verify_settle: int = 15) -> list:
+    """按顺序发布多条分卷看点评论，第 1 条置顶，后续每条间隔 delay_between。
+
+    delay_between 可传 int（固定秒数）或 (min_sec, max_sec) 元组（每次随机取值），
+    随机间隔更接近真人行为，可降低连续发评论被防刷屏拦截的机率。
+
+    verify_first：第 1 条发出后回查评论区确认真的出现；
+    若失败或查不到，立即中止后续评论，避免在异常状态下连发。
     Returns:
         [{"chunk": 1, "ok": True, "info": "3169..."}, ...]
     """
     import time
+    import random
+
+    def _next_delay() -> float:
+        if isinstance(delay_between, (tuple, list)) and len(delay_between) == 2:
+            return random.uniform(float(delay_between[0]), float(delay_between[1]))
+        return float(delay_between)
+
     results = []
     for idx, msg in enumerate(chunks, 1):
         if idx > 1:
-            logger.info(f"等待 {delay_between} 秒后发布下一条分P索引评论 [{idx}/{len(chunks)}]")
-            time.sleep(delay_between)
+            wait = _next_delay()
+            logger.info(
+                f"等待 {wait / 60:.1f} 分钟（{wait:.0f} 秒）后发布下一条分P看点评论 [{idx}/{len(chunks)}]"
+            )
+            time.sleep(wait)
+
         is_pin = pin_first and (idx == 1)
         ok, info = post_video_comment(
             bvid=bvid,
@@ -976,10 +1042,30 @@ def post_multi_chunk_comments(bvid: str, chunks: list,
             aid=aid,
         )
         results.append({"chunk": idx, "ok": ok, "info": info})
+
         if ok:
             logger.info(f"分P索引评论 [{idx}/{len(chunks)}] 发布成功: BV={bvid} {info}")
         else:
             logger.warning(f"分P索引评论 [{idx}/{len(chunks)}] 发布失败: BV={bvid} {info}")
+
+        # 第 1 条是整个索引的入口：发送失败或评论区查不到时，中止后续序列
+        if idx == 1 and verify_first:
+            if not ok:
+                logger.warning(f"首条看点评论发送失败，中止后续评论序列: BV={bvid}")
+                break
+            rpid = info if str(info).isdigit() else str(info).split("（")[0]
+            if not str(rpid).isdigit():
+                logger.warning(f"首条看点评论未取得 rpid（{info}），中止后续评论序列: BV={bvid}")
+                break
+            time.sleep(verify_settle)
+            if comment_exists(bvid, rpid, cookie_path, aid=aid):
+                logger.info(f"首条看点评论已确认出现在评论区 (rpid={rpid})，继续发布后续评论")
+            else:
+                logger.warning(
+                    f"首条看点评论发布成功但评论区查不到 (rpid={rpid})，中止后续评论序列: BV={bvid}"
+                )
+                break
+
     return results
 
 

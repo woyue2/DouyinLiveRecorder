@@ -221,6 +221,87 @@ def test_upload_is_only_self(monkeypatch):
         os.remove(temp_cookie)
 
 
+def test_multi_chunk_aborts_when_first_comment_fails(monkeypatch):
+    """首条评论发送失败时，必须立即中止后续评论，避免无效连发。"""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+    posted = []
+    monkeypatch.setattr(
+        bili_uploader, "post_video_comment",
+        lambda **kw: (posted.append(kw["message"]), (False, "发评论失败 code=12025"))[1],
+    )
+    monkeypatch.setattr(bili_uploader, "comment_exists", lambda *a, **k: True)
+
+    results = bili_uploader.post_multi_chunk_comments(
+        "BVtest", ["c1", "c2", "c3"], "cookies.json",
+        aid=1, delay_between=(180, 360), verify_first=True,
+    )
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert posted == ["c1"]
+
+
+def test_multi_chunk_aborts_when_first_comment_not_visible(monkeypatch):
+    """首条接口返回成功但评论区查不到时，同样必须中止后续评论。"""
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)
+
+    posted = []
+    monkeypatch.setattr(
+        bili_uploader, "post_video_comment",
+        lambda **kw: (posted.append(kw["message"]), (True, "3169"))[1],
+    )
+    monkeypatch.setattr(bili_uploader, "comment_exists", lambda *a, **k: False)
+
+    results = bili_uploader.post_multi_chunk_comments(
+        "BVtest", ["c1", "c2", "c3"], "cookies.json",
+        aid=1, delay_between=(180, 360), verify_first=True,
+    )
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert posted == ["c1"]
+
+
+def test_multi_chunk_continues_with_random_gap_after_verified_first(monkeypatch):
+    """首条确认存在后继续发送，且后续间隔落在指定的随机区间内。"""
+    import time as _time
+    sleeps = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+
+    monkeypatch.setattr(bili_uploader, "post_video_comment", lambda **kw: (True, "3169"))
+    monkeypatch.setattr(bili_uploader, "comment_exists", lambda *a, **k: True)
+
+    results = bili_uploader.post_multi_chunk_comments(
+        "BVtest", ["c1", "c2", "c3"], "cookies.json",
+        aid=1, delay_between=(180, 360), verify_first=True, verify_settle=15,
+    )
+    assert len(results) == 3
+    assert all(r["ok"] for r in results)
+
+    # sleeps[0] 是首条校验前的 settle，其余为两条评论之间的随机间隔
+    assert sleeps[0] == 15
+    gaps = sleeps[1:]
+    assert len(gaps) == 2
+    for gap in gaps:
+        assert 180 <= gap <= 360
+
+
+def test_multi_chunk_fixed_delay_still_supported(monkeypatch):
+    """delay_between 传 int 时维持固定间隔（向下兼容）。"""
+    import time as _time
+    sleeps = []
+    monkeypatch.setattr(_time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(bili_uploader, "post_video_comment", lambda **kw: (True, "3169"))
+    monkeypatch.setattr(bili_uploader, "comment_exists", lambda *a, **k: True)
+
+    bili_uploader.post_multi_chunk_comments(
+        "BVtest", ["c1", "c2"], "cookies.json",
+        aid=1, delay_between=30, verify_first=False,
+    )
+    assert sleeps == [30]
+
+
 def test_build_parts_index_chunks():
     # 测试较少 P 时单条
     short_parts = [
