@@ -507,6 +507,9 @@ feishu_doc_enabled = False
 feishu_app_id = ""
 feishu_app_secret = ""
 feishu_folder_token = ""
+feishu_wiki_space_id = ""
+feishu_wiki_root_node = ""
+feishu_wiki_domain = "my.feishu.cn"
 # B站投稿全局配置项（从 config.ini [B站投稿] 读取）
 bili_upload_enabled = False
 bili_upload_mode = "整场多P投稿"
@@ -1070,12 +1073,16 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                 if feishu_doc_enabled and feishu_app_id and feishu_app_secret and os.path.exists(md_path):
                     try:
                         from src.feishu_uploader import FeishuDocManager
-                        feishu_mgr = FeishuDocManager(feishu_app_id, feishu_app_secret, folder_token=feishu_folder_token)
+                        feishu_mgr = FeishuDocManager(
+                            feishu_app_id, feishu_app_secret,
+                            folder_token=feishu_folder_token,
+                            wiki_space_id=feishu_wiki_space_id,
+                            wiki_root_node=feishu_wiki_root_node,
+                            wiki_domain=feishu_wiki_domain,
+                        )
                         doc_title = f"【{record_name}】{Path(md_path).stem}"
-                        # 文章歸入以主播命名的子資料夾
-                        author_folder = feishu_mgr.get_or_create_author_folder(record_name)
-                        doc_url, _ = feishu_mgr.create_docx_from_markdown(
-                            md_path, doc_title=doc_title, folder_token=author_folder
+                        doc_url, _ = feishu_mgr.create_article_docx(
+                            md_path, author=record_name, doc_title=doc_title
                         )
                         if doc_url:
                             feishu_doc_line = f"\n📄 飞书云文档（划线与收藏）：\n{doc_url}\n"
@@ -3221,6 +3228,9 @@ while True:
     feishu_app_id = read_config_value(config, '飞书文档配置', '飞书app_id', "").strip()
     feishu_app_secret = read_config_value(config, '飞书文档配置', '飞书app_secret', "").strip()
     feishu_folder_token = read_config_value(config, '飞书文档配置', '飞书文件夹_token', "").strip()
+    feishu_wiki_space_id = read_config_value(config, '飞书文档配置', '飞书知识库space_id', "").strip()
+    feishu_wiki_root_node = read_config_value(config, '飞书文档配置', '飞书知识库根节点', "").strip()
+    feishu_wiki_domain = read_config_value(config, '飞书文档配置', '飞书域名', "my.feishu.cn").strip()
     streamer_types = {}
     if '主播类型配置' in config.sections():
         for k, v in config.items('主播类型配置'):

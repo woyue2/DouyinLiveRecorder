@@ -194,6 +194,9 @@ def load_project_config() -> Dict[str, Any]:
         settings["feishu_app_id"] = config.get("飞书文档配置", "飞书app_id", fallback="").strip()
         settings["feishu_app_secret"] = config.get("飞书文档配置", "飞书app_secret", fallback="").strip()
         settings["feishu_folder_token"] = config.get("飞书文档配置", "飞书文件夹_token", fallback="").strip()
+        settings["feishu_wiki_space_id"] = config.get("飞书文档配置", "飞书知识库space_id", fallback="").strip()
+        settings["feishu_wiki_root_node"] = config.get("飞书文档配置", "飞书知识库根节点", fallback="").strip()
+        settings["feishu_wiki_domain"] = config.get("飞书文档配置", "飞书域名", fallback="my.feishu.cn").strip()
 
     return settings
 
@@ -599,7 +602,10 @@ def process_monitor_once(
                         feishu_mgr = FeishuDocManager(
                             app_id=config_settings.get("feishu_app_id", ""),
                             app_secret=config_settings.get("feishu_app_secret", ""),
-                            folder_token=config_settings.get("feishu_folder_token", "")
+                            folder_token=config_settings.get("feishu_folder_token", ""),
+                            wiki_space_id=config_settings.get("feishu_wiki_space_id", ""),
+                            wiki_root_node=config_settings.get("feishu_wiki_root_node", ""),
+                            wiki_domain=config_settings.get("feishu_wiki_domain", "my.feishu.cn"),
                         )
                         note_md = [f"# {title}", ""]
                         note_md.append(f"> 📕 **作者**：{author_name}  |  📅 **发布时间**：{detail['publish_time']}  |  👍 **点赞**：{n.get('liked_count', '0')}")
@@ -613,9 +619,8 @@ def process_monitor_once(
                             nf.write("\n".join(note_md))
 
                         doc_title = f"{detail['publish_time'][:10]}【{author_name}】{title[:30]}"
-                        author_folder = feishu_mgr.get_or_create_author_folder(author_name)
-                        doc_url, _ = feishu_mgr.create_docx_from_markdown(
-                            note_md_path, doc_title=doc_title, folder_token=author_folder
+                        doc_url, _ = feishu_mgr.create_article_docx(
+                            note_md_path, author=author_name, doc_title=doc_title
                         )
                         if os.path.exists(note_md_path):
                             os.remove(note_md_path)

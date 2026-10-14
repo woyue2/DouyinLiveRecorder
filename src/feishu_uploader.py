@@ -22,15 +22,170 @@ FEISHU_HOST = "https://open.feishu.cn"
 
 
 class FeishuDocManager:
-    def __init__(self, app_id: str, app_secret: str, folder_token: str = ""):
+    def __init__(
+        self,
+        app_id: str,
+        app_secret: str,
+        folder_token: str = "",
+        wiki_space_id: str = "",
+        wiki_root_node: str = "",
+        wiki_domain: str = "my.feishu.cn",
+    ):
         self.app_id = app_id.strip()
         self.app_secret = app_secret.strip()
         self.folder_token = folder_token.strip()
+        self.wiki_space_id = wiki_space_id.strip()
+        self.wiki_root_node = wiki_root_node.strip()
+        self.wiki_domain = (wiki_domain or "my.feishu.cn").strip()
         self._token: Optional[str] = None
         self._token_expire_at: float = 0
         # 父資料夾 token -> {子資料夾名稱: 子資料夾 token} 快取，避免同一次執行重複查詢
         self._subfolder_cache: Dict[str, Dict[str, str]] = {}
+        # 主播名稱 -> 知識庫 node_token 快取
+        self._wiki_author_cache: Dict[str, str] = {}
         self.client = httpx.Client(timeout=30.0)
+
+    @property
+    def wiki_enabled(self) -> bool:
+        return bool(self.wiki_space_id and self.wiki_root_node)
+
+    def _wiki_headers(self) -> Optional[Dict[str, str]]:
+        token = self.get_tenant_access_token()
+        if not token:
+            return None
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+
+    def list_wiki_child_nodes(self, parent_node_token: str) -> Dict[str, str]:
+        """列出知識庫中某節點下的子節點，回傳 {標題: node_token}"""
+        headers = self._wiki_headers()
+        if not headers or not self.wiki_space_id:
+            return {}
+
+        url = f"{FEISHU_HOST}/open-apis/wiki/v2/spaces/{self.wiki_space_id}/nodes"
+        nodes: Dict[str, str] = {}
+        page_token = ""
+        try:
+            while True:
+                params = {"parent_node_token": parent_node_token, "page_size": 50}
+                if page_token:
+                    params["page_token"] = page_token
+                data = self.client.get(url, headers=headers, params=params).json()
+                if data.get("code") != 0:
+                    logger.warning(f"列出知識庫節點失敗: {data.get('msg')}")
+                    break
+                payload = data.get("data", {}) or {}
+                for item in payload.get("items") or []:
+                    nodes[item.get("title", "")] = item.get("node_token", "")
+                if payload.get("has_more"):
+                    page_token = payload.get("page_token", "")
+                else:
+                    break
+        except Exception as e:
+            logger.warning(f"列出知識庫節點異常: {e}")
+        return nodes
+
+    def get_or_create_wiki_author_node(self, author: str) -> Optional[str]:
+        """取得或建立知識庫中該主播的節點，回傳 node_token"""
+        clean_author = (author or "").strip()
+        if not self.wiki_enabled or not clean_author:
+            return None
+
+        if clean_author in self._wiki_author_cache:
+            return self._wiki_author_cache[clean_author]
+
+        existing = self.list_wiki_child_nodes(self.wiki_root_node)
+        if clean_author in existing and existing[clean_author]:
+            self._wiki_author_cache.update(existing)
+            return self._wiki_author_cache[clean_author]
+
+        headers = self._wiki_headers()
+        if not headers:
+            return None
+        try:
+            resp = self.client.post(
+                f"{FEISHU_HOST}/open-apis/wiki/v2/spaces/{self.wiki_space_id}/nodes",
+                headers=headers,
+                json={
+                    "obj_type": "docx",
+                    "node_type": "origin",
+                    "parent_node_token": self.wiki_root_node,
+                    "title": clean_author,
+                },
+            )
+            data = resp.json()
+            if data.get("code") == 0:
+                node_token = data.get("data", {}).get("node", {}).get("node_token")
+                if node_token:
+                    self._wiki_author_cache[clean_author] = node_token
+                    logger.info(f"已在知識庫建立主播節點: {clean_author}")
+                    return node_token
+            logger.warning(f"建立知識庫主播節點失敗 ({clean_author}): {data.get('msg')}")
+        except Exception as e:
+            logger.warning(f"建立知識庫主播節點異常 ({clean_author}): {e}")
+        return None
+
+    def move_doc_to_wiki(self, parent_node_token: str, obj_token: str) -> Optional[str]:
+        """把雲空間中的 Docx 移入知識庫指定節點下，回傳新的 wiki node_token"""
+        headers = self._wiki_headers()
+        if not headers or not obj_token:
+            return None
+        try:
+            resp = self.client.post(
+                f"{FEISHU_HOST}/open-apis/wiki/v2/spaces/{self.wiki_space_id}/nodes/move_docs_to_wiki",
+                headers=headers,
+                json={"parent_wiki_token": parent_node_token, "obj_type": "docx", "obj_token": obj_token},
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(f"移入知識庫失敗: {data.get('msg')}")
+                return None
+
+            # 反查節點，取得 wiki node_token 以組成可分享網址
+            lookup = self.client.get(
+                f"{FEISHU_HOST}/open-apis/wiki/v2/spaces/get_node",
+                headers=headers,
+                params={"token": obj_token, "obj_type": "docx"},
+            ).json()
+            node_token = (lookup.get("data", {}) or {}).get("node", {}).get("node_token")
+            return node_token
+        except Exception as e:
+            logger.warning(f"移入知識庫異常: {e}")
+            return None
+
+    def create_article_docx(
+        self,
+        md_path: str,
+        author: str = "",
+        doc_title: str = "",
+        folder_token: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        建立文章 Docx 並歸檔：
+        1. 匯入 Markdown 為 Docx
+        2. 若啟用知識庫，移入該主播的知識庫節點，回傳知識庫網址
+        3. 否則保留在雲空間主播子資料夾
+        """
+        target_folder = folder_token
+        if target_folder is None:
+            target_folder = self.get_or_create_author_folder(author) if author else self.folder_token
+
+        doc_url, doc_token = self.create_docx_from_markdown(
+            md_path, doc_title=doc_title, folder_token=target_folder
+        )
+        if not doc_token:
+            return None, None
+
+        if self.wiki_enabled and author:
+            author_node = self.get_or_create_wiki_author_node(author)
+            if author_node:
+                wiki_node = self.move_doc_to_wiki(author_node, doc_token)
+                if wiki_node:
+                    return f"https://{self.wiki_domain}/wiki/{wiki_node}", doc_token
+
+        return doc_url, doc_token
 
     def _list_subfolders(self, parent_token: str) -> Dict[str, str]:
         """列出父資料夾下的所有子資料夾 {名稱: token}"""

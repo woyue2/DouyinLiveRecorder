@@ -116,11 +116,17 @@ def load_project_config() -> Dict[str, Any]:
         settings["feishu_app_id"] = config.get("飞书文档配置", "飞书app_id", fallback="").strip()
         settings["feishu_app_secret"] = config.get("飞书文档配置", "飞书app_secret", fallback="").strip()
         settings["feishu_folder_token"] = config.get("飞书文档配置", "飞书文件夹_token", fallback="").strip()
+        settings["feishu_wiki_space_id"] = config.get("飞书文档配置", "飞书知识库space_id", fallback="").strip()
+        settings["feishu_wiki_root_node"] = config.get("飞书文档配置", "飞书知识库根节点", fallback="").strip()
+        settings["feishu_wiki_domain"] = config.get("飞书文档配置", "飞书域名", fallback="my.feishu.cn").strip()
     else:
         settings["feishu_enabled"] = False
         settings["feishu_app_id"] = ""
         settings["feishu_app_secret"] = ""
         settings["feishu_folder_token"] = ""
+        settings["feishu_wiki_space_id"] = ""
+        settings["feishu_wiki_root_node"] = ""
+        settings["feishu_wiki_domain"] = "my.feishu.cn"
 
     return settings
 
@@ -724,13 +730,15 @@ def process_blogger_videos(
                                 feishu_mgr = FeishuDocManager(
                                     app_id=config_settings.get("feishu_app_id", ""),
                                     app_secret=config_settings.get("feishu_app_secret", ""),
-                                    folder_token=config_settings.get("feishu_folder_token", "")
+                                    folder_token=config_settings.get("feishu_folder_token", ""),
+                                    wiki_space_id=config_settings.get("feishu_wiki_space_id", ""),
+                                    wiki_root_node=config_settings.get("feishu_wiki_root_node", ""),
+                                    wiki_domain=config_settings.get("feishu_wiki_domain", "my.feishu.cn"),
                                 )
                                 doc_title = f"{v['publish_time'][:10]}【{author_name}】{effective_title[:30]}"
-                                # 文章歸入以主播命名的子資料夾
-                                author_folder = feishu_mgr.get_or_create_author_folder(author_name)
-                                doc_url, doc_token = feishu_mgr.create_docx_from_markdown(
-                                    md_file, doc_title=doc_title, folder_token=author_folder
+                                # 建立文檔並歸檔至該主播的飛書知識庫節點（未啟用知識庫時落在雲空間子資料夾）
+                                doc_url, doc_token = feishu_mgr.create_article_docx(
+                                    md_file, author=author_name, doc_title=doc_title
                                 )
                                 if doc_url:
                                     feishu_url = doc_url
