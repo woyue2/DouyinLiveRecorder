@@ -302,6 +302,56 @@ def test_multi_chunk_fixed_delay_still_supported(monkeypatch):
     assert sleeps == [30]
 
 
+def test_build_parts_timeline_markdown_includes_all_parts_and_timestamps():
+    """时间轴文档：不截断、含主播/日期/段数表头，并按分P标注起始时间戳。"""
+    parts = [
+        {"label": "【P1】", "title": "P1 开头", "lines": ["00:30 看点A", "12:40 看点B"]},
+        {"label": "【P2】", "title": "P2 中段", "lines": ["看点C"]},
+    ]
+    md = bili_uploader.build_parts_timeline_markdown(
+        parts, record_name="序号6 初恋小娜", upload_date="2026-10-14",
+        start_times=[0, 901],
+    )
+    assert md.startswith("# 直播时间轴 · 初恋小娜")
+    assert "📅 2026-10-14" in md
+    assert "🎬 共 2 段" in md
+    # 分P 標題去掉了 "P1" 前缀，并带上该分P的全域起始时间戳
+    assert "## 【P1】 00:00 · 开头" in md
+    assert "## 【P2】 15:01 · 中段" in md
+    # 所有看点都保留（无字数截断）
+    for point in ("00:30 看点A", "12:40 看点B", "看点C"):
+        assert point in md
+
+
+def test_build_parts_timeline_markdown_handles_empty_and_missing_titles():
+    parts = [
+        {"label": "【P1】", "title": "", "lines": []},
+        {"label": "", "title": "仅标题", "lines": ["只有一行"]},
+    ]
+    md = bili_uploader.build_parts_timeline_markdown(parts, record_name="主播: 小娜")
+    assert "## 【P1】" in md
+    assert "（本段无转写内容）" in md
+    assert "## 【P2】 仅标题" in md
+    assert "- 只有一行" in md
+
+
+def test_probe_duration_and_start_times_fall_back(monkeypatch):
+    """ffprobe 取不到时长时，用 fallback 秒数累加，保证时间戳仍递增。"""
+    monkeypatch.setattr(bili_uploader, "probe_duration_seconds", lambda p: 0.0)
+    starts = bili_uploader.compute_part_start_times(["a", "b", "c"], fallback_seconds=900)
+    assert starts == [0, 900, 1800]
+
+    monkeypatch.setattr(bili_uploader, "probe_duration_seconds", lambda p: 901.0)
+    starts = bili_uploader.compute_part_start_times(["a", "b"])
+    assert starts == [0, 901]
+
+
+def test_format_timestamp():
+    assert bili_uploader._format_timestamp(0) == "00:00"
+    assert bili_uploader._format_timestamp(901) == "15:01"
+    assert bili_uploader._format_timestamp(3725) == "01:02:05"
+
+
 def test_build_parts_index_chunks():
     # 测试较少 P 时单条
     short_parts = [

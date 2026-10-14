@@ -57,10 +57,10 @@ from src.bili_uploader import (
     handle_post_upload_cleanup,
     build_parts_index,
     build_parts_index_chunks,
+    build_parts_timeline_markdown,
+    compute_part_start_times,
     build_part_links,
     cleanup_part_links,
-    post_video_comment,
-    post_multi_chunk_comments,
     get_video_status,
 )
 from src.stream_selection import is_flv_preferred_platform, select_source_url
@@ -518,11 +518,11 @@ bili_cooldown_minutes = 360
 bili_cooldown_until = 0.0
 bili_last_submit_time = 0.0
 bili_submit_lock = threading.Lock()
-# B站分P看点评论发送节奏（秒）：轮询影片就绪 → 再等 1 小时 → 发首条 → 后续每条随机间隔
-bili_comment_ready_timeout = 4 * 3600      # 轮询「影片可评论」的最长等待
-bili_comment_ready_poll = 300              # 影片状态轮询间隔
-bili_comment_first_delay = 3600            # 影片就绪后、首条评论前再等多久
-bili_comment_gap_range = (180, 360)        # 后续每两条评论之间的随机间隔（3~6 分钟）
+# B站看点时间轴：投稿成功后生成飞书文档归档（不再发 B 站评论）
+# 飞书知识库中「直播时间轴」页面的 node_token（从 config.ini 读取）
+bili_timeline_node = ""
+bili_timeline_enabled = False
+bili_timeline_domain = "my.feishu.cn"
 # B站待投稿队列：满足最小间隔后由后台线程依次提交，避免阻塞录制主流程
 bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
@@ -562,7 +562,6 @@ def _load_bili_queue() -> None:
             logger.info(f"成功从磁盘恢复 {len(loaded)} 个B站待投稿任务")
     except Exception as e:
         logger.warning(f"恢复B站队列状态失败: {e}")
-bili_auto_comment = False
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
 bili_default_tid = 138
@@ -756,122 +755,76 @@ def _rate_limit_notice(record_name: str) -> str:
             f"措施: 已自动开启 {bili_cooldown_minutes} 分钟冷却保护，视频已安全锁定不会被删除，冷却后将自动恢复！")
 
 
-def _wait_until_bili_commentable(bvid: str, fallback_aid: Optional[int]) -> tuple[Optional[int], int]:
-    """轮询影片信息，直到可以发评论（拿到 aid）为止。
+def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
+                            ts_paths: Optional[list] = None) -> tuple[Optional[str], str]:
+    """把直播分P看点整理成「直播时间轴」飞书文档。
 
-    注意：B 站的 state 对部分影片（长片转码中、仅自己可见等）可能长期停留在负值，
-    实测有影片投稿一天后仍为 -50。但发评论只需要 aid，与 state 无关，
-    因此以「aid 可取得」作为就绪条件，避免每次投稿都白等 4 小时超时。
-
-    返回 (effective_aid, state)。超时仍拿不到 aid 时返回最后结果，由调用方决定。
-    """
-    deadline = time.time() + bili_comment_ready_timeout
-    state, effective_aid, attempt = -999, fallback_aid, 0
-    while True:
-        attempt += 1
-        state, curr_aid = get_video_status(bvid, bili_cookie_path)
-        effective_aid = fallback_aid or curr_aid
-        if effective_aid:
-            logger.info(
-                f"B站影片已可评论 (aid={effective_aid}, state={state})，第 {attempt} 次查询: BV={bvid}"
-            )
-            return effective_aid, state
-        if time.time() >= deadline:
-            logger.warning(
-                f"等待影片 aid 超时（{bili_comment_ready_timeout // 60} 分钟，查询 {attempt} 次），"
-                f"无法发布评论: BV={bvid} state={state}"
-            )
-            return effective_aid, state
-        logger.info(
-            f"B站影片尚未取得 aid (state={state})，{bili_comment_ready_poll} 秒后重查 [{attempt}]: BV={bvid}"
-        )
-        time.sleep(bili_comment_ready_poll)
-
-
-def schedule_delayed_bili_comments(bvid: str, meta: dict, aid: Optional[int],
-                                    record_name: str, clean_name: str) -> None:
-    """在独立后台守护线程中发送分P看点评论。
-
-    节奏：轮询影片直至就绪 → 再等 1 小时 → 发第 1 条（置顶）
-          → 校验确实出现在评论区 → 后续每条间隔随机 3~6 分钟。
-    首条发送失败或评论区查不到时立即中止后续序列，避免无效连发。
+    归档到「直播时间轴」节点下、以主播命名的子节点中（与其他主播并排）。
+    返回 (飞书文档链接, 说明文字)；失败时链接为 None。
     """
     parts = meta.get("parts") or []
     if not parts:
-        logger.info(f"B站延迟评论跳过 ({bvid})：无可用的分P索引内容")
-        return
-    chunks = build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3)
+        return None, "无可用的分P看点内容"
+    if not (feishu_doc_enabled and feishu_app_id and feishu_app_secret and bili_timeline_node):
+        return None, "未配置飞书时间轴知识库"
 
+    start_times = compute_part_start_times(ts_paths) if ts_paths else None
+    upload_date = time.strftime("%Y-%m-%d")
+    md = build_parts_timeline_markdown(
+        parts, record_name=record_name, upload_date=upload_date, start_times=start_times
+    )
+
+    tmp_path = os.path.join("/tmp", f"bili_timeline_{int(time.time())}.md")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(md)
+        from src.feishu_uploader import FeishuDocManager
+        mgr = FeishuDocManager(
+            feishu_app_id, feishu_app_secret,
+            folder_token=feishu_folder_token,
+            wiki_space_id=feishu_wiki_space_id,
+            wiki_root_node=bili_timeline_node,
+            wiki_domain=bili_timeline_domain,
+        )
+        doc_title = f"{upload_date}【{clean_name}】直播时间轴"
+        url, _ = mgr.create_article_docx(tmp_path, author=clean_name, doc_title=doc_title)
+        return url, ""
+    except Exception as e:
+        logger.warning(f"生成直播时间轴飞书文档异常 ({record_name}): {e}")
+        return None, f"异常: {e}"
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
+                           ts_paths: Optional[list] = None) -> None:
+    """后台线程：生成直播时间轴飞书文档并推送钉钉通知。
+
+    注意：本流程完全不涉及 B 站评论（帳號權限受限，評論會被靜默丟棄）。
+    """
     def _worker():
         try:
-            logger.info(f"开启B站评论发布守护线程: BV={bvid}，先轮询影片状态直至取得 aid...")
-            effective_aid, _state = _wait_until_bili_commentable(bvid, aid)
-            if not effective_aid:
-                logger.warning(f"未能取得 aid，跳过看点评论发布: BV={bvid}")
-                return
-
-            logger.info(
-                f"影片就绪后再等 {bili_comment_first_delay // 60} 分钟，让审核充分完成: BV={bvid}"
-            )
-            time.sleep(bili_comment_first_delay)
-
-            results = post_multi_chunk_comments(
-                bvid=bvid,
-                chunks=chunks,
-                cookie_path=bili_cookie_path,
-                aid=effective_aid,
-                pin_first=True,
-                delay_between=bili_comment_gap_range,
-                verify_first=True,
-            )
-            success_count = sum(1 for r in results if r.get("ok"))
-            posted = len(results)
-            if success_count > 0:
-                logger.info(
-                    f"B站分P看点评论已发布: BV={bvid} 成功={success_count}/{posted}（计划 {len(chunks)} 条）"
-                )
-                gap_label = f"{bili_comment_gap_range[0] // 60}~{bili_comment_gap_range[1] // 60}"
+            url, err = build_bili_timeline_doc(meta, record_name, clean_name, ts_paths)
+            if url:
+                logger.info(f"直播时间轴飞书文档已生成: {url}")
                 try:
                     push_message(
-                        record_name,
-                        "",
-                        f"[B站分P看点评论发布完成] 【{clean_name}】{bvid}\n"
-                        f"已发布 {success_count}/{posted} 条看点评论"
-                        f"（第1条置顶，后续每条间隔 {gap_label} 分钟随机）"
+                        record_name, "",
+                        f"[直播时间轴已生成] 【{clean_name}】\n{url}"
                     )
                 except Exception as e:
-                    logger.warning(f"推送分P看点评论完成通知失败: {e}")
-            elif posted < len(chunks):
-                logger.warning(
-                    f"B站分P看点评论已中止: BV={bvid}（首条异常，未继续发送后续 {len(chunks) - posted} 条）"
-                )
+                    logger.warning(f"推送直播时间轴通知失败: {e}")
             else:
-                logger.warning(f"B站分P看点评论全部失败: BV={bvid}")
+                logger.info(f"直播时间轴文档跳过 ({record_name}): {err}")
         except Exception as e:
-            logger.error(f"B站评论发布守护线程异常 ({bvid}): {e}")
+            logger.error(f"直播时间轴线程异常 ({record_name}): {e}")
 
-    t = threading.Thread(target=_worker, daemon=True, name=f"bili-comment-{bvid}")
+    t = threading.Thread(target=_worker, daemon=True, name="bili-timeline")
     t.start()
-
-
-def post_bili_index_comment(bvid: str, meta: dict, aid: Optional[int] = None) -> tuple[bool, str]:
-    """在多P稿件下立即尝试发布分P看点索引评论（兼容直接调用）。"""
-    parts = meta.get("parts") or []
-    if not parts:
-        return False, "无可用的分P索引内容"
-    chunks = build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3)
-    results = post_multi_chunk_comments(
-        bvid=bvid,
-        chunks=chunks,
-        cookie_path=bili_cookie_path,
-        aid=aid,
-        pin_first=True,
-        delay_between=bili_comment_gap_range,
-        verify_first=True,
-    )
-    ok = any(r.get("ok") for r in results)
-    info = "; ".join(f"[{r.get('chunk')}] {r.get('info')}" for r in results)
-    return ok, info
 
 
 def run_bili_single_job(job: dict) -> None:
@@ -998,24 +951,15 @@ def run_bili_session_job(job: dict) -> None:
     if success:
         bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
         bvid = bvid_match.group(0) if bvid_match else "已提交"
-        aid_match = re.search(r'"aid"\s*:\s*(\d+)', output)
-        parsed_aid = int(aid_match.group(1)) if aid_match else None
-        comment_note = ""
-        if bili_auto_comment and bvid.startswith("BV"):
-            parts = meta.get("parts") or []
-            if parts:
-                schedule_delayed_bili_comments(bvid, meta, parsed_aid, record_name, clean_name)
-                chunks_count = len(build_parts_index_chunks(parts, max_len_per_chunk=900, max_chunks=3))
-                gap_label = f"{bili_comment_gap_range[0] // 60}~{bili_comment_gap_range[1] // 60}"
-                comment_note = (
-                    f"\n置顶评论: 后台已安排（共 {chunks_count} 条，"
-                    f"取得 aid 后再等 {bili_comment_first_delay // 60} 分钟发出第1条，"
-                    f"首条失败即中止，后续每条间隔 {gap_label} 分钟随机）"
-                )
+        timeline_note = ""
+        if bili_timeline_enabled and (meta.get("parts") or []):
+            # 生成飞书「直播时间轴」文档（不含任何 B 站评论操作）
+            schedule_bili_timeline(meta, record_name, clean_name, valid_ts_paths)
+            timeline_note = "\n直播时间轴: 后台生成飞书文档中（完成后推送链接）"
         content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
                    f"标题: {meta['title']}\n"
                    f"BV号: {bvid}\n"
-                   f"总集数: {len(valid_ts_paths)}P (全场自动合集){comment_note}")
+                   f"总集数: {len(valid_ts_paths)}P (全场自动合集){timeline_note}")
         handle_post_upload_cleanup(valid_ts_paths, policy=bili_post_policy)
     else:
         content = _handle_bili_failure(output, record_name, f"集数: {len(valid_ts_paths)}P", vis_label)
@@ -3083,6 +3027,18 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
             config_parser.add_section('主播类型配置')
         if '主播可见性配置' not in config_parser.sections():
             config_parser.add_section('主播可见性配置')
+        # 本地私密/環境專屬覆蓋檔優先（已被 .gitignore 忽略），用於存放 API Key、Cookie、
+        # 知識庫節點等不進版本庫的設定。
+        # 注意：必須用獨立 parser 讀取，不可合併進 config_parser，
+        # 否則下方「補默認值並寫回」會把這些密鑰寫進 config/config.ini。
+        for _extra_config in (f'{script_path}/config/local_secrets.ini',
+                              f'{script_path}/local_secrets.ini'):
+            if os.path.exists(_extra_config):
+                _override = configparser.RawConfigParser()
+                _override.read(_extra_config, encoding=text_encoding)
+                if _override.has_option(section, option):
+                    return _override.get(section, option)
+                break
         return config_parser.get(section, option)
     except (configparser.NoSectionError, configparser.NoOptionError):
         config_parser.set(section, option, str(default_value))
@@ -3272,9 +3228,6 @@ while True:
     bili_upload_mode = read_config_value(config, 'B站投稿', '投稿模式', "整场多P投稿").strip()
     bili_min_interval_seconds = int(read_config_value(config, 'B站投稿', '最小投稿间隔(分钟)', 360)) * 60
     bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 360))
-    # 默认关闭：B 站看點評論已全面停用（帳號等級不足，發出的評論不會真正顯示，
-    # 繼續嘗試只會徒增風控風險）。如需重新啟用，請在 config.ini 明確設為「是」。
-    bili_auto_comment = options.get(read_config_value(config, 'B站投稿', '投稿后自动发置顶评论(是/否)', "否"), False)
     bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
     bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
     bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))
@@ -3290,6 +3243,12 @@ while True:
     feishu_wiki_space_id = read_config_value(config, '飞书文档配置', '飞书知识库space_id', "").strip()
     feishu_wiki_root_node = read_config_value(config, '飞书文档配置', '飞书知识库根节点', "").strip()
     feishu_wiki_domain = read_config_value(config, '飞书文档配置', '飞书域名', "my.feishu.cn").strip()
+    # B站看点时间轴：投稿成功后生成飞书文档归档（不再发 B 站评论）
+    # 节点指向飞书知识库中的「直播时间轴」页面，其下按主播建立子节点
+    # 注意：必须在 feishu_app_id / feishu_app_secret 读取之后才能判定是否启用
+    bili_timeline_node = read_config_value(config, 'B站投稿', '直播时间轴节点', "").strip()
+    bili_timeline_domain = read_config_value(config, 'B站投稿', '直播时间轴域名', "").strip() or feishu_wiki_domain or "my.feishu.cn"
+    bili_timeline_enabled = bool(bili_timeline_node and feishu_app_id and feishu_app_secret)
     streamer_types = {}
     if '主播类型配置' in config.sections():
         for k, v in config.items('主播类型配置'):

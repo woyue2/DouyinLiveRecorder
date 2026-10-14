@@ -944,6 +944,79 @@ def cleanup_part_links(tmp_dir: str) -> None:
         logger.warning(f"清理分P硬链接目录失败 {tmp_dir}: {e}")
 
 
+def probe_duration_seconds(path: str) -> float:
+    """用 ffprobe 取得媒體時長（秒）；失敗回傳 0。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=30, check=True,
+        )
+        return float((out.stdout or b"0").decode("utf-8", "ignore").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def compute_part_start_times(ts_paths: list, fallback_seconds: int = 0) -> list:
+    """由各分P檔案時長累加，算出每個分P的全域起始秒數。"""
+    starts, cum = [], 0
+    for p in ts_paths:
+        starts.append(cum)
+        dur = probe_duration_seconds(p)
+        cum += dur if dur > 0 else fallback_seconds
+    return starts
+
+
+def _format_timestamp(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hh, rem = divmod(total, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+
+
+def build_parts_timeline_markdown(parts: list, record_name: str = "",
+                                  upload_date: str = "",
+                                  start_times: Optional[list] = None) -> str:
+    """把各分P的看点整理成完整的「直播时间轴」Markdown，供飞书文档使用。
+
+    与分P索引评论不同，飞书文档没有 1000/2000 字上限，因此这里不做截断，
+    每个分P列出全部看点，并标注该分P在全场中的起始时间戳。
+    """
+    clean_name = re.sub(
+        r'^(主播|anchor)[:：]\s*', '',
+        (record_name or "").split(" ", maxsplit=1)[-1],
+    ).strip()
+
+    lines = [f"# 直播时间轴 · {clean_name or '直播'}", ""]
+    meta_bits = []
+    if clean_name:
+        meta_bits.append(f"🎙️ {clean_name}")
+    if upload_date:
+        meta_bits.append(f"📅 {upload_date}")
+    meta_bits.append(f"🎬 共 {len(parts)} 段")
+    lines.append("> " + "  |  ".join(meta_bits))
+    lines.append("")
+
+    for idx, part in enumerate(parts):
+        label = part.get("label") or f"【P{idx + 1}】"
+        ptitle = re.sub(r'^P\d+\s*', '', (part.get("title") or "").strip()).strip()
+        if start_times and idx < len(start_times):
+            ts = _format_timestamp(start_times[idx])
+            heading = f"## {label} {ts} · {ptitle}" if ptitle else f"## {label} {ts}"
+        else:
+            heading = f"## {label} {ptitle}" if ptitle else f"## {label}"
+        lines.append(heading)
+        lines.append("")
+
+        points = [str(l).strip() for l in (part.get("lines") or []) if str(l).strip()]
+        for pt in points or ["（本段无转写内容）"]:
+            lines.append(f"- {pt}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def build_parts_index_chunks(parts: list, max_len_per_chunk: int = BILI_COMMENT_MAX_LEN, max_chunks: int = 3) -> list:
     """把各分 P 的时间戳看点切分成多条（1~3条）严格不超过 max_len_per_chunk 的索引评论。
 
