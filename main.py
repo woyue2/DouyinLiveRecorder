@@ -562,7 +562,7 @@ def _load_bili_queue() -> None:
             logger.info(f"成功从磁盘恢复 {len(loaded)} 个B站待投稿任务")
     except Exception as e:
         logger.warning(f"恢复B站队列状态失败: {e}")
-bili_auto_comment = True
+bili_auto_comment = False
 bili_post_policy = "仅百度云上传md(删除ts)"
 bili_cookie_path = "cookies.json"
 bili_default_tid = 138
@@ -3272,7 +3272,9 @@ while True:
     bili_upload_mode = read_config_value(config, 'B站投稿', '投稿模式', "整场多P投稿").strip()
     bili_min_interval_seconds = int(read_config_value(config, 'B站投稿', '最小投稿间隔(分钟)', 360)) * 60
     bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 360))
-    bili_auto_comment = options.get(read_config_value(config, 'B站投稿', '投稿后自动发置顶评论(是/否)', "是"), True)
+    # 默认关闭：B 站看點評論已全面停用（帳號等級不足，發出的評論不會真正顯示，
+    # 繼續嘗試只會徒增風控風險）。如需重新啟用，請在 config.ini 明確設為「是」。
+    bili_auto_comment = options.get(read_config_value(config, 'B站投稿', '投稿后自动发置顶评论(是/否)', "否"), False)
     bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
     bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
     bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))
