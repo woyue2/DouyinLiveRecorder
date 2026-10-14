@@ -788,21 +788,40 @@ def post_video_comment(bvid: str, message: str,
         if len(message) > BILI_COMMENT_MAX_LEN:
             message = message[:BILI_COMMENT_MAX_LEN - 3] + "..."
 
+        # 依序嘗試多個長度版本：B 站字數上限會隨帳號/風控調整，
+        # 收到 12025（评论字数过多）時自動改用更短的版本重試，避免整條評論丟失。
+        candidates = [message]
+        for limit in (700, 450, 280):
+            if len(message) > limit:
+                candidates.append(message[:limit - 3] + "...")
+
         # code 12051 = 重复评论/请勿刷屏；间隔后重试
         res = {}
-        for attempt in range(3):
-            res = _bili_api("https://api.bilibili.com/x/v2/reply/add", header, {
-                "type": "1", "oid": str(aid), "message": message, "csrf": csrf})
-            if res.get("code") == 0:
+        for cand_idx, candidate in enumerate(candidates):
+            for attempt in range(3):
+                res = _bili_api("https://api.bilibili.com/x/v2/reply/add", header, {
+                    "type": "1", "oid": str(aid), "message": candidate, "csrf": csrf})
+                if res.get("code") == 0:
+                    break
+                if res.get("code") == 12051 and attempt < 2:
+                    logger.warning(f"评论被防刷屏拦截(12051)，{15 * (attempt + 1)}s 后重试")
+                    import time as _t
+                    _t.sleep(15 * (attempt + 1))
+                    continue
                 break
-            if res.get("code") == 12051 and attempt < 2:
-                logger.warning(f"评论被防刷屏拦截(12051)，{15 * (attempt + 1)}s 后重试")
-                import time as _t
-                _t.sleep(15 * (attempt + 1))
-                continue
-            break
+            if res.get("code") == 0:
+                if cand_idx > 0:
+                    logger.info(f"评论经缩短至 {len(candidate)} 字后发布成功")
+                break
+            if res.get("code") != 12025:
+                break
+            next_len = len(candidates[cand_idx + 1]) if cand_idx + 1 < len(candidates) else 0
+            logger.warning(
+                f"评论字数超限(12025)，当前 {len(candidate)} 字，改用更短版本重试"
+                + (f"（{next_len} 字）" if next_len else "（已無更短版本）")
+            )
         if res.get("code") != 0:
-            return False, f"发评论失败 code={res.get('code')} {res.get('message')}"
+            return False, f"发评论失败 code={res.get('code')} {res.get('message')}（最终长度 {len(candidates[-1])} 字）"
 
         rpid = (res.get("data") or {}).get("rpid")
         if pin and rpid:
