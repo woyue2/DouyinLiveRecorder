@@ -28,6 +28,39 @@ DETAIL = {
 }
 
 
+def test_extract_video_url_new_ef_format_prefers_muxed_stream():
+    """新版小紅書用 EF4/EF5… 作鍵；應挑含音軌的合流，而非純視頻流。"""
+    card = {
+        "video": {"media": {"stream": {
+            "EF5": [{"master_url": "https://v/video-only.m4s"}],
+            "EF4": [{"master_url": "https://v/muxed.mp4", "audio_codec": "mp4a"}],
+            "EF6": [],
+        }}}
+    }
+    assert xhs.extract_note_video_url(card) == "https://v/muxed.mp4"
+
+
+def test_extract_video_url_legacy_codec_keys_still_work():
+    card = {"video": {"media": {"stream": {
+        "h264": [{"master_url": "https://v/h264.mp4", "audio_bitrate": 64}],
+    }}}}
+    assert xhs.extract_note_video_url(card) == "https://v/h264.mp4"
+
+
+def test_extract_video_url_falls_back_when_no_muxed_stream():
+    card = {"video": {"media": {"stream": {
+        "EF5": [{"master_url": "https://v/only.m4s"}],
+    }}}}
+    assert xhs.extract_note_video_url(card) == "https://v/only.m4s"
+
+
+def test_extract_video_url_handles_missing_or_empty():
+    assert xhs.extract_note_video_url({}) == ""
+    assert xhs.extract_note_video_url({"video": {}}) == ""
+    assert xhs.extract_note_video_url({"video": {"media": {"stream": {}}}}) == ""
+    assert xhs.extract_note_video_url({"video": {"media": {"stream": {"EF4": []}}}}) == ""
+
+
 def test_feishu_markdown_uses_transcript_when_available(tmp_path):
     transcript = tmp_path / "t.md"
     transcript.write_text("# 原標題\n\n## 章節\n逐字稿內容\n", encoding="utf-8")

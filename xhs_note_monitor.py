@@ -201,6 +201,32 @@ def load_project_config() -> Dict[str, Any]:
     return settings
 
 
+def extract_note_video_url(card: Dict[str, Any]) -> str:
+    """從 note_card 取出可下載的視頻連結。
+
+    小紅書的 stream 有兩種鍵名：舊版用編碼名（h264/h265/av1），
+    新版用 EF4/EF5/EF6/EF7。故不依賴鍵名，一律掃描所有值，
+    並優先挑「含音軌」（有 audio_codec / audio_bitrate）的合流，
+    因為後續要抽音訊轉寫；找不到合流才退而取任一個有 master_url 的流。
+    """
+    media_stream = (card.get("video") or {}).get("media", {}).get("stream", {}) or {}
+    muxed_url, any_url = "", ""
+    for streams in media_stream.values():
+        if not isinstance(streams, list):
+            continue
+        for st in streams:
+            if not isinstance(st, dict):
+                continue
+            url = st.get("master_url")
+            if not url:
+                continue
+            if not any_url:
+                any_url = url
+            if st.get("audio_codec") or st.get("audio_bitrate"):
+                return url
+    return any_url
+
+
 class XhsNoteMonitor:
     def __init__(self, cookie: str = ""):
         self.cookie_str = cookie.strip()
@@ -393,18 +419,7 @@ class XhsNoteMonitor:
             if url:
                 image_list.append(url)
 
-        video_info = card.get("video", {})
-        video_url = ""
-        media_stream = video_info.get("media", {}).get("stream", {}) or {}
-        # 依序嘗試常見編碼；小紅書不一定提供 h264（部分只有 h265/av1）
-        for codec in ("h264", "h265", "h266", "av1"):
-            streams = media_stream.get(codec) or []
-            for st in streams:
-                if st.get("master_url"):
-                    video_url = st["master_url"]
-                    break
-            if video_url:
-                break
+        video_url = extract_note_video_url(card)
 
         return {
             "note_id": note_id,
