@@ -24,12 +24,14 @@ class UploadScriptTests(unittest.TestCase):
 
     def test_uploads_each_file_independently(self):
         self.assertIn("for ((index = 0; index < pending_count; index++))", self.script)
-        self.assertIn('upload "$local_file" "$remote_file" overwrite', self.script)
+        # 逐檔上傳由 run_upload_and_verify() 輔助函式執行，使用 overwrite 覆蓋同名遠端檔案
+        self.assertIn('run_upload_and_verify "$local_file" "$remote_file"', self.script)
+        self.assertIn('upload "$up_local" "$up_remote" overwrite', self.script)
         self.assertNotIn("syncup", self.script)
 
     def test_deletes_only_the_verified_file(self):
-        self.assertIn('meta "$remote_file" \'$s\'', self.script)
-        self.assertIn('[ "$remote_size" != "$local_size" ]', self.script)
+        self.assertIn('meta "$up_remote" \'$s\'', self.script)
+        self.assertIn('[ "$REMOTE_SIZE" != "$local_bytes" ]', self.script)
         self.assertIn('rm -f -- "$local_file"', self.script)
         self.assertNotIn("rm -rf", self.script)
 
@@ -60,9 +62,11 @@ class UploadScriptTests(unittest.TestCase):
 
     def test_distinguishes_rapidupload_fallback_and_authorization_failure(self):
         self.assertIn("--type rapidupload_fallback", self.script)
-        self.assertIn('error_category="authorization_31064"', self.script)
-        authorization_check = self.script.index('[ "$error_code" = "31064" ]')
-        process_check = self.script.index('[ "$process_exit_code" -ne 0 ]')
+        self.assertIn('ERROR_CATEGORY="authorization_31064"', self.script)
+        # 31064（授權失敗）必須先於通用的「進程退出碼非 0」判定，
+        # 否則會把授權問題誤判成一般上傳失敗
+        authorization_check = self.script.index('[ "$ERROR_CODE" = "31064" ]')
+        process_check = self.script.index('[ "$UPLOAD_EXIT_CODE" -ne 0 ]')
         self.assertLess(authorization_check, process_check)
 
     def test_sends_start_and_final_notifications(self):

@@ -33,15 +33,18 @@ class FFmpegCommandOptionsTests(unittest.TestCase):
     def test_reconnect_options_have_explicit_values_before_input(self):
         command = self.get_recording_command_literals()
         input_index = command.index("-i")
+        # 注意：-reconnect_at_eof 已於 2026-08-08 移除。
+        # 該選項會讓 ffmpeg 在輸入 EOF（直播真的結束）後仍持續重連，
+        # 導致錄製進程無法乾淨結束、偵測不到下播，故不再使用。
         for option in (
             "-reconnect",
-            "-reconnect_at_eof",
             "-reconnect_streamed",
         ):
             option_index = command.index(option)
             self.assertLess(option_index, input_index)
             self.assertEqual(command[option_index + 1], "1")
 
+        self.assertNotIn("-reconnect_at_eof", command)
         self.assertLess(command.index("-reconnect_delay_max"), input_index)
         self.assertNotIn("-correct_ts_overflow", command)
 
