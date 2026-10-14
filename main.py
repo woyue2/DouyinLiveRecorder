@@ -757,10 +757,13 @@ def _rate_limit_notice(record_name: str) -> str:
 
 
 def _wait_until_bili_commentable(bvid: str, fallback_aid: Optional[int]) -> tuple[Optional[int], int]:
-    """轮询影片状态，直到可评论（已过审/转码完成且有 aid）。
+    """轮询影片信息，直到可以发评论（拿到 aid）为止。
 
-    返回 (effective_aid, state)。超过 bili_comment_ready_timeout 仍不就绪时，
-    仍返回最后一次结果，由调用方决定是否照样尝试发布（best effort）。
+    注意：B 站的 state 对部分影片（长片转码中、仅自己可见等）可能长期停留在负值，
+    实测有影片投稿一天后仍为 -50。但发评论只需要 aid，与 state 无关，
+    因此以「aid 可取得」作为就绪条件，避免每次投稿都白等 4 小时超时。
+
+    返回 (effective_aid, state)。超时仍拿不到 aid 时返回最后结果，由调用方决定。
     """
     deadline = time.time() + bili_comment_ready_timeout
     state, effective_aid, attempt = -999, fallback_aid, 0
@@ -768,16 +771,20 @@ def _wait_until_bili_commentable(bvid: str, fallback_aid: Optional[int]) -> tupl
         attempt += 1
         state, curr_aid = get_video_status(bvid, bili_cookie_path)
         effective_aid = fallback_aid or curr_aid
-        if state >= 0 and effective_aid:
-            logger.info(f"B站影片已就绪可评论 (state={state}, aid={effective_aid})，第 {attempt} 次查询: BV={bvid}")
+        if effective_aid:
+            logger.info(
+                f"B站影片已可评论 (aid={effective_aid}, state={state})，第 {attempt} 次查询: BV={bvid}"
+            )
             return effective_aid, state
         if time.time() >= deadline:
             logger.warning(
-                f"等待影片就绪超时（{bili_comment_ready_timeout // 60} 分钟，查询 {attempt} 次），"
-                f"仍尝试发布评论: BV={bvid} state={state}"
+                f"等待影片 aid 超时（{bili_comment_ready_timeout // 60} 分钟，查询 {attempt} 次），"
+                f"无法发布评论: BV={bvid} state={state}"
             )
             return effective_aid, state
-        logger.info(f"B站影片尚未就绪 (state={state})，{bili_comment_ready_poll} 秒后重查 [{attempt}]: BV={bvid}")
+        logger.info(
+            f"B站影片尚未取得 aid (state={state})，{bili_comment_ready_poll} 秒后重查 [{attempt}]: BV={bvid}"
+        )
         time.sleep(bili_comment_ready_poll)
 
 
@@ -797,8 +804,11 @@ def schedule_delayed_bili_comments(bvid: str, meta: dict, aid: Optional[int],
 
     def _worker():
         try:
-            logger.info(f"开启B站评论发布守护线程: BV={bvid}，先轮询影片状态直至可评论...")
+            logger.info(f"开启B站评论发布守护线程: BV={bvid}，先轮询影片状态直至取得 aid...")
             effective_aid, _state = _wait_until_bili_commentable(bvid, aid)
+            if not effective_aid:
+                logger.warning(f"未能取得 aid，跳过看点评论发布: BV={bvid}")
+                return
 
             logger.info(
                 f"影片就绪后再等 {bili_comment_first_delay // 60} 分钟，让审核充分完成: BV={bvid}"
@@ -999,7 +1009,7 @@ def run_bili_session_job(job: dict) -> None:
                 gap_label = f"{bili_comment_gap_range[0] // 60}~{bili_comment_gap_range[1] // 60}"
                 comment_note = (
                     f"\n置顶评论: 后台已安排（共 {chunks_count} 条，"
-                    f"等待影片过审后再等 {bili_comment_first_delay // 60} 分钟发出第1条，"
+                    f"取得 aid 后再等 {bili_comment_first_delay // 60} 分钟发出第1条，"
                     f"首条失败即中止，后续每条间隔 {gap_label} 分钟随机）"
                 )
         content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
