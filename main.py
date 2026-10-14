@@ -1095,7 +1095,18 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
                         )
                         # 去掉 URL_config.ini 的「序号N」前綴，避免節點名變成「序号3 袁大帥哥布林族長」
                         display_name, _ = _resolve_streamer_type(record_name)
-                        doc_title = f"【{display_name}】{Path(md_path).stem}"
+                        # 標題優先採用轉寫 Markdown 的 H1（AI 提煉的標題）；
+                        # 用原始檔名（朱主名_日期_時間_NNN）當標題會毫無辨識度。
+                        stem = Path(md_path).stem
+                        ai_title = ""
+                        try:
+                            from src.md_to_html import extract_article_title
+                            ai_title = extract_article_title(md_path)
+                        except Exception as e:
+                            logger.warning(f"讀取轉寫標題失敗，改用檔名: {e}")
+                        date_m = re.search(r'(\d{4}-\d{2}-\d{2})', stem)
+                        date_str = date_m.group(1) if date_m else time.strftime('%Y-%m-%d')
+                        doc_title = f"{date_str}【{display_name}】{(ai_title or stem)[:50]}"
                         doc_url, _ = feishu_mgr.create_article_docx(
                             md_path, author=display_name, doc_title=doc_title
                         )

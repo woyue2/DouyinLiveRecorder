@@ -37,6 +37,10 @@ def test_live_transcription_archives_to_timeline_not_works_library():
     )
     # 主播節點名要去掉 URL_config.ini 的「序号N」前綴
     assert "display_name" in body and "_resolve_streamer_type" in body
+    # 標題要用 AI 提煉的 H1，而不是毫無辨識度的原始檔名
+    assert "extract_article_title" in body, (
+        "直播轉寫文檔標題應取 Markdown 的 H1（AI 提煉標題），不可直接用檔名"
+    )
 
 
 def test_work_monitors_archive_to_works_library():
