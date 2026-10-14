@@ -491,6 +491,28 @@ class DouyinVideoMonitor:
             logger.error(f"釘釘推送失敗: {res.get('error')}")
         return success
 
+    @staticmethod
+    def trigger_baidu_upload(script_path: str = "upload_baidu.sh") -> bool:
+        """呼叫現有 upload_baidu.sh 執行百度雲上傳與本地校驗清理"""
+        if not os.path.exists(script_path):
+            logger.warning(f"百度雲上傳腳本不存在: {script_path}，將由伺服器 cron 定時上傳")
+            return False
+
+        logger.info(f"開始觸發百度網盤上傳: bash {script_path}")
+        try:
+            ret = subprocess.run(
+                ["bash", script_path], capture_output=True, text=True,
+                errors="ignore", timeout=1800,
+            )
+            if ret.returncode == 0:
+                logger.info("百度網盤上傳腳本執行完畢")
+                return True
+            logger.warning(f"百度網盤上傳腳本異常: {ret.stderr[:200]}")
+            return False
+        except Exception as e:
+            logger.error(f"呼叫百度網盤上傳失敗: {e}")
+            return False
+
 
 def cleanup_expired_web_posts(posts_dir: str, retention_days: int = 30):
     """清理過期的 Web HTML 檔案 (預設保留 30 天)"""
@@ -508,25 +530,6 @@ def cleanup_expired_web_posts(posts_dir: str, retention_days: int = 30):
             except OSError:
                 pass
 
-    @staticmethod
-    def trigger_baidu_upload(script_path: str = "upload_baidu.sh") -> bool:
-        """呼叫現有 upload_baidu.sh 執行百度雲上傳與本地校驗清理"""
-        if not os.path.exists(script_path):
-            logger.warning(f"百度雲上傳腳本不存在: {script_path}，將由伺服器 cron 定時上傳")
-            return False
-
-        logger.info(f"開始觸發百度網盤上傳: bash {script_path}")
-        try:
-            ret = subprocess.run(["bash", script_path], capture_output=True, text=True, timeout=1800)
-            if ret.returncode == 0:
-                logger.info("百度網盤上傳腳本執行完畢")
-                return True
-            else:
-                logger.warning(f"百度網盤上傳腳本異常: {ret.stderr[:200]}")
-                return False
-        except Exception as e:
-            logger.error(f"呼叫百度網盤上傳失敗: {e}")
-            return False
 
 
 def load_history(filepath: str) -> set:

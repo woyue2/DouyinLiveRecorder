@@ -756,10 +756,13 @@ def _rate_limit_notice(record_name: str) -> str:
 
 
 def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
-                            ts_paths: Optional[list] = None) -> tuple[Optional[str], str]:
+                            start_times: Optional[list] = None) -> tuple[Optional[str], str]:
     """把直播分P看点整理成「直播时间轴」飞书文档。
 
     归档到「直播时间轴」节点下、以主播命名的子节点中（与其他主播并排）。
+    start_times 必须由调用方在**清理本地 TS 之前**算好并传入：上传成功后主流程
+    会立刻删除 TS（策略「仅百度云上传md(删除ts)」），若此处才去 ffprobe，
+    檔案已不存在，所有时间戳都会退化成 00:00。
     返回 (飞书文档链接, 说明文字)；失败时链接为 None。
     """
     parts = meta.get("parts") or []
@@ -768,13 +771,12 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
     if not (feishu_doc_enabled and feishu_app_id and feishu_app_secret and bili_timeline_node):
         return None, "未配置飞书时间轴知识库"
 
-    start_times = compute_part_start_times(ts_paths) if ts_paths else None
     upload_date = time.strftime("%Y-%m-%d")
     md = build_parts_timeline_markdown(
         parts, record_name=record_name, upload_date=upload_date, start_times=start_times
     )
 
-    tmp_path = os.path.join("/tmp", f"bili_timeline_{int(time.time())}.md")
+    tmp_path = os.path.join("/tmp", f"bili_timeline_{os.getpid()}_{int(time.time() * 1000)}.md")
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(md)
@@ -801,14 +803,15 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
 
 
 def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
-                           ts_paths: Optional[list] = None) -> None:
+                           start_times: Optional[list] = None) -> None:
     """后台线程：生成直播时间轴飞书文档并推送钉钉通知。
 
+    start_times 需由调用方在清理本地 TS 之前算好（见 build_bili_timeline_doc 说明）。
     注意：本流程完全不涉及 B 站评论（帳號權限受限，評論會被靜默丟棄）。
     """
     def _worker():
         try:
-            url, err = build_bili_timeline_doc(meta, record_name, clean_name, ts_paths)
+            url, err = build_bili_timeline_doc(meta, record_name, clean_name, start_times)
             if url:
                 logger.info(f"直播时间轴飞书文档已生成: {url}")
                 try:
@@ -953,8 +956,16 @@ def run_bili_session_job(job: dict) -> None:
         bvid = bvid_match.group(0) if bvid_match else "已提交"
         timeline_note = ""
         if bili_timeline_enabled and (meta.get("parts") or []):
+            # 必須在 handle_post_upload_cleanup 刪除 TS 之前算好分P時間戳：
+            # 清理策略會移除本地 TS，事後才 ffprobe 會讀不到檔案，
+            # 導致所有分P起始時間退化成 00:00。
+            try:
+                _seg_fallback = int(str(split_time).strip())
+            except Exception:
+                _seg_fallback = 0
+            start_times = compute_part_start_times(valid_ts_paths, fallback_seconds=_seg_fallback)
             # 生成飞书「直播时间轴」文档（不含任何 B 站评论操作）
-            schedule_bili_timeline(meta, record_name, clean_name, valid_ts_paths)
+            schedule_bili_timeline(meta, record_name, clean_name, start_times)
             timeline_note = "\n直播时间轴: 后台生成飞书文档中（完成后推送链接）"
         content = (f"[B站整场多P投稿成功{vis_label}] {record_name}\n"
                    f"标题: {meta['title']}\n"
