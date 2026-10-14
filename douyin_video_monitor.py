@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import json
+import random
 import logging
 import argparse
 import datetime
@@ -51,6 +52,10 @@ DEFAULT_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+# 防風控節流（秒）：與小紅書採用同一套紀律，避免短時間內連續請求被平台識別為爬蟲
+BLOGGER_GAP_RANGE = (600, 900)   # 博主之間：至少 10 分鐘（隨機 10~15 分鐘）
+VIDEO_GAP_RANGE = (180, 300)     # 同一博主的作品之間：至少 3 分鐘（隨機 3~5 分鐘）
 
 
 def load_project_config() -> Dict[str, Any]:
@@ -363,7 +368,14 @@ class DouyinVideoMonitor:
             logger.info(f"MP3 提取完成: {mp3_path} ({os.path.getsize(mp3_path) / (1024 * 1024):.2f}MB)")
             return True
         except subprocess.CalledProcessError as e:
-            logger.error(f"ffmpeg 轉換失敗: {e.stderr.decode('utf-8', errors='ignore')}")
+            logger.error(f"ffmpeg 轉換失敗: {(e.stderr or b'').decode('utf-8', errors='ignore')}")
+            return False
+        except FileNotFoundError:
+            # 系統未安裝 ffmpeg：不可讓例外穿透，否則整批作品中止且不寫 history
+            logger.error("找不到 ffmpeg，無法提取 MP3（請先安裝 ffmpeg）")
+            return False
+        except Exception as e:
+            logger.error(f"提取 MP3 時發生未預期錯誤: {type(e).__name__}: {e}")
             return False
 
     @staticmethod
@@ -629,147 +641,159 @@ def process_blogger_videos(
         print(f"    時長: {v['duration_sec']:.1f}s")
         print("-" * 70)
 
-        if args.download and v["video_url"]:
-            if v["aweme_id"] in history:
-                continue
+        try:
+            # 單一作品失敗不得中斷其他作品，也不會漏寫 history
+            if args.download and v["video_url"]:
+                if v["aweme_id"] in history:
+                    continue
 
-            if args.max_download > 0 and downloaded_count >= args.max_download:
-                logger.info(f"達到本次下載數量上限 ({args.max_download})，停止下載")
-                break
+                if args.max_download > 0 and downloaded_count >= args.max_download:
+                    logger.info(f"達到本次下載數量上限 ({args.max_download})，停止下載")
+                    break
 
-            author_raw = custom_name or v["author"]
-            author_name = re.sub(r'[\s#\\/*?:"<>|]', "_", author_raw).strip("_") or "抖音博主"
-            safe_title = re.sub(r'[\s#\\/*?:"<>|]', "_", v["title"][:25]).strip("_") or v["aweme_id"]
-            date_prefix = v["publish_time"][:10].replace("-", "")
-            base_name = f"{date_prefix}_{safe_title}_{v['aweme_id']}"
+                # 同一博主的作品之間隨機延遲，避免連續請求形成爬蟲特徵
+                if downloaded_count > 0:
+                    gap = random.uniform(*VIDEO_GAP_RANGE)
+                    logger.info(f"防風控隨機延遲: 休眠 {gap / 60:.1f} 分鐘後處理下一部作品...")
+                    time.sleep(gap)
 
-            # 保存路徑：downloads/{作者名}_作品/xxx.mp4，上傳至百度雲時自動歸入 /live_audio/{作者名}_作品/，與直播目錄隔離
-            folder_name = f"{author_name}_作品"
-            target_dir = os.path.join(args.outdir, folder_name)
-            mp4_file = os.path.join(target_dir, f"{base_name}.mp4")
-            mp3_file = os.path.join(target_dir, f"{base_name}.mp3")
+                author_raw = custom_name or v["author"]
+                author_name = re.sub(r'[\s#\\/*?:"<>|]', "_", author_raw).strip("_") or "抖音博主"
+                safe_title = re.sub(r'[\s#\\/*?:"<>|]', "_", v["title"][:25]).strip("_") or v["aweme_id"]
+                date_prefix = v["publish_time"][:10].replace("-", "")
+                base_name = f"{date_prefix}_{safe_title}_{v['aweme_id']}"
 
-            # 1. 下載 MP4
-            success = False
-            if not os.path.exists(mp4_file) and not os.path.exists(mp3_file):
-                success = monitor.download_video(v["video_url"], mp4_file)
-            else:
-                if os.path.exists(mp3_file):
-                    logger.info(f"MP3 已存在，跳過下載 MP4: {mp3_file}")
-                    success = True
+                # 保存路徑：downloads/{作者名}_作品/xxx.mp4，上傳至百度雲時自動歸入 /live_audio/{作者名}_作品/，與直播目錄隔離
+                folder_name = f"{author_name}_作品"
+                target_dir = os.path.join(args.outdir, folder_name)
+                mp4_file = os.path.join(target_dir, f"{base_name}.mp4")
+                mp3_file = os.path.join(target_dir, f"{base_name}.mp3")
+
+                # 1. 下載 MP4
+                success = False
+                if not os.path.exists(mp4_file) and not os.path.exists(mp3_file):
+                    success = monitor.download_video(v["video_url"], mp4_file)
                 else:
-                    logger.info(f"MP4 已存在: {mp4_file}")
-                    success = True
+                    if os.path.exists(mp3_file):
+                        logger.info(f"MP3 已存在，跳過下載 MP4: {mp3_file}")
+                        success = True
+                    else:
+                        logger.info(f"MP4 已存在: {mp4_file}")
+                        success = True
 
-            if not success:
-                continue
+                if not success:
+                    continue
 
-            # 2. 提取 MP3
-            if args.extract_mp3 and not os.path.exists(mp3_file):
-                monitor.extract_mp3_from_mp4(mp4_file, mp3_file)
+                # 2. 提取 MP3
+                if args.extract_mp3 and not os.path.exists(mp3_file):
+                    monitor.extract_mp3_from_mp4(mp4_file, mp3_file)
 
-            # 依使用者需求：不保存視頻，提取出 MP3 後立即刪除 MP4（節省伺服器空間，百度雲僅備份 MP3 與 MD）
-            if not getattr(args, "keep_video", False) and os.path.exists(mp4_file) and os.path.exists(mp3_file):
-                try:
-                    os.remove(mp4_file)
-                    logger.info(f"已清理暫存 MP4 視頻，僅保留音訊與 Markdown: {mp4_file}")
-                except OSError as e:
-                    logger.warning(f"刪除 MP4 失敗: {e}")
+                # 依使用者需求：不保存視頻，提取出 MP3 後立即刪除 MP4（節省伺服器空間，百度雲僅備份 MP3 與 MD）
+                if not getattr(args, "keep_video", False) and os.path.exists(mp4_file) and os.path.exists(mp3_file):
+                    try:
+                        os.remove(mp4_file)
+                        logger.info(f"已清理暫存 MP4 視頻，僅保留音訊與 Markdown: {mp4_file}")
+                    except OSError as e:
+                        logger.warning(f"刪除 MP4 失敗: {e}")
 
-            # 3. 轉寫 MP3 -> MD (注意：傳遞絕對路徑給 transcribe_one.sh)
-            md_file = None
-            summary_text = ""
-            read_url = ""
-            feishu_url = ""
-            effective_title = v["title"]
-            if args.transcribe and os.path.exists(mp3_file):
-                if transcribe_script:
-                    abs_mp3_file = os.path.abspath(mp3_file)
-                    md_file = monitor.transcribe_mp3_to_md(abs_mp3_file, transcribe_script)
-                    if md_file:
-                        summary_text = monitor.extract_summary_from_md(md_file)
+                # 3. 轉寫 MP3 -> MD (注意：傳遞絕對路徑給 transcribe_one.sh)
+                md_file = None
+                summary_text = ""
+                read_url = ""
+                feishu_url = ""
+                effective_title = v["title"]
+                if args.transcribe and os.path.exists(mp3_file):
+                    if transcribe_script:
+                        abs_mp3_file = os.path.abspath(mp3_file)
+                        md_file = monitor.transcribe_mp3_to_md(abs_mp3_file, transcribe_script)
+                        if md_file:
+                            summary_text = monitor.extract_summary_from_md(md_file)
 
-                        # 標題優先採用 LLM 生成的標題；平台文案（常為純 hashtag）僅作回退
-                        try:
-                            from md_to_html import extract_article_title
-                            effective_title = extract_article_title(md_file) or v["title"]
-                        except Exception:
-                            effective_title = v["title"]
-
-                        # 3.1 生成手機版在線閱讀 HTML 網頁
-                        if config_settings.get("web_enabled", True):
+                            # 標題優先採用 LLM 生成的標題；平台文案（常為純 hashtag）僅作回退
                             try:
-                                from md_to_html import convert_md_file_to_html
-                                web_outdir = getattr(args, "web_outdir", "") or config_settings.get("web_outdir", "./web_posts")
-                                web_base_url = getattr(args, "web_base_url", "") or config_settings.get("web_base_url", "http://101.35.47.249:8080/posts").rstrip("/")
-                                html_path, html_filename = convert_md_file_to_html(
-                                    md_path=md_file,
-                                    output_dir=web_outdir,
-                                    author=author_name,
-                                    title=effective_title,
-                                    publish_time=v["publish_time"]
-                                )
-                                if html_path and html_filename:
-                                    logger.info(f"成功生成手機版 HTML 網頁: {html_path}")
-                                    quoted_filename = urllib.parse.quote(html_filename)
-                                    # 產生帶錨點的閱讀館門戶連結，點擊直達並支援側邊欄切換
-                                    read_url = f"{web_base_url}/index.html#/{quoted_filename}"
+                                from md_to_html import extract_article_title
+                                effective_title = extract_article_title(md_file) or v["title"]
+                            except Exception:
+                                effective_title = v["title"]
 
-                                    # 3.2 刷新閱讀館門戶與二級側邊欄索引
-                                    try:
-                                        from web_portal import update_portal
-                                        update_portal(web_outdir)
-                                    except Exception as pe:
-                                        logger.warning(f"刷新閱讀館門戶索引失敗: {pe}")
+                            # 3.1 生成手機版在線閱讀 HTML 網頁
+                            if config_settings.get("web_enabled", True):
+                                try:
+                                    from md_to_html import convert_md_file_to_html
+                                    web_outdir = getattr(args, "web_outdir", "") or config_settings.get("web_outdir", "./web_posts")
+                                    web_base_url = getattr(args, "web_base_url", "") or config_settings.get("web_base_url", "http://101.35.47.249:8080/posts").rstrip("/")
+                                    html_path, html_filename = convert_md_file_to_html(
+                                        md_path=md_file,
+                                        output_dir=web_outdir,
+                                        author=author_name,
+                                        title=effective_title,
+                                        publish_time=v["publish_time"]
+                                    )
+                                    if html_path and html_filename:
+                                        logger.info(f"成功生成手機版 HTML 網頁: {html_path}")
+                                        quoted_filename = urllib.parse.quote(html_filename)
+                                        # 產生帶錨點的閱讀館門戶連結，點擊直達並支援側邊欄切換
+                                        read_url = f"{web_base_url}/index.html#/{quoted_filename}"
 
-                                    cleanup_expired_web_posts(web_outdir, config_settings.get("web_retention_days", 30))
-                            except Exception as e:
-                                logger.error(f"生成 HTML 網頁異常: {e}")
+                                        # 先清理過期網頁再刷新門戶索引：
+                                        # 反之 index.html 會列出剛被刪除的文章，產生死連結
+                                        cleanup_expired_web_posts(web_outdir, config_settings.get("web_retention_days", 30))
 
-                        # 3.2 匯入飛書雲文檔 (Feishu Docx)
-                        if config_settings.get("feishu_enabled", True) and config_settings.get("feishu_app_id"):
-                            try:
-                                from feishu_uploader import FeishuDocManager
-                                feishu_mgr = FeishuDocManager(
-                                    app_id=config_settings.get("feishu_app_id", ""),
-                                    app_secret=config_settings.get("feishu_app_secret", ""),
-                                    folder_token=config_settings.get("feishu_folder_token", ""),
-                                    wiki_space_id=config_settings.get("feishu_wiki_space_id", ""),
-                                    wiki_root_node=config_settings.get("feishu_wiki_root_node", ""),
-                                    wiki_domain=config_settings.get("feishu_wiki_domain", "my.feishu.cn"),
-                                )
-                                doc_title = f"{v['publish_time'][:10]}【{author_name}】{effective_title[:30]}"
-                                # 建立文檔並歸檔至該主播的飛書知識庫節點（未啟用知識庫時落在雲空間子資料夾）
-                                doc_url, doc_token = feishu_mgr.create_article_docx(
-                                    md_file, author=author_name, doc_title=doc_title
-                                )
-                                if doc_url:
-                                    feishu_url = doc_url
-                                    logger.info(f"成功創建飛書雲文檔: {feishu_url}")
-                            except Exception as fe:
-                                logger.error(f"創建飛書雲文檔異常: {fe}")
-                else:
-                    logger.info("未配置轉寫腳本路徑，跳過本機轉寫 (若在伺服器上會由後台處理)")
+                                        # 3.2 刷新閱讀館門戶與二級側邊欄索引
+                                        try:
+                                            from web_portal import update_portal
+                                            update_portal(web_outdir)
+                                        except Exception as pe:
+                                            logger.warning(f"刷新閱讀館門戶索引失敗: {pe}")
+                                except Exception as e:
+                                    logger.error(f"生成 HTML 網頁異常: {e}")
 
-            # 4. 釘釘推送
-            if args.notify_dingtalk and dingtalk_webhook:
-                monitor.send_dingtalk_notification(
-                    webhook=dingtalk_webhook,
-                    author=author_name,
-                    title=effective_title,
-                    publish_time=v["publish_time"],
-                    mp3_name=os.path.basename(mp3_file),
-                    summary=summary_text,
-                    read_url=read_url,
-                    feishu_url=feishu_url,
-                    phone=dingtalk_phone,
-                    is_atall=dingtalk_is_atall
-                )
+                            # 3.2 匯入飛書雲文檔 (Feishu Docx)
+                            if config_settings.get("feishu_enabled", True) and config_settings.get("feishu_app_id"):
+                                try:
+                                    from feishu_uploader import FeishuDocManager
+                                    feishu_mgr = FeishuDocManager(
+                                        app_id=config_settings.get("feishu_app_id", ""),
+                                        app_secret=config_settings.get("feishu_app_secret", ""),
+                                        folder_token=config_settings.get("feishu_folder_token", ""),
+                                        wiki_space_id=config_settings.get("feishu_wiki_space_id", ""),
+                                        wiki_root_node=config_settings.get("feishu_wiki_root_node", ""),
+                                        wiki_domain=config_settings.get("feishu_wiki_domain", "my.feishu.cn"),
+                                    )
+                                    doc_title = f"{v['publish_time'][:10]}【{author_name}】{effective_title[:30]}"
+                                    # 建立文檔並歸檔至該主播的飛書知識庫節點（未啟用知識庫時落在雲空間子資料夾）
+                                    doc_url, doc_token = feishu_mgr.create_article_docx(
+                                        md_file, author=author_name, doc_title=doc_title
+                                    )
+                                    if doc_url:
+                                        feishu_url = doc_url
+                                        logger.info(f"成功創建飛書雲文檔: {feishu_url}")
+                                except Exception as fe:
+                                    logger.error(f"創建飛書雲文檔異常: {fe}")
+                    else:
+                        logger.info("未配置轉寫腳本路徑，跳過本機轉寫 (若在伺服器上會由後台處理)")
 
-            # 5. 寫入去重歷史
-            history.add(v["aweme_id"])
-            save_history(args.history_file, history)
-            downloaded_count += 1
+                # 4. 釘釘推送
+                if args.notify_dingtalk and dingtalk_webhook:
+                    monitor.send_dingtalk_notification(
+                        webhook=dingtalk_webhook,
+                        author=author_name,
+                        title=effective_title,
+                        publish_time=v["publish_time"],
+                        mp3_name=os.path.basename(mp3_file),
+                        summary=summary_text,
+                        read_url=read_url,
+                        feishu_url=feishu_url,
+                        phone=dingtalk_phone,
+                        is_atall=dingtalk_is_atall
+                    )
+
+                # 5. 寫入去重歷史
+                history.add(v["aweme_id"])
+                save_history(args.history_file, history)
+                downloaded_count += 1
+        except Exception as e:
+            logger.error(f"處理作品 {v.get('aweme_id')} 時發生未預期異常，跳過該作品: {type(e).__name__}: {e}")
 
     return downloaded_count
 
@@ -787,9 +811,19 @@ def process_monitor_once(args, monitor: DouyinVideoMonitor, config_settings: Dic
             return
 
     total_downloaded = 0
-    for t in targets:
-        count = process_blogger_videos(t["url"], t["name"], args, monitor, config_settings)
-        total_downloaded += count
+    for t_idx, t in enumerate(targets):
+        # 博主之間隨機延遲，避免多博主背靠背請求形成爬蟲特徵
+        if t_idx > 0:
+            gap = random.uniform(*BLOGGER_GAP_RANGE)
+            logger.info(f"防風控隨機延遲: 休眠 {gap / 60:.1f} 分鐘後檢查下一位博主...")
+            time.sleep(gap)
+        try:
+            total_downloaded += process_blogger_videos(
+                t["url"], t["name"], args, monitor, config_settings
+            )
+        except Exception as e:
+            # 單一博主失敗不得中斷其他博主
+            logger.error(f"檢查博主 {t.get('url')} 時發生未預期異常，跳過該博主: {e}")
 
     # 觸發百度網盤上傳 (若有新作品下載)
     if args.upload_baidu and total_downloaded > 0:
@@ -810,7 +844,10 @@ def main():
     parser.add_argument("--transcribe", action="store_true", default=True, help="提取音頻後呼叫腳本轉寫為 MD")
     parser.add_argument("--notify-dingtalk", action="store_true", default=True, help="轉寫完成後推送釘釘看點通知")
     parser.add_argument("--upload-baidu", action="store_true", help="主動觸發 upload_baidu.sh 上傳")
-    parser.add_argument("--max-download", type=int, default=0, help="限制本次最多下載部數 (0 表示無限制)")
+    parser.add_argument(
+        "--max-download", type=int, default=5,
+        help="限制單次每位博主最多下載部數（預設 5；0 表示無限制）。未下載的會留待下次巡檢，不會遺漏"
+    )
     parser.add_argument("--outdir", type=str, default="./downloads", help="下載保存目錄")
     parser.add_argument("--history-file", type=str, default="./downloads/download_history.json", help="去重歷史紀錄檔案")
     parser.add_argument("--transcribe-script", type=str, default="", help="指定轉寫腳本路徑")

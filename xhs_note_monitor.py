@@ -238,20 +238,30 @@ class XhsNoteMonitor:
         if "Verifyuuid" in response.headers or "verify" in response.headers.get("Content-Type", ""):
             raise XhsRiskControlError(f"響應頭出現驗證碼攔截標記: {response.headers.get('Verifyuuid')}")
 
-        # 3. 業務狀態碼檢查
+        # 3. 伺服器拒絕或頻率超限
+        if response.status_code in (403, 429):
+            raise XhsRiskControlError(f"伺服器拒絕訪問或頻率超限 (HTTP {response.status_code})")
+
+        # 4. 業務狀態碼檢查
         if response.status_code == 200:
             try:
                 data = response.json()
-                code = data.get("code")
-                msg = str(data.get("msg", ""))
-                # 300012: 訪問過於頻繁; 300015: 風控攔截; -100: 登入態失效
-                if code in (300012, 300015) or "频繁" in msg or "验证" in msg or "风控" in msg:
-                    raise XhsRiskControlError(f"業務接口回傳風控阻斷: code={code}, msg={msg}")
             except Exception:
-                pass
+                # 200 卻回非 JSON，通常是 HTML 攔截頁/驗證頁的軟攔截。
+                # 不可靜默放行，否則帳號失效或風控會被當成「本次無新內容」。
+                snippet = (response.text or "")[:120].replace("\n", " ").strip()
+                raise XhsRiskControlError(f"回應非 JSON（疑似驗證頁或攔截頁）: {snippet}")
 
-        if response.status_code in (403, 429):
-            raise XhsRiskControlError(f"伺服器拒絕訪問或頻率超限 (HTTP {response.status_code})")
+            code = data.get("code")
+            msg = str(data.get("msg", ""))
+
+            # -100：登入態失效（Cookie 過期或被登出），需人工更新，不可靜默忽略
+            if code == -100:
+                raise XhsRiskControlError(f"小紅書登入態失效 (code=-100, msg={msg})，請更新 Cookie")
+
+            # 300012: 訪問過於頻繁; 300015: 風控攔截
+            if code in (300012, 300015) or "频繁" in msg or "验证" in msg or "风控" in msg:
+                raise XhsRiskControlError(f"業務接口回傳風控阻斷: code={code}, msg={msg}")
 
     def parse_user_id(self, url: str) -> str:
         """從用戶個人主頁 URL 提取 user_id"""
