@@ -438,3 +438,37 @@ def test_chunk_session_meta_zero_limit_disables_splitting():
     chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 0)
     assert len(chunks) == 1
     assert chunks[0]["title"] == "整場高能合集"
+
+
+def test_merge_queue_job_appends_new_session():
+    q = [{"session_dir": "/a", "ts_paths": ["a1.ts"]}]
+    pos, deduped = bili_uploader.merge_queue_job(q, {"session_dir": "/b", "ts_paths": ["b1.ts"]})
+    assert (pos, deduped) == (2, False)
+    assert len(q) == 2
+
+
+def test_merge_queue_job_dedupes_same_session_and_updates_ts():
+    """斷流讓同一場次被重複入隊時，應原地更新 TS 清單，不新增一筆。"""
+    q = [
+        {"session_dir": "/a", "ts_paths": ["a1.ts"]},
+        {"session_dir": "/b", "ts_paths": ["b1.ts", "b2.ts"]},
+    ]
+    pos, deduped = bili_uploader.merge_queue_job(
+        q, {"session_dir": "/b", "ts_paths": ["b1.ts", "b2.ts", "b3.ts"], "reason": "最小投稿间隔"}
+    )
+    assert (pos, deduped) == (2, True)
+    assert len(q) == 2, "不應新增佇列項"
+    assert q[1]["ts_paths"] == ["b1.ts", "b2.ts", "b3.ts"], "應更新為最新 TS 清單"
+    assert "reason" not in q[1], "舊的等待原因應被清掉，避免沿用過期的等待秒數"
+
+
+def test_merge_queue_job_keeps_original_position_on_dedupe():
+    """去重時必須保持原本排位，不可被挪到隊尾。"""
+    q = [
+        {"session_dir": "/a", "ts_paths": ["a1.ts"]},
+        {"session_dir": "/b", "ts_paths": ["b1.ts"]},
+        {"session_dir": "/c", "ts_paths": ["c1.ts"]},
+    ]
+    pos, _ = bili_uploader.merge_queue_job(q, {"session_dir": "/a", "ts_paths": ["a1.ts", "a2.ts"]})
+    assert pos == 1
+    assert [j["session_dir"] for j in q] == ["/a", "/b", "/c"]

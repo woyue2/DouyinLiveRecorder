@@ -60,6 +60,7 @@ from src.bili_uploader import (
     build_parts_timeline_markdown,
     compute_part_start_times,
     chunk_session_meta,
+    merge_queue_job,
     build_part_links,
     cleanup_part_links,
     get_video_status,
@@ -622,12 +623,17 @@ def mark_bili_submitted() -> None:
 
 
 def enqueue_bili_job(job: dict) -> None:
-    """将待投稿任务加入队列，由后台线程按最小间隔依次提交。"""
+    """将待投稿任务加入队列，由后台线程按最小间隔依次提交。
+
+    按 session_dir 去重：断流会让录制在同一 base_name 下反复结束又续接，导致同一
+    个场次被重复入队。若不去重，每多出的一笔都会白占一个「最小投稿间隔」时段，
+    而先跑成功的那笔已把本地 TS 删掉，后续几笔只能空跑。
+    """
     with bili_queue_lock:
-        bili_pending_queue.append(job)
-        position = len(bili_pending_queue)
+        position, deduped = merge_queue_job(bili_pending_queue, job)
     _save_bili_queue()
-    logger.info(f"B站投稿已入队（队列第 {position} 位）: {job.get('record_name')}")
+    action = "已更新队列中的同场次任务" if deduped else "已进入待投稿队列"
+    logger.info(f"B站投稿{action}（队列第 {position} 位）: {job.get('record_name')}")
     try:
         raw_name = job.get("record_name", "B站投稿")
         clean_name = raw_name.split(" ", 1)[-1].strip()
@@ -638,7 +644,7 @@ def enqueue_bili_job(job: dict) -> None:
         push_message(
             raw_name,
             "",
-            f"[B站投稿排队] 【{clean_name}】场次《{session_time}》{part_info}已进入待投稿队列"
+            f"[B站投稿排队] 【{clean_name}】场次《{session_time}》{part_info}{action}"
             f"（第 {position} 位）。新号限制每 6 小时仅可投稿一次，"
             f"视频全程加锁保护，不会被删除或上传网盘。",
         )

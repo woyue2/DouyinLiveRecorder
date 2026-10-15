@@ -337,6 +337,27 @@ def extract_session_bili_metadata(
     }
 
 
+def merge_queue_job(queue: list, job: dict) -> tuple:
+    """把待投稿任务并入队列，按 session_dir 去重。
+
+    断流会让录制在同一 base_name 下反复结束又续接，导致同一个场次被重复入队。
+    重复的每一笔都会白占一个「最小投稿间隔」时段，而先跑成功的那笔已删除本地 TS，
+    后续几笔只能空跑。这里改为原地更新既有任务的 TS 清单，保持原有排位。
+
+    Returns:
+        (该任务在队列中的 1-based 位置, 是否为去重更新)
+    """
+    session_dir = job.get("session_dir", "")
+    for i, existing in enumerate(queue):
+        if existing.get("session_dir") == session_dir:
+            existing["ts_paths"] = job.get("ts_paths", existing.get("ts_paths", []))
+            existing.pop("wait_seconds", None)
+            existing.pop("reason", None)
+            return i + 1, True
+    queue.append(job)
+    return len(queue), False
+
+
 def chunk_session_meta(meta: dict, ts_paths: list, max_parts: int) -> list:
     """把整场直播切成多份稿件（超时保护），每份重排分P编号并加 1/2/3 标题后缀。
 
