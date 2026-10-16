@@ -108,20 +108,21 @@ def test_feishu_markdown_without_transcript_arg():
     assert "cover.jpg" in md and "笔记正文" in md
 
 
-def test_process_video_note_returns_none_when_download_fails(tmp_path):
+def test_process_video_note_returns_false_flag_when_download_fails(tmp_path):
     class StubMonitor:
         def download_video(self, url, path):
             return False
 
     detail = dict(DETAIL, video_url="https://v.example/a.mp4")
-    result = xhs.process_video_note(
+    md_path, download_ok = xhs.process_video_note(
         StubMonitor(), detail, "文主任", "標題", "nid1", str(tmp_path), "/bin/true"
     )
-    assert result is None
+    assert md_path is None
+    assert download_ok is False
 
 
-def test_process_video_note_returns_none_without_transcribe_script(monkeypatch, tmp_path):
-    """下載與抽音成功但未配置轉寫腳本時，不應崩潰，回傳 None。"""
+def test_process_video_note_returns_true_flag_without_transcribe_script(monkeypatch, tmp_path):
+    """下載與抽音成功但未配置轉寫腳本時，回傳 (None, True)，代表下載成功可安全降級。"""
     douyin = _load("douyin_video_monitor", ROOT / "douyin_video_monitor.py")
 
     class StubMonitor:
@@ -136,10 +137,44 @@ def test_process_video_note_returns_none_without_transcribe_script(monkeypatch, 
                         staticmethod(lambda mp3, s: str(mp3) + ".md"))
 
     detail = dict(DETAIL, video_url="https://v.example/a.mp4")
-    result = xhs.process_video_note(
+    md_path, download_ok = xhs.process_video_note(
         StubMonitor(), detail, "文主任", "標題", "nid2", str(tmp_path), ""
     )
-    assert result is None
+    assert md_path is None
+    assert download_ok is True
     # 影片本體在抽出音訊後應被刪除
     media_dir = tmp_path / "文主任_作品"
     assert not list(media_dir.glob("*.mp4"))
+
+
+def test_download_video_retries_on_failure(monkeypatch, tmp_path):
+    """遇到網路抖動時重試，第 2 次成功應視為成功。"""
+    attempts = 0
+
+    class DummyResponse:
+        headers = {"content-length": "4"}
+        def raise_for_status(self): pass
+        def iter_bytes(self, chunk_size=65536):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise IOError("RemoteProtocolError: connection reset")
+            return [b"test"]
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+
+    class DummyClient:
+        headers = {}
+        def stream(self, method, url, headers=None):
+            return DummyResponse()
+
+    monitor = xhs.XhsNoteMonitor()
+    monitor.client = DummyClient()
+    monkeypatch.setattr(xhs.time, "sleep", lambda s: None)
+
+    save_file = str(tmp_path / "out.mp4")
+    ok = monitor.download_video("https://fake.url/video.mp4", save_file, max_retries=2)
+    assert ok is True
+    assert attempts == 2
+    assert Path(save_file).read_bytes() == b"test"
+

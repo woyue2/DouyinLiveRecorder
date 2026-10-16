@@ -453,8 +453,13 @@ class XhsNoteMonitor:
             "note_type": card.get("type", "normal")
         }
 
-    def download_video(self, video_url: str, save_path: str) -> bool:
-        """下載小紅書視頻。小紅書 CDN 會檢查 Referer，缺少時回 403。"""
+    def download_video(self, video_url: str, save_path: str, max_retries: int = 2) -> bool:
+        """下載小紅書視頻。小紅書 CDN 會檢查 Referer，缺少時回 403。
+
+        CDN 下載為靜態資源（不走業務 API，不觸發帳號風控）。
+        長視頻下載容易因 CDN 網路抖動出現 RemoteProtocolError 等連線中斷，
+        故內建短線重試機制（預設最多 2 次）。
+        """
         if not video_url:
             logger.error("視頻下載連結為空")
             return False
@@ -466,39 +471,44 @@ class XhsNoteMonitor:
             "Referer": "https://www.xiaohongshu.com/",
         }
 
-        logger.info(f"開始下載視頻 -> {save_path}")
-        try:
-            with self.client.stream("GET", video_url, headers=headers) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("content-length", 0) or 0)
-                downloaded = 0
-                last_log = time.time()
-                with open(temp_path, "wb") as f:
-                    for chunk in r.iter_bytes(chunk_size=65536):
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if time.time() - last_log > 5:
-                            mb = downloaded / (1024 * 1024)
-                            if total > 0:
-                                logger.info(f"下載進度: {mb:.1f}MB / {total / (1024 * 1024):.1f}MB")
-                            else:
-                                logger.info(f"已下載: {mb:.1f}MB")
-                            last_log = time.time()
+        for attempt in range(1, max_retries + 1):
+            logger.info(f"開始下載視頻 (第 {attempt}/{max_retries} 次) -> {save_path}")
+            try:
+                with self.client.stream("GET", video_url, headers=headers) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("content-length", 0) or 0)
+                    downloaded = 0
+                    last_log = time.time()
+                    with open(temp_path, "wb") as f:
+                        for chunk in r.iter_bytes(chunk_size=65536):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if time.time() - last_log > 5:
+                                mb = downloaded / (1024 * 1024)
+                                if total > 0:
+                                    logger.info(f"下載進度: {mb:.1f}MB / {total / (1024 * 1024):.1f}MB")
+                                else:
+                                    logger.info(f"已下載: {mb:.1f}MB")
+                                last_log = time.time()
 
-            if total > 0 and downloaded < total:
-                raise IOError(f"下載不完整：{downloaded}/{total} 位元組")
+                if total > 0 and downloaded < total:
+                    raise IOError(f"下載不完整：{downloaded}/{total} 位元組")
 
-            os.replace(temp_path, save_path)
-            logger.info(f"視頻下載完成: {save_path} ({os.path.getsize(save_path) / (1024 * 1024):.1f}MB)")
-            return True
-        except Exception as e:
-            logger.error(f"視頻下載失敗: {type(e).__name__}: {e}")
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-            return False
+                os.replace(temp_path, save_path)
+                logger.info(f"視頻下載完成: {save_path} ({os.path.getsize(save_path) / (1024 * 1024):.1f}MB)")
+                return True
+            except Exception as e:
+                logger.warning(f"視頻下載異常 (第 {attempt}/{max_retries} 次): {type(e).__name__}: {e}")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                if attempt < max_retries:
+                    time.sleep(2.0)
+
+        logger.error(f"視頻下載最終失敗 ({max_retries} 次重試均未成功): {save_path}")
+        return False
 
 
 def load_urls_from_config(config_file: str) -> List[Dict[str, str]]:
@@ -573,10 +583,14 @@ def render_photo_note_html(
 
 
 def process_video_note(monitor, detail: Dict[str, Any], author_name: str, title: str,
-                       note_id: str, outdir: str, transcribe_script: str) -> Optional[str]:
-    """影片筆記：下載視頻 → 抽 MP3 → 轉寫為 Markdown，回傳 md 路徑（任一步失敗回 None）。
+                       note_id: str, outdir: str, transcribe_script: str) -> Tuple[Optional[str], bool]:
+    """影片筆記：下載視頻 → 抽 MP3 → 轉寫為 Markdown。
 
-    與抖音作品走同一條鏈路；提取出 MP3 後即刪除 MP4（不保留視頻本體，節省空間）。
+    回傳 (transcript_md_path, download_ok)：
+    - 若影片下載或抽音訊失敗：回傳 (None, False)。呼叫端應中斷本篇處理，不發降級
+      文檔，也不記入 history，留待下次巡檢重試（避免長視頻因 CDN 抖動被降級廢棄）。
+    - 若音訊下載提取成功：回傳 (md_path, True)；即便音訊過短/無人聲導致轉寫失敗，
+      md_path 雖為 None 但 download_ok 仍為 True，可安全降級以文案備份，不反覆重試。
     """
     from douyin_video_monitor import DouyinVideoMonitor
 
@@ -590,10 +604,10 @@ def process_video_note(monitor, detail: Dict[str, Any], author_name: str, title:
     mp3_path = os.path.join(media_dir, base + ".mp3")
 
     if not monitor.download_video(detail["video_url"], mp4_path):
-        return None
+        return None, False
 
     if not DouyinVideoMonitor.extract_mp3_from_mp4(mp4_path, mp3_path):
-        return None
+        return None, False
 
     # 不保留視頻本體：與抖音作品一致，僅留 MP3 與 Markdown 供後續備份
     if os.path.exists(mp4_path):
@@ -605,9 +619,10 @@ def process_video_note(monitor, detail: Dict[str, Any], author_name: str, title:
 
     if not transcribe_script:
         logger.warning("未配置 [录制设置] mp3转写md脚本路径，跳過影片轉寫")
-        return None
+        return None, True
 
-    return DouyinVideoMonitor.transcribe_mp3_to_md(os.path.abspath(mp3_path), transcribe_script)
+    md_path = DouyinVideoMonitor.transcribe_mp3_to_md(os.path.abspath(mp3_path), transcribe_script)
+    return md_path, True
 
 
 def build_note_feishu_markdown(detail: Dict[str, Any], author_name: str, title: str,
@@ -826,12 +841,20 @@ def process_monitor_once(
                 # 影片筆記：下載 → 抽 MP3 → 轉寫 → Markdown（與抖音作品同一條鏈路）
                 transcript_md_path = None
                 if detail["note_type"] == "video" and detail.get("video_url"):
-                    transcript_md_path = process_video_note(
+                    transcript_md_path, download_ok = process_video_note(
                         monitor, detail, author_name, title, note_id, outdir, transcribe_script
                     )
+                    if not download_ok:
+                        # 視頻下載失敗（CDN 網路抖動等）：堅決不降級發送半成品，不記入歷史，
+                        # 留待下次巡檢自動重試，避免重要長視頻被永久廢棄！
+                        logger.warning(
+                            f"影片下載失敗（可能為 CDN 短暫抖動），跳過本次處理且不記入歷史，留待下次巡檢重試: 【{author_name}】{title}"
+                        )
+                        continue
+
                     if not transcript_md_path:
                         logger.warning(
-                            f"影片轉寫未完成，飛書文檔將改以封面與文案生成: {title[:30]}"
+                            f"影片轉寫未完成（音訊無人聲或極短），飛書文檔將安全降級以封面與文案生成: {title[:30]}"
                         )
 
                 # 生成飛書雲文檔（影片有逐字稿則用逐字稿；否則用標題、正文與配圖）
