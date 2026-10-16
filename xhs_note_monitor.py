@@ -46,6 +46,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("XhsNoteMonitor")
 
+# note_id 前 8 位十六進位為建立時間戳；早於此時間視為解析失敗（不會是小紅書真實貼文）
+_NOTE_ID_TS_MIN = 1577808000.0   # 2020-01-01 00:00:00 UTC+8
+
 
 class XhsRiskControlError(Exception):
     """小紅書風控/人機驗證碼阻斷異常"""
@@ -637,6 +640,36 @@ def build_note_doc_title(publish_time: str, author: str, note_title: str,
     return f"{publish_time[:10]}【{author}】{topic[:40]}"
 
 
+def note_id_timestamp(note_id: str) -> Optional[float]:
+    """由小紅書 note_id 解出建立時間（秒）。
+
+    note_id 前 8 位十六進位即 Unix 時間戳，已用 15 篇已下載紀錄驗證 15/15 相符
+    （例：6ad06ef7… → 2026-10-15 14:13）。因此判斷筆記新舊**不需要**抓詳情。
+
+    解不出來或不合理時回傳 None，交由呼叫方照常處理——寧可多抓一篇，
+    也不可在小紅書改動 ID 格式後把新筆記靜默濾掉。
+    """
+    if not note_id or len(note_id) < 8:
+        return None
+    try:
+        ts = float(int(note_id[:8], 16))
+    except (ValueError, TypeError):
+        return None
+    if ts < _NOTE_ID_TS_MIN or ts > time.time() + 86400:
+        return None                    # 格式變更或時鐘異常 → 不判斷
+    return ts
+
+
+def is_note_out_of_window(note_id: str, since_days: float) -> bool:
+    """筆記是否已超出時間窗口。since_days <= 0 或解不出日期時回傳 False（不限制）。"""
+    if not since_days or since_days <= 0:
+        return False
+    ts = note_id_timestamp(note_id)
+    if ts is None:
+        return False
+    return ts < time.time() - since_days * 86400
+
+
 def load_history(filepath: str) -> set:
     if os.path.exists(filepath):
         try:
@@ -709,11 +742,20 @@ def process_monitor_once(
             logger.info(f"取得作品筆記清單: {len(notes)} 篇")
 
             max_new = getattr(args, "max_new", 0) or 0
+            since_days = getattr(args, "days", 1.5)
             processed_this_author = 0
+            skipped_old = 0
 
             for n in notes:
                 note_id = n["note_id"]
                 if not note_id or note_id in history:
+                    continue
+
+                # 超出時間窗口的舊筆記直接跳過。note_id 自帶建立時間，判斷不需抓詳情，
+                # 所以跳過是零成本的：不發請求、不 sleep、也不佔 max_new 額度。
+                # 沒有這道過濾時，新增博主會沿著歷史往回抓（實際發生過抓到 200 天前）。
+                if is_note_out_of_window(note_id, since_days):
+                    skipped_old += 1
                     continue
 
                 # 限制單次每位博主最多處理幾篇新筆記；未處理的留待下次巡檢
@@ -832,6 +874,12 @@ def process_monitor_once(
                 save_history(args.history_file, history)
                 processed_this_author += 1
 
+            if skipped_old:
+                logger.info(
+                    f"略過 {skipped_old} 篇超出 {since_days} 天窗口的舊筆記（不抓詳情、不佔額度）: "
+                    f"【{custom_name or user_id}】"
+                )
+
         except XhsRiskControlError as rce:
             # 捕獲風控異常，立即激活 24 小時冷卻熔斷
             cooldown_mgr.activate_cooldown(
@@ -855,6 +903,11 @@ def main():
     parser.add_argument(
         "--max-new", type=int, default=0,
         help="單次每位博主最多處理幾篇新筆記 (0 表示不限制)；未處理的留待下次巡檢，不會遺漏"
+    )
+    parser.add_argument(
+        "--days", type=float, default=1.5,
+        help="只處理過去幾天內發布的筆記 (預設 1.5 天 = 36 小時)；0 表示不限制。"
+             "舊筆記由 note_id 自帶的時間戳判斷，不需抓詳情即可跳過"
     )
     parser.add_argument("--history-file", type=str, default="./downloads/xhs_download_history.json", help="去重歷史紀錄檔案")
     parser.add_argument("--outdir", type=str, default="./downloads", help="影片/音訊保存目錄（影片筆記轉寫用）")
