@@ -526,6 +526,23 @@ class DouyinVideoMonitor:
             return False
 
 
+def sanitize_filename_part(text: str, max_len: int = 25) -> str:
+    """清洗檔名片段：徹底過濾 Emoji、高位 Unicode 符號與檔案系統非法字元。
+
+    百度網盤 PCS API（bypy）在檔名包含 Emoji（例如 🔥、💡 等 4 位元組字符）
+    或特殊標點時會拒絕建立並報 Error 31062 (file name is invalid)。
+    """
+    if not text:
+        return ""
+    clean = re.sub(
+        r'[\U00010000-\U0010ffff]|[☀-➿]|[︀-️]',
+        '',
+        text
+    )
+    clean = re.sub(r'[\s#\\/*?:"<>|`~$\^&%!\'\"]', '_', clean[:max_len]).strip('_')
+    return clean
+
+
 def cleanup_expired_web_posts(posts_dir: str, retention_days: int = 30):
     """清理過期的 Web HTML 檔案 (預設保留 30 天)"""
     if not os.path.exists(posts_dir) or retention_days <= 0:
@@ -658,8 +675,8 @@ def process_blogger_videos(
                     time.sleep(gap)
 
                 author_raw = custom_name or v["author"]
-                author_name = re.sub(r'[\s#\\/*?:"<>|]', "_", author_raw).strip("_") or "抖音博主"
-                safe_title = re.sub(r'[\s#\\/*?:"<>|]', "_", v["title"][:25]).strip("_") or v["aweme_id"]
+                author_name = sanitize_filename_part(author_raw, max_len=20) or "抖音博主"
+                safe_title = sanitize_filename_part(v["title"], max_len=25) or v["aweme_id"]
                 date_prefix = v["publish_time"][:10].replace("-", "")
                 base_name = f"{date_prefix}_{safe_title}_{v['aweme_id']}"
 

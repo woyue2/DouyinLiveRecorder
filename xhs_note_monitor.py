@@ -204,6 +204,25 @@ def load_project_config() -> Dict[str, Any]:
     return settings
 
 
+def sanitize_filename_part(text: str, max_len: int = 25) -> str:
+    """清洗檔名片段：徹底過濾 Emoji、高位 Unicode 符號與檔案系統非法字元。
+
+    百度網盤 PCS API（bypy）在檔名包含 Emoji（例如 🔥、💡 等 4 位元組字符）
+    或部分特殊標點時會拒絕建立並報 Error 31062 (file name is invalid)。
+    """
+    if not text:
+        return ""
+    # 移除 4 位元組 Emoji 及特殊符號區段（包括雜項符號、裝飾符號、變化選擇器等）
+    clean = re.sub(
+        r'[\U00010000-\U0010ffff]|[☀-➿]|[︀-️]',
+        '',
+        text
+    )
+    # 替換檔案系統非法字元、空白及特殊符號
+    clean = re.sub(r'[\s#\\/*?:"<>|`~$\^&%!\'\"]', '_', clean[:max_len]).strip('_')
+    return clean
+
+
 def extract_note_video_url(card: Dict[str, Any]) -> str:
     """從 note_card 取出可下載的視頻連結。
 
@@ -561,10 +580,11 @@ def process_video_note(monitor, detail: Dict[str, Any], author_name: str, title:
     """
     from douyin_video_monitor import DouyinVideoMonitor
 
-    media_dir = os.path.join(outdir, f"{author_name}_作品")
+    safe_author = sanitize_filename_part(author_name, max_len=20) or "小紅書博主"
+    media_dir = os.path.join(outdir, f"{safe_author}_作品")
     os.makedirs(media_dir, exist_ok=True)
     date_prefix = detail["publish_time"][:10].replace("-", "")
-    clean_title = re.sub(r'[\s#\\/*?:"<>|]', "_", title[:25]).strip("_") or note_id
+    clean_title = sanitize_filename_part(title, max_len=25) or note_id
     base = f"xhs_{date_prefix}_{clean_title}_{note_id}"
     mp4_path = os.path.join(media_dir, base + ".mp4")
     mp3_path = os.path.join(media_dir, base + ".mp3")
@@ -785,7 +805,7 @@ def process_monitor_once(
                     web_base_url = config_settings.get("web_base_url", "http://101.35.47.249:8080/posts").rstrip("/")
 
                     date_prefix = detail["publish_time"][:10].replace("-", "")
-                    clean_title = re.sub(r'[\s#\\/*?:"<>|]', "_", title[:25]).strip("_") or note_id
+                    clean_title = sanitize_filename_part(title, max_len=25) or note_id
                     html_filename = f"xhs_{date_prefix}_{clean_title}_{note_id}.html"
                     html_path = os.path.join(web_outdir, html_filename)
 
