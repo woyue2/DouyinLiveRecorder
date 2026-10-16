@@ -525,10 +525,13 @@ bili_submit_lock = threading.Lock()
 bili_timeline_node = ""
 bili_timeline_enabled = False
 bili_timeline_domain = "my.feishu.cn"
-# 拆稿保护：单稿件分P数超过上限时切成多份独立稿件（标题加 1/2/3 后缀），
+# 拆稿保护：单稿件体积超过上限时切成多份独立稿件（标题加 1/2/3 后缀），
 # 否则整包体积超出上行带宽在 biliup 超时窗口内能传完的量，上传会被掐断、整场丢失。
-bili_max_parts_per_submission = 8
+# 按体积而非分P数判断：瓶颈是「带宽 × 2 小时」，改画质后分段数阈值会失准。
+bili_max_chunk_bytes = 0
 bili_split_interval_seconds = 90 * 60
+# 非风控失败（网络抖动、B 站暂时异常）自动重投一次的等待秒数
+bili_upload_retry_wait = 60
 # B站待投稿队列：满足最小间隔后由后台线程依次提交，避免阻塞录制主流程
 bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
@@ -973,12 +976,13 @@ def run_bili_session_job(job: dict) -> None:
             _seg_fallback = 0
         timeline_start_times = compute_part_start_times(valid_ts_paths, fallback_seconds=_seg_fallback)
 
-    chunks = chunk_session_meta(meta, valid_ts_paths, bili_max_parts_per_submission)
+    chunks = chunk_session_meta(meta, valid_ts_paths, bili_max_chunk_bytes)
     multi = len(chunks) > 1
     if multi:
+        total_gb = sum(os.path.getsize(p) for p in valid_ts_paths if os.path.exists(p)) / 1024 ** 3
         logger.info(
-            f"整场多P投稿：{len(valid_ts_paths)}P 超过单稿上限 {bili_max_parts_per_submission}，"
-            f"拆成 {len(chunks)} 份稿件 ({record_name})"
+            f"整场多P投稿：{len(valid_ts_paths)}P / {total_gb:.2f}GB 超过单稿上限 "
+            f"{bili_max_chunk_bytes / 1024 ** 3:.1f}GB，拆成 {len(chunks)} 份稿件 ({record_name})"
         )
 
     notifications = []
@@ -993,6 +997,15 @@ def run_bili_session_job(job: dict) -> None:
             time.sleep(bili_split_interval_seconds)
 
         success, output = _upload_one_chunk(chunk, is_only_self)
+        if not success and "RATE_LIMITED_21566" not in output:
+            # 非风控失败（网络抖动、B 站暂时异常）自动重投一次。
+            # 风控失败必须交给冷却机制处理，硬重试只会加重风控。
+            logger.warning(
+                f"投稿失败，{bili_upload_retry_wait} 秒后重投一次 (第 "
+                f"{chunk['index']}/{chunk['total']} 份) {record_name}: {output[:200]}"
+            )
+            time.sleep(bili_upload_retry_wait)
+            success, output = _upload_one_chunk(chunk, is_only_self)
         part_note = f"\n集数: {len(chunk['ts_paths'])}P" + (
             f" (第 {chunk['index']}/{chunk['total']} 份)" if multi else " (全场自动合集)"
         )
@@ -3321,8 +3334,10 @@ while True:
     bili_timeline_node = read_config_value(config, 'B站投稿', '直播时间轴节点', "").strip()
     bili_timeline_domain = read_config_value(config, 'B站投稿', '直播时间轴域名', "").strip() or feishu_wiki_domain or "my.feishu.cn"
     bili_timeline_enabled = bool(bili_timeline_node and feishu_app_id and feishu_app_secret)
-    # 拆稿保护：单稿分P上限与拆稿之间的投稿间隔（0 = 不在拆稿之间额外等待）
-    bili_max_parts_per_submission = int(read_config_value(config, 'B站投稿', '单稿最大分P数', 8))
+    # 拆稿保护：单稿体积上限与拆稿之间的投稿间隔（0 = 不拆稿 / 不额外等待）
+    bili_max_chunk_bytes = int(
+        float(read_config_value(config, 'B站投稿', '单稿最大体积(GB)', 1.5)) * 1024 ** 3
+    )
     bili_split_interval_seconds = int(read_config_value(config, 'B站投稿', '拆稿投稿间隔(分钟)', 90)) * 60
     streamer_types = {}
     if '主播类型配置' in config.sections():

@@ -358,18 +358,25 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
     return len(queue), False
 
 
-def chunk_session_meta(meta: dict, ts_paths: list, max_parts: int) -> list:
+def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
     """把整场直播切成多份稿件（超时保护），每份重排分P编号并加 1/2/3 标题后缀。
 
-    背景：单稿件分P过多时，整包体积会远超服务器上行带宽在 biliup 超时窗口内
-    传得完的量，导致上传被掐断、整场丢失。切成多份后每份都能在超时内传完。
+    按**累计体积**切分，而不是分P数量。真正的瓶颈是「上行带宽 × biliup 的 2 小时
+    超时窗口」，体积才是直接对应的量；用分段数当阈值在改画质后立刻失准——同样 8
+    段，高清的体积可能是流畅的数倍，照样超时。
 
     分P编号在同场内整体重排（第 2 份从 P1 开始），否则播放器里会从 P11 起跳。
     不重新调用大模型：标题共用一个整场标题，简介按分片重新拼装。
     """
-    total_parts = len(ts_paths)
     src_parts = list(meta.get("parts") or [])
     src_descs = list(meta.get("part_descs") or [])
+
+    sizes = []
+    for p in ts_paths:
+        try:
+            sizes.append(os.path.getsize(p))
+        except OSError:
+            sizes.append(0)
 
     def _single() -> list:
         return [{
@@ -382,16 +389,27 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_parts: int) -> list:
             "parts": src_parts,
         }]
 
-    if max_parts <= 0 or total_parts <= max_parts:
+    if max_bytes <= 0 or sum(sizes) <= max_bytes:
         return _single()
 
-    starts = list(range(0, total_parts, max_parts))
-    total = len(starts)
+    # 依累计体积分组；每份至少含一段（单段自身就超上限时只能自成一份）
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    cur_bytes = 0
+    for i, size in enumerate(sizes):
+        if cur and cur_bytes + size > max_bytes:
+            groups.append(cur)
+            cur, cur_bytes = [], 0
+        cur.append(i)
+        cur_bytes += size
+    if cur:
+        groups.append(cur)
+
+    total = len(groups)
     chunks = []
-    for n, start in enumerate(starts, start=1):
-        end = min(start + max_parts, total_parts)
+    for n, idxs in enumerate(groups, start=1):
         parts, descs = [], []
-        for offset, i in enumerate(range(start, end), start=1):
+        for offset, i in enumerate(idxs, start=1):
             label = f"【P{offset}】"
             p = src_parts[i] if i < len(src_parts) else {}
             seed = re.sub(r'^P\d+\s*', '', (p.get("title") or "").strip()).strip()
@@ -408,7 +426,7 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_parts: int) -> list:
         chunks.append({
             "index": n,
             "total": total,
-            "ts_paths": list(ts_paths[start:end]),
+            "ts_paths": [ts_paths[i] for i in idxs],
             "title": f"{meta['title']} {n}"[:80],
             "desc": desc,
             "tags": meta["tags"],

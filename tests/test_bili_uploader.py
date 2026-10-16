@@ -391,53 +391,78 @@ def _mk_session_meta(n: int) -> dict:
     }
 
 
-def test_chunk_session_meta_splits_when_over_limit():
-    """19P 超過單稿上限 8 時應切成 8/8/3 三份，標題加 1/2/3 後綴。"""
-    ts = [f"/d/{i}.ts" for i in range(19)]
-    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 8)
-    assert [len(c["ts_paths"]) for c in chunks] == [8, 8, 3]
-    assert [c["total"] for c in chunks] == [3, 3, 3]
-    assert [c["title"] for c in chunks] == ["整場高能合集 1", "整場高能合集 2", "整場高能合集 3"]
-    # TS 依序切分：不重疊、不遺漏
+def _mk_ts_files(tmp_path, sizes: list) -> list:
+    """建立指定大小的真實 .ts 檔（chunk_session_meta 以 os.path.getsize 判斷體積）。"""
+    paths = []
+    for i, size in enumerate(sizes):
+        p = tmp_path / f"{i}.ts"
+        p.write_bytes(b"x" * size)
+        paths.append(str(p))
+    return paths
+
+
+def test_chunk_session_meta_splits_by_total_size(tmp_path):
+    """體積超過單稿上限時切成多份，標題加 1/2/3 後綴；TS 依序切分不重不漏。"""
+    ts = _mk_ts_files(tmp_path, [100] * 7)          # 共 700
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(7), ts, 250)
+    assert [len(c["ts_paths"]) for c in chunks] == [2, 2, 2, 1]
+    assert [c["total"] for c in chunks] == [4, 4, 4, 4]
+    assert [c["title"] for c in chunks] == [
+        "整場高能合集 1", "整場高能合集 2", "整場高能合集 3", "整場高能合集 4",
+    ]
     assert [p for c in chunks for p in c["ts_paths"]] == ts
 
 
-def test_chunk_session_meta_renumbers_parts_within_each_chunk():
-    """第 2 份的分P必須從 P1 重新編號，否則播放器列表會從 P9 起跳。"""
-    ts = [f"/d/{i}.ts" for i in range(19)]
-    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 8)
+def test_chunk_session_meta_renumbers_parts_within_each_chunk(tmp_path):
+    """第 2 份的分P必須從 P1 重新編號，否則播放器列表會從 P3 起跳。"""
+    ts = _mk_ts_files(tmp_path, [100] * 7)
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(7), ts, 250)
     second = chunks[1]
     assert second["parts"][0]["label"] == "【P1】"
     assert second["parts"][0]["title"].startswith("P1 ")
-    assert second["parts"][-1]["label"] == "【P8】"
-    assert second["parts"][0]["lines"] == ["08:15 看點9"]
+    assert second["parts"][-1]["label"] == "【P2】"
+    assert second["parts"][0]["lines"] == ["02:15 看點3"]
 
 
-def test_chunk_session_meta_desc_only_covers_own_parts():
+def test_chunk_session_meta_desc_only_covers_own_parts(tmp_path):
     """每份的簡介只能涵蓋自己那幾個分P，不可照抄整場簡介。"""
-    ts = [f"/d/{i}.ts" for i in range(19)]
-    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 8)
+    ts = _mk_ts_files(tmp_path, [100] * 7)
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(7), ts, 250)
     assert "第1段簡介" in chunks[0]["desc"]
-    assert "第9段簡介" not in chunks[0]["desc"]
-    assert "第9段簡介" in chunks[1]["desc"]
+    assert "第3段簡介" not in chunks[0]["desc"]
+    assert "第3段簡介" in chunks[1]["desc"]
     assert "第1段簡介" not in chunks[1]["desc"]
 
 
-def test_chunk_session_meta_no_split_when_within_limit():
+def test_chunk_session_meta_single_oversized_part_forms_own_chunk(tmp_path):
+    """單段自身就超過上限時，仍必須自成一份（不可切成空稿件）。"""
+    ts = _mk_ts_files(tmp_path, [500, 100, 100])
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(3), ts, 250)
+    assert [len(c["ts_paths"]) for c in chunks] == [1, 2]
+
+
+def test_chunk_session_meta_no_split_when_under_limit(tmp_path):
     """未超過上限時維持單稿件原貌，標題不加後綴。"""
-    ts = [f"/d/{i}.ts" for i in range(5)]
-    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(5), ts, 8)
+    ts = _mk_ts_files(tmp_path, [100, 100])
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(2), ts, 250)
     assert len(chunks) == 1
     assert chunks[0]["title"] == "整場高能合集"
     assert chunks[0]["desc"] == "whole desc"
     assert chunks[0]["ts_paths"] == ts
 
 
-def test_chunk_session_meta_zero_limit_disables_splitting():
-    ts = [f"/d/{i}.ts" for i in range(19)]
-    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(19), ts, 0)
+def test_chunk_session_meta_zero_limit_disables_splitting(tmp_path):
+    ts = _mk_ts_files(tmp_path, [100] * 10)
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(10), ts, 0)
     assert len(chunks) == 1
     assert chunks[0]["title"] == "整場高能合集"
+
+
+def test_chunk_session_meta_missing_file_counts_as_zero(tmp_path):
+    """檔案不存在時體積視為 0，不應拋錯中斷整個投稿流程。"""
+    ts = _mk_ts_files(tmp_path, [100, 100]) + [str(tmp_path / "nope.ts")]
+    chunks = bili_uploader.chunk_session_meta(_mk_session_meta(3), ts, 250)
+    assert [p for c in chunks for p in c["ts_paths"]] == ts
 
 
 def test_merge_queue_job_appends_new_session():
