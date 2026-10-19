@@ -14,14 +14,24 @@ MAIN_SRC = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
 
 def test_start_times_are_computed_before_ts_cleanup():
     i_compute = MAIN_SRC.index("compute_part_start_times(valid_ts_paths")
-    i_schedule = MAIN_SRC.index(
-        "schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)"
-    )
-    i_cleanup = MAIN_SRC.index("handle_post_upload_cleanup(", i_schedule)
-    assert i_compute < i_schedule < i_cleanup, (
-        "必須先在清理本地 TS 之前算好分P起始時間，再排程生成時間軸文件，"
+    i_cleanup = MAIN_SRC.index('handle_post_upload_cleanup(chunk["ts_paths"]')
+    assert i_compute < i_cleanup, (
+        "必須在上傳成功、依策略刪除 TS 之前算好分P起始時間，"
         "否則 ffprobe 讀不到被刪除的檔案，時間戳會全部變成 00:00"
     )
+
+
+def test_timeline_is_built_after_upload_from_precomputed_start_times():
+    """時間軸在所有分片處理完後才生成，且用先前算好的時間戳，不在執行緒內重新探測。"""
+    i_cleanup = MAIN_SRC.index('handle_post_upload_cleanup(chunk["ts_paths"]')
+    i_schedule = MAIN_SRC.index(
+        "schedule_bili_timeline(tl_meta, record_name, clean_name, tl_starts)"
+    )
+    assert i_schedule > i_cleanup, (
+        "時間軸應在全部上傳結束後才生成，避免列出上傳失敗、B 站上不存在的分片"
+    )
+    # 不可再退回用整場 meta 直接排程（會與拆稿後重新編號的分P 標籤對不上）
+    assert "schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)" not in MAIN_SRC
 
 
 def test_live_transcription_archives_to_timeline_not_works_library():

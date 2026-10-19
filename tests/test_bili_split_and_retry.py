@@ -41,9 +41,16 @@ def test_failed_chunk_retries_once_but_never_on_rate_limit():
     assert body.count("_upload_one_chunk(chunk, is_only_self)") == 2, (
         "首次上傳 + 重投一次，run_bili_session_job 內應恰好呼叫 _upload_one_chunk 兩次"
     )
-    assert 'not success and "RATE_LIMITED_21566" not in output' in body, (
-        "重投條件必須排除風控失敗"
+    assert "not success and _bili_upload_retryable(output)" in body, (
+        "重投條件必須排除風控失敗、上傳超時與檔案不存在等不可重投的情況"
     )
+
+
+def test_non_retryable_markers_cover_rate_limit_and_timeout():
+    """風控與超時都不可重投：前者會加重風控，後者可能在 B 站端已建稿而產生重複。"""
+    for marker in ("RATE_LIMITED_21566", "上传超时", "视频文件不存在", "Cookie 文件不存在"):
+        assert marker in MAIN_SRC, f"不可重投標記缺少: {marker}"
+    assert "def _bili_upload_retryable(" in MAIN_SRC
 
 
 def test_retry_only_resends_chunk_whose_ts_were_not_cleaned():

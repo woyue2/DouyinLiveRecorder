@@ -79,3 +79,34 @@ def test_is_note_out_of_window_keeps_unparsable_notes(monkeypatch):
     """note_id 解不出時間時必須保留（回傳 False），不可因格式問題靜默漏抓。"""
     monkeypatch.setattr(xhs.time, "time", lambda: SAMPLE_TS + 999 * 3600)
     assert xhs.is_note_out_of_window("zzzzzzzz0000000000000000", 1.5) is False
+
+
+def test_retry_queue_round_trip(tmp_path):
+    """重試清單必須可持久化並還原（跨巡檢保留 note_id → 失敗次數）。"""
+    p = str(tmp_path / "retry.json")
+    assert xhs.load_retry_queue(p) == {}
+
+    xhs.save_retry_queue(p, {"note_a": 1, "note_b": 2})
+    assert xhs.load_retry_queue(p) == {"note_a": 1, "note_b": 2}
+
+
+def test_retry_queue_tolerates_corrupt_or_missing_file(tmp_path):
+    """檔案損毀或不存在時應回空字典，不可讓整個巡檢崩潰。"""
+    missing = str(tmp_path / "nope.json")
+    assert xhs.load_retry_queue(missing) == {}
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert xhs.load_retry_queue(str(bad)) == {}
+
+
+def test_retry_notes_bypass_window_decision():
+    """重試中的筆記必須能繞過窗口判定——否則失敗一次後隔天就被永久跳過。
+
+    這裡守住機制本身：只要呼叫端把 note_id 放進重試清單，窗口判定就不該是
+    唯一的守門條件（實際順序由 process_monitor_once 的 `not retrying and ...` 保證）。
+    """
+    assert xhs._XHS_MAX_DOWNLOAD_ATTEMPTS >= 2
+    src = (ROOT / "xhs_note_monitor.py").read_text(encoding="utf-8")
+    assert "if not retrying and is_note_out_of_window(note_id, since_days):" in src
+    assert "retry_first = [n for n in notes if n.get(\"note_id\") in retry_queue]" in src

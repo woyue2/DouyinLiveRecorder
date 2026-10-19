@@ -38,6 +38,7 @@ if _SRC_DIR not in sys.path:
 
 import msg_push
 from md_to_html import HTML_TEMPLATE, render_markdown_inline
+from filename_utils import sanitize_filename_part
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +49,9 @@ logger = logging.getLogger("XhsNoteMonitor")
 
 # note_id 前 8 位十六進位為建立時間戳；早於此時間視為解析失敗（不會是小紅書真實貼文）
 _NOTE_ID_TS_MIN = 1577808000.0   # 2020-01-01 00:00:00 UTC+8
+
+# 影片下載連續失敗幾次後放棄（避免一封壞掉的筆記每天重下載整個影片）
+_XHS_MAX_DOWNLOAD_ATTEMPTS = 3
 
 
 class XhsRiskControlError(Exception):
@@ -202,25 +206,6 @@ def load_project_config() -> Dict[str, Any]:
         settings["feishu_wiki_domain"] = config.get("飞书文档配置", "飞书域名", fallback="my.feishu.cn").strip()
 
     return settings
-
-
-def sanitize_filename_part(text: str, max_len: int = 25) -> str:
-    """清洗檔名片段：徹底過濾 Emoji、高位 Unicode 符號與檔案系統非法字元。
-
-    百度網盤 PCS API（bypy）在檔名包含 Emoji（例如 🔥、💡 等 4 位元組字符）
-    或部分特殊標點時會拒絕建立並報 Error 31062 (file name is invalid)。
-    """
-    if not text:
-        return ""
-    # 移除 4 位元組 Emoji 及特殊符號區段（包括雜項符號、裝飾符號、變化選擇器等）
-    clean = re.sub(
-        r'[\U00010000-\U0010ffff]|[☀-➿]|[︀-️]',
-        '',
-        text
-    )
-    # 替換檔案系統非法字元、空白及特殊符號
-    clean = re.sub(r'[\s#\\/*?:"<>|`~$\^&%!\'\"]', '_', clean[:max_len]).strip('_')
-    return clean
 
 
 def extract_note_video_url(card: Dict[str, Any]) -> str:
@@ -725,6 +710,31 @@ def save_history(filepath: str, downloaded_ids: set):
         logger.warning(f"保存歷史紀錄失敗: {e}")
 
 
+def load_retry_queue(filepath: str) -> Dict[str, int]:
+    """讀取「下載失敗待重試」清單：{note_id: 已失敗次數}。
+
+    沒有這份紀錄時，一封下載失敗的影片筆記不會寫入 history，看似留待下次重試；
+    但下次巡檢它往往已超出 --days 時間窗口而在下載前被跳過，等於永久靜默丟失。
+    """
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {str(k): int(v) for k, v in (data.get("retry", {}) or {}).items()}
+        except Exception as e:
+            logger.warning(f"讀取重試清單失敗: {e}")
+    return {}
+
+
+def save_retry_queue(filepath: str, retry: Dict[str, int]):
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump({"retry": retry}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存重試清單失敗: {e}")
+
+
 def process_monitor_once(
     args,
     monitor: XhsNoteMonitor,
@@ -753,6 +763,7 @@ def process_monitor_once(
             return
 
     history = load_history(args.history_file)
+    retry_queue = load_retry_queue(args.retry_file)
     dingtalk_webhook = args.dingtalk_webhook or config_settings.get("dingtalk_webhook", "")
     dingtalk_phone = config_settings.get("dingtalk_phone", "")
     dingtalk_is_atall = config_settings.get("dingtalk_is_atall", False)
@@ -781,20 +792,28 @@ def process_monitor_once(
             processed_this_author = 0
             skipped_old = 0
 
-            for n in notes:
+            # 重試清單裡的筆記優先處理，且不受 --days 窗口限制：
+            # 一封「今天發現、下載失敗」的筆記到了下次巡檢可能已超出窗口，
+            # 若仍套用窗口就會在重試前被跳過，等於永久靜默丟失。
+            retry_first = [n for n in notes if n.get("note_id") in retry_queue]
+            others = [n for n in notes if n.get("note_id") not in retry_queue]
+
+            for n in retry_first + others:
                 note_id = n["note_id"]
+                retrying = note_id in retry_queue
                 if not note_id or note_id in history:
                     continue
 
                 # 超出時間窗口的舊筆記直接跳過。note_id 自帶建立時間，判斷不需抓詳情，
                 # 所以跳過是零成本的：不發請求、不 sleep、也不佔 max_new 額度。
                 # 沒有這道過濾時，新增博主會沿著歷史往回抓（實際發生過抓到 200 天前）。
-                if is_note_out_of_window(note_id, since_days):
+                if not retrying and is_note_out_of_window(note_id, since_days):
                     skipped_old += 1
                     continue
 
-                # 限制單次每位博主最多處理幾篇新筆記；未處理的留待下次巡檢
-                if max_new > 0 and processed_this_author >= max_new:
+                # 限制單次每位博主最多處理幾篇新筆記；未處理的留待下次巡檢。
+                # 重試中的筆記不佔額度，否則它們可能永遠排不到。
+                if not retrying and max_new > 0 and processed_this_author >= max_new:
                     logger.info(
                         f"已達單次處理上限 {max_new} 篇，其餘新筆記留待下次巡檢: 【{custom_name or user_id}】"
                     )
@@ -845,11 +864,24 @@ def process_monitor_once(
                         monitor, detail, author_name, title, note_id, outdir, transcribe_script
                     )
                     if not download_ok:
-                        # 視頻下載失敗（CDN 網路抖動等）：堅決不降級發送半成品，不記入歷史，
-                        # 留待下次巡檢自動重試，避免重要長視頻被永久廢棄！
-                        logger.warning(
-                            f"影片下載失敗（可能為 CDN 短暫抖動），跳過本次處理且不記入歷史，留待下次巡檢重試: 【{author_name}】{title}"
-                        )
+                        # 視頻下載失敗（CDN 網路抖動等）：不降級發送半成品，也不記入歷史。
+                        # 但只靠「下次巡檢重試」不夠——下次巡檢時它可能已超出 --days 窗口
+                        # 而被跳過，所以這裡必須寫入重試清單，讓它繞過窗口限制。
+                        attempts = retry_queue.get(note_id, 0) + 1
+                        if attempts >= _XHS_MAX_DOWNLOAD_ATTEMPTS:
+                            logger.error(
+                                f"影片下載連續 {attempts} 次失敗，放棄並記入歷史: 【{author_name}】{title}"
+                            )
+                            retry_queue.pop(note_id, None)
+                            history.add(note_id)
+                            save_history(args.history_file, history)
+                        else:
+                            retry_queue[note_id] = attempts
+                            logger.warning(
+                                f"影片下載失敗（第 {attempts}/{_XHS_MAX_DOWNLOAD_ATTEMPTS} 次），"
+                                f"已排入重試清單，下次巡檢優先重試: 【{author_name}】{title}"
+                            )
+                        save_retry_queue(args.retry_file, retry_queue)
                         continue
 
                     if not transcript_md_path:
@@ -915,6 +947,8 @@ def process_monitor_once(
 
                 history.add(note_id)
                 save_history(args.history_file, history)
+                if retry_queue.pop(note_id, None) is not None:
+                    save_retry_queue(args.retry_file, retry_queue)
                 processed_this_author += 1
 
             if skipped_old:
@@ -953,6 +987,7 @@ def main():
              "舊筆記由 note_id 自帶的時間戳判斷，不需抓詳情即可跳過"
     )
     parser.add_argument("--history-file", type=str, default="./downloads/xhs_download_history.json", help="去重歷史紀錄檔案")
+    parser.add_argument("--retry-file", type=str, default="./downloads/xhs_retry_queue.json", help="下載失敗待重試清單")
     parser.add_argument("--outdir", type=str, default="./downloads", help="影片/音訊保存目錄（影片筆記轉寫用）")
     parser.add_argument("--cooldown-file", type=str, default="./downloads/xhs_cooldown.json", help="風控熔斷記錄檔案")
     parser.add_argument("--daemon", action="store_true", help="啟用常駐輪詢模式 (預設 12 小時檢查一次)")

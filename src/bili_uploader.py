@@ -386,7 +386,9 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
             "title": meta["title"],
             "desc": meta["desc"],
             "tags": meta["tags"],
-            "parts": src_parts,
+            # src_index 保留該分P在整場中的位置，供呼叫端把上傳成功的分片
+            # 對回整場的起始時間戳（時間軸文件用）。
+            "parts": [{**p, "src_index": i} for i, p in enumerate(src_parts)],
         }]
 
     if max_bytes <= 0 or sum(sizes) <= max_bytes:
@@ -417,6 +419,7 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
                 "label": label,
                 "lines": list(p.get("lines") or []),
                 "title": (f"P{offset} {seed}" if seed else f"P{offset}")[:80],
+                "src_index": i,
             })
             if i < len(src_descs):
                 descs.append(f"{label}\n{src_descs[i]}")
@@ -427,7 +430,9 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
             "index": n,
             "total": total,
             "ts_paths": [ts_paths[i] for i in idxs],
-            "title": f"{meta['title']} {n}"[:80],
+            # 先為「 1/2/3」後綴留位再截斷，否則整場標題剛好 80 字時後綴會被切掉，
+            # 多份稿件就會出現完全相同的標題。
+            "title": meta["title"][:80 - len(f" {n}")] + f" {n}",
             "desc": desc,
             "tags": meta["tags"],
             "parts": parts,

@@ -940,6 +940,75 @@ def _upload_one_chunk(chunk: dict, is_only_self: bool) -> tuple[bool, str]:
         cleanup_part_links(link_dir)
 
 
+# 這些失敗重投也不會成功，或已在 B 站端留下稿件（重投只會產生重複稿件）
+_NON_RETRYABLE_UPLOAD_MARKERS = (
+    "RATE_LIMITED_21566",
+    "上传超时",
+    "视频文件不存在",
+    "Cookie 文件不存在",
+)
+
+
+def _bili_upload_retryable(output: str) -> bool:
+    """只有真正的暫時性失敗才值得重投一次。"""
+    return not any(m in (output or "") for m in _NON_RETRYABLE_UPLOAD_MARKERS)
+
+
+def _push_bili_notice(record_name: str, content: str) -> None:
+    try:
+        push_message(record_name, "", content)
+    except Exception as e:
+        logger.error(f"B站投稿通知发送失败: {e}")
+
+
+def _wait_for_split_slot(record_name: str, chunk: dict) -> None:
+    """拆稿分片也是真實投稿，必須遵守冷卻與最小投稿間隔。
+
+    原本只 sleep「拆稿投稿间隔」，會繞過佇列用的最小投稿間隔（例如 200 分鐘），
+    在幾小時內對同一帳號連投 3~4 次而觸發風控。這裡取「拆稿間隔」與
+    bili_slot_status() 剩餘等待的較大者。
+    """
+    deadline = time.time() + max(0, bili_split_interval_seconds)
+    _, reason, wait_seconds = bili_slot_status()
+    wait = max(deadline - time.time(), wait_seconds)
+    if wait <= 0:
+        return
+    logger.info(
+        f"拆稿投稿：等待 {int(wait) // 60} 分鐘後提交第 "
+        f"{chunk['index']}/{chunk['total']} 份（{reason or '拆稿间隔'}） ({record_name})"
+    )
+    while wait > 0:
+        time.sleep(min(wait, 60))
+        _, reason, wait_seconds = bili_slot_status()
+        wait = max(deadline - time.time(), wait_seconds)
+
+
+def _build_successful_timeline(meta: dict, chunks: list, uploaded: list,
+                               start_times: list):
+    """只用「實際上傳成功」的分片組時間軸 meta 與對應的起始時間戳。
+
+    拆稿後每份稿件的分P都從 P1 重新編號，直接套整場 meta 會讓文件標籤（P11…）
+    對不上播放器裡的 P1…，也會列出上傳失敗、B 站上根本不存在的分片。
+    """
+    if not start_times:
+        return None, None
+    parts, starts = [], []
+    multi = len(chunks) > 1
+    for chunk, ok in zip(chunks, uploaded):
+        if not ok:
+            continue
+        for part in chunk.get("parts") or []:
+            si = part.get("src_index")
+            starts.append(start_times[si] if si is not None and si < len(start_times) else 0)
+            label = part.get("label") or ""
+            if multi:
+                label = f"【第{chunk['index']}份·{label.strip('【】')}】"
+            parts.append({**part, "label": label})
+    if not parts:
+        return None, None
+    return {**meta, "parts": parts}, starts
+
+
 def run_bili_session_job(job: dict) -> None:
     """整场多 P 合集投稿；分P过多会自动拆成多份独立稿件，避免整包上传超时丢场。"""
     global bili_cooldown_until
@@ -985,43 +1054,34 @@ def run_bili_session_job(job: dict) -> None:
             f"{bili_max_chunk_bytes / 1024 ** 3:.1f}GB，拆成 {len(chunks)} 份稿件 ({record_name})"
         )
 
-    notifications = []
-    timeline_scheduled = False
+    uploaded = []
     for chunk in chunks:
-        if chunk["index"] > 1 and bili_split_interval_seconds > 0:
-            # 拆稿之间按配置间隔，避免短时间内连投触发风控
-            logger.info(
-                f"拆稿投稿：等待 {bili_split_interval_seconds // 60} 分钟后提交第 "
-                f"{chunk['index']}/{chunk['total']} 份 ({record_name})"
-            )
-            time.sleep(bili_split_interval_seconds)
+        if chunk["index"] > 1:
+            _wait_for_split_slot(record_name, chunk)
 
         success, output = _upload_one_chunk(chunk, is_only_self)
-        if not success and "RATE_LIMITED_21566" not in output:
-            # 非风控失败（网络抖动、B 站暂时异常）自动重投一次。
-            # 风控失败必须交给冷却机制处理，硬重试只会加重风控。
+        if not success and _bili_upload_retryable(output):
+            # 只有暫時性失敗才重投：超時（可能已在 B 站端建稿）與風控重投只會更糟。
             logger.warning(
                 f"投稿失败，{bili_upload_retry_wait} 秒后重投一次 (第 "
                 f"{chunk['index']}/{chunk['total']} 份) {record_name}: {output[:200]}"
             )
             time.sleep(bili_upload_retry_wait)
             success, output = _upload_one_chunk(chunk, is_only_self)
+
+        uploaded.append(bool(success))
         part_note = f"\n集数: {len(chunk['ts_paths'])}P" + (
             f" (第 {chunk['index']}/{chunk['total']} 份)" if multi else " (全场自动合集)"
         )
         if success:
             bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
             bvid = bvid_match.group(0) if bvid_match else "已提交"
-            timeline_note = ""
-            if timeline_start_times is not None and not timeline_scheduled:
-                # 生成飞书「直播时间轴」文档（不含任何 B 站评论操作），整场只生成一次
-                schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)
-                timeline_scheduled = True
-                timeline_note = "\n直播时间轴: 后台生成飞书文档中（完成后推送链接）"
-            notifications.append(
+            # 立即推送：拆稿之間要 sleep 90 分鐘以上，累積到最後才推會因重啟而全數丟失
+            _push_bili_notice(
+                record_name,
                 f"[B站投稿成功{vis_label}] {record_name}\n"
                 f"标题: {chunk['title']}\n"
-                f"BV号: {bvid}{part_note}{timeline_note}"
+                f"BV号: {bvid}{part_note}",
             )
             handle_post_upload_cleanup(chunk["ts_paths"], policy=bili_post_policy)
         else:
@@ -1029,19 +1089,39 @@ def run_bili_session_job(job: dict) -> None:
                 output, record_name, f"集数: {len(chunk['ts_paths'])}P", vis_label
             )
             if content is None:
-                # 风控：立即冷却，并停止后续分片投稿
+                # 风控：冷卻並把剩餘分片重新入隊。job 已被佇列 pop 掉，
+                # 不重新入隊的話剩下的 TS 會永遠留在磁碟（且被百度雲腳本跳過）。
                 bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+                remaining = [
+                    p for c in chunks[chunk["index"] - 1:]
+                    for p in c["ts_paths"] if os.path.exists(p)
+                ]
+                if remaining:
+                    enqueue_bili_job({
+                        "kind": "session",
+                        "session_dir": session_dir,
+                        "ts_paths": remaining,
+                        "record_name": record_name,
+                        "record_url": record_url,
+                    })
                 _save_bili_queue()
-                notifications.append(_rate_limit_notice(record_name))
+                _push_bili_notice(
+                    record_name,
+                    _rate_limit_notice(record_name)
+                    + (f"\n剩余 {len(remaining)}P 已重新排队，冷却结束后自动续投" if remaining else ""),
+                )
                 break
-            notifications.append(content)
+            _push_bili_notice(record_name, content)
 
-    if not notifications:
-        return
-    try:
-        push_message(record_name, "", "\n\n".join(notifications))
-    except Exception as e:
-        logger.error(f"B站整场多P投稿通知发送失败: {e}")
+    # 時間軸在全部處理完後才生成，且只列實際上傳成功的分片
+    if timeline_start_times is not None and any(uploaded):
+        tl_meta, tl_starts = _build_successful_timeline(meta, chunks, uploaded, timeline_start_times)
+        if tl_meta:
+            schedule_bili_timeline(tl_meta, record_name, clean_name, tl_starts)
+            _push_bili_notice(
+                record_name,
+                f"[直播时间轴] {record_name}\n后台生成飞书文档中（完成后推送链接）",
+            )
 
 
 def process_session_multi_p_upload(save_file_path: str, record_name: str, record_url: str) -> None:
@@ -3132,6 +3212,21 @@ def read_config_value(config_parser: configparser.RawConfigParser, section: str,
         return default_value
 
 
+def read_config_float(config_parser, section: str, option: str, default: float) -> float:
+    """讀取浮點設定；留空或非數字時退回預設值並告警。
+
+    read_config_value 只在選項「缺失」時才套用預設值——寫成 `key =`（留空）會回傳
+    空字串，直接 float() 會拋 ValueError。而這些讀取位在主迴圈內，例外被捕捉後
+    每 3 秒重試同一段解析，會讓錄製與投稿永久停擺。
+    """
+    raw = read_config_value(config_parser, section, option, default)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(f"設定 {section}.{option} 值無效（{raw!r}），改用預設 {default}")
+        return float(default)
+
+
 options = {"是": True, "否": False}
 config = configparser.RawConfigParser()
 language = read_config_value(config, '录制设置', 'language(zh_cn/en)', "zh_cn")
@@ -3311,8 +3406,8 @@ while True:
 
     bili_upload_enabled = options.get(read_config_value(config, 'B站投稿', '是否开启B站自动投稿', "否"), False)
     bili_upload_mode = read_config_value(config, 'B站投稿', '投稿模式', "整场多P投稿").strip()
-    bili_min_interval_seconds = int(read_config_value(config, 'B站投稿', '最小投稿间隔(分钟)', 360)) * 60
-    bili_cooldown_minutes = int(read_config_value(config, 'B站投稿', '风控冷却时间(分钟)', 360))
+    bili_min_interval_seconds = int(read_config_float(config, 'B站投稿', '最小投稿间隔(分钟)', 200)) * 60
+    bili_cooldown_minutes = int(read_config_float(config, 'B站投稿', '风控冷却时间(分钟)', 360))
     bili_post_policy = read_config_value(config, 'B站投稿', 'B站成功后策略', "仅百度云上传md(删除ts)").strip()
     bili_cookie_path = read_config_value(config, 'B站投稿', 'B站cookies文件路径', "cookies.json").strip()
     bili_default_tid = int(read_config_value(config, 'B站投稿', '默认分区', 138))
@@ -3336,9 +3431,9 @@ while True:
     bili_timeline_enabled = bool(bili_timeline_node and feishu_app_id and feishu_app_secret)
     # 拆稿保护：单稿体积上限与拆稿之间的投稿间隔（0 = 不拆稿 / 不额外等待）
     bili_max_chunk_bytes = int(
-        float(read_config_value(config, 'B站投稿', '单稿最大体积(GB)', 1.5)) * 1024 ** 3
+        read_config_float(config, 'B站投稿', '单稿最大体积(GB)', 1.5) * 1024 ** 3
     )
-    bili_split_interval_seconds = int(read_config_value(config, 'B站投稿', '拆稿投稿间隔(分钟)', 90)) * 60
+    bili_split_interval_seconds = int(read_config_float(config, 'B站投稿', '拆稿投稿间隔(分钟)', 90)) * 60
     streamer_types = {}
     if '主播类型配置' in config.sections():
         for k, v in config.items('主播类型配置'):

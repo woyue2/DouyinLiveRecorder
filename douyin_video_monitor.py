@@ -39,6 +39,7 @@ if _SRC_DIR not in sys.path:
 
 from ab_sign import ab_sign
 import msg_push
+from filename_utils import sanitize_filename_part
 
 logging.basicConfig(
     level=logging.INFO,
@@ -524,23 +525,6 @@ class DouyinVideoMonitor:
         except Exception as e:
             logger.error(f"呼叫百度網盤上傳失敗: {e}")
             return False
-
-
-def sanitize_filename_part(text: str, max_len: int = 25) -> str:
-    """清洗檔名片段：徹底過濾 Emoji、高位 Unicode 符號與檔案系統非法字元。
-
-    百度網盤 PCS API（bypy）在檔名包含 Emoji（例如 🔥、💡 等 4 位元組字符）
-    或特殊標點時會拒絕建立並報 Error 31062 (file name is invalid)。
-    """
-    if not text:
-        return ""
-    clean = re.sub(
-        r'[\U00010000-\U0010ffff]|[☀-➿]|[︀-️]',
-        '',
-        text
-    )
-    clean = re.sub(r'[\s#\\/*?:"<>|`~$\^&%!\'\"]', '_', clean[:max_len]).strip('_')
-    return clean
 
 
 def cleanup_expired_web_posts(posts_dir: str, retention_days: int = 30):
