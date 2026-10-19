@@ -735,6 +735,12 @@ def save_retry_queue(filepath: str, retry: Dict[str, int]):
         logger.warning(f"保存重試清單失敗: {e}")
 
 
+def order_notes_for_retry(notes: List[Dict[str, Any]],
+                          retry_queue: Dict[str, int]) -> List[Dict[str, Any]]:
+    """重試中的筆記排最前面，其餘維持原本（新到舊）順序。"""
+    return sorted(notes, key=lambda n: n.get("note_id") not in retry_queue)
+
+
 def process_monitor_once(
     args,
     monitor: XhsNoteMonitor,
@@ -795,10 +801,7 @@ def process_monitor_once(
             # 重試清單裡的筆記優先處理，且不受 --days 窗口限制：
             # 一封「今天發現、下載失敗」的筆記到了下次巡檢可能已超出窗口，
             # 若仍套用窗口就會在重試前被跳過，等於永久靜默丟失。
-            retry_first = [n for n in notes if n.get("note_id") in retry_queue]
-            others = [n for n in notes if n.get("note_id") not in retry_queue]
-
-            for n in retry_first + others:
+            for n in order_notes_for_retry(notes, retry_queue):
                 note_id = n["note_id"]
                 retrying = note_id in retry_queue
                 if not note_id or note_id in history:
@@ -949,7 +952,9 @@ def process_monitor_once(
                 save_history(args.history_file, history)
                 if retry_queue.pop(note_id, None) is not None:
                     save_retry_queue(args.retry_file, retry_queue)
-                processed_this_author += 1
+                # 重試筆記不佔用本次的新筆記額度（與上面的 max_new 豁免保持一致）
+                if not retrying:
+                    processed_this_author += 1
 
             if skipped_old:
                 logger.info(

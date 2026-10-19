@@ -967,46 +967,43 @@ def _wait_for_split_slot(record_name: str, chunk: dict) -> None:
     原本只 sleep「拆稿投稿间隔」，會繞過佇列用的最小投稿間隔（例如 200 分鐘），
     在幾小時內對同一帳號連投 3~4 次而觸發風控。這裡取「拆稿間隔」與
     bili_slot_status() 剩餘等待的較大者。
+
+    等待期間唯一的投稿者就是本執行緒，slot 狀態不會中途改變，因此算一次即可，
+    不必每隔一分鐘醒來重算。
     """
-    deadline = time.time() + max(0, bili_split_interval_seconds)
     _, reason, wait_seconds = bili_slot_status()
-    wait = max(deadline - time.time(), wait_seconds)
+    wait = max(0, bili_split_interval_seconds, wait_seconds)
     if wait <= 0:
         return
     logger.info(
         f"拆稿投稿：等待 {int(wait) // 60} 分鐘後提交第 "
         f"{chunk['index']}/{chunk['total']} 份（{reason or '拆稿间隔'}） ({record_name})"
     )
-    while wait > 0:
-        time.sleep(min(wait, 60))
-        _, reason, wait_seconds = bili_slot_status()
-        wait = max(deadline - time.time(), wait_seconds)
+    time.sleep(wait)
 
 
-def _build_successful_timeline(meta: dict, chunks: list, uploaded: list,
-                               start_times: list):
-    """只用「實際上傳成功」的分片組時間軸 meta 與對應的起始時間戳。
+def _build_successful_timeline(meta: dict, chunks: list, start_times: list):
+    """只用「實際上傳成功」的分片組時間軸資料；沒有成功分片時回 None。
 
     拆稿後每份稿件的分P都從 P1 重新編號，直接套整場 meta 會讓文件標籤（P11…）
     對不上播放器裡的 P1…，也會列出上傳失敗、B 站上根本不存在的分片。
     """
     if not start_times:
-        return None, None
+        return None
     parts, starts = [], []
-    multi = len(chunks) > 1
-    for chunk, ok in zip(chunks, uploaded):
-        if not ok:
+    for chunk in chunks:
+        if not chunk.get("uploaded"):
             continue
         for part in chunk.get("parts") or []:
             si = part.get("src_index")
             starts.append(start_times[si] if si is not None and si < len(start_times) else 0)
             label = part.get("label") or ""
-            if multi:
+            if chunk["total"] > 1:
                 label = f"【第{chunk['index']}份·{label.strip('【】')}】"
             parts.append({**part, "label": label})
     if not parts:
-        return None, None
-    return {**meta, "parts": parts}, starts
+        return None
+    return {"meta": {**meta, "parts": parts}, "starts": starts}
 
 
 def run_bili_session_job(job: dict) -> None:
@@ -1054,7 +1051,6 @@ def run_bili_session_job(job: dict) -> None:
             f"{bili_max_chunk_bytes / 1024 ** 3:.1f}GB，拆成 {len(chunks)} 份稿件 ({record_name})"
         )
 
-    uploaded = []
     for chunk in chunks:
         if chunk["index"] > 1:
             _wait_for_split_slot(record_name, chunk)
@@ -1069,7 +1065,7 @@ def run_bili_session_job(job: dict) -> None:
             time.sleep(bili_upload_retry_wait)
             success, output = _upload_one_chunk(chunk, is_only_self)
 
-        uploaded.append(bool(success))
+        chunk["uploaded"] = bool(success)
         part_note = f"\n集数: {len(chunk['ts_paths'])}P" + (
             f" (第 {chunk['index']}/{chunk['total']} 份)" if multi else " (全场自动合集)"
         )
@@ -1114,10 +1110,12 @@ def run_bili_session_job(job: dict) -> None:
             _push_bili_notice(record_name, content)
 
     # 時間軸在全部處理完後才生成，且只列實際上傳成功的分片
-    if timeline_start_times is not None and any(uploaded):
-        tl_meta, tl_starts = _build_successful_timeline(meta, chunks, uploaded, timeline_start_times)
-        if tl_meta:
-            schedule_bili_timeline(tl_meta, record_name, clean_name, tl_starts)
+    if timeline_start_times is not None:
+        timeline = _build_successful_timeline(meta, chunks, timeline_start_times)
+        if timeline:
+            schedule_bili_timeline(
+                timeline["meta"], record_name, clean_name, timeline["starts"]
+            )
             _push_bili_notice(
                 record_name,
                 f"[直播时间轴] {record_name}\n后台生成飞书文档中（完成后推送链接）",
@@ -3297,7 +3295,7 @@ while True:
     show_url = options.get(read_config_value(config, '录制设置', '是否显示直播源地址', "否"), False)
     split_video_by_time = options.get(read_config_value(config, '录制设置', '分段录制是否开启', "否"), False)
     enable_https_recording = options.get(read_config_value(config, '录制设置', '是否强制启用https录制', "否"), False)
-    disk_space_limit = float(read_config_value(config, '录制设置', '录制空间剩余阈值(gb)', 1.0))
+    disk_space_limit = read_config_float(config, '录制设置', '录制空间剩余阈值(gb)', 1.0)
     split_time = str(read_config_value(config, '录制设置', '视频分段时间(秒)', 1800))
     converts_to_mp4 = options.get(read_config_value(config, '录制设置', '录制完成后自动转为mp4格式', "否"), False)
     converts_to_h264 = options.get(read_config_value(config, '录制设置', 'mp4格式重新编码为h264', "否"), False)

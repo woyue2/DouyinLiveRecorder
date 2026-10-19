@@ -371,6 +371,21 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
     src_parts = list(meta.get("parts") or [])
     src_descs = list(meta.get("part_descs") or [])
 
+    # src_index 保留該分P在整場中的位置，供呼叫端把上傳成功的分片
+    # 對回整場的起始時間戳（時間軸文件用）。
+    single = [{
+        "index": 1,
+        "total": 1,
+        "ts_paths": list(ts_paths),
+        "title": meta["title"],
+        "desc": meta["desc"],
+        "tags": meta["tags"],
+        "parts": [{**p, "src_index": i} for i, p in enumerate(src_parts)],
+    }]
+
+    if max_bytes <= 0:
+        return single
+
     sizes = []
     for p in ts_paths:
         try:
@@ -378,21 +393,8 @@ def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
         except OSError:
             sizes.append(0)
 
-    def _single() -> list:
-        return [{
-            "index": 1,
-            "total": 1,
-            "ts_paths": list(ts_paths),
-            "title": meta["title"],
-            "desc": meta["desc"],
-            "tags": meta["tags"],
-            # src_index 保留該分P在整場中的位置，供呼叫端把上傳成功的分片
-            # 對回整場的起始時間戳（時間軸文件用）。
-            "parts": [{**p, "src_index": i} for i, p in enumerate(src_parts)],
-        }]
-
-    if max_bytes <= 0 or sum(sizes) <= max_bytes:
-        return _single()
+    if sum(sizes) <= max_bytes:
+        return single
 
     # 依累计体积分组；每份至少含一段（单段自身就超上限时只能自成一份）
     groups: list[list[int]] = []

@@ -100,13 +100,15 @@ def test_retry_queue_tolerates_corrupt_or_missing_file(tmp_path):
     assert xhs.load_retry_queue(str(bad)) == {}
 
 
-def test_retry_notes_bypass_window_decision():
-    """重試中的筆記必須能繞過窗口判定——否則失敗一次後隔天就被永久跳過。
+def test_order_notes_for_retry_puts_retries_first():
+    """重試中的筆記排最前，其餘維持原本（新到舊）順序。"""
+    notes = [{"note_id": "a"}, {"note_id": "b"}, {"note_id": "c"}]
+    out = xhs.order_notes_for_retry(notes, {"c": 1})
+    assert [n["note_id"] for n in out] == ["c", "a", "b"]
 
-    這裡守住機制本身：只要呼叫端把 note_id 放進重試清單，窗口判定就不該是
-    唯一的守門條件（實際順序由 process_monitor_once 的 `not retrying and ...` 保證）。
-    """
+
+def test_retry_notes_bypass_window_decision():
+    """重試中的筆記必須能繞過窗口判定——否則失敗一次後隔天就被永久跳過。"""
     assert xhs._XHS_MAX_DOWNLOAD_ATTEMPTS >= 2
     src = (ROOT / "xhs_note_monitor.py").read_text(encoding="utf-8")
     assert "if not retrying and is_note_out_of_window(note_id, since_days):" in src
-    assert "retry_first = [n for n in notes if n.get(\"note_id\") in retry_queue]" in src
