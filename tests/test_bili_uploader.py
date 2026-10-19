@@ -542,7 +542,27 @@ def test_pick_live_batch_disabled_when_limit_is_zero(tmp_path):
     assert bili_uploader.pick_live_batch(str(tmp_path), 0, min_age_seconds=0) == []
 
 
-def test_live_part_range_from_segment_numbers():
-    paths = ["主播_2026-10-19_00-00-00_012.ts", "主播_2026-10-19_00-00-00_019.ts"]
-    assert bili_uploader.live_part_range(paths) == "P12-19"
-    assert bili_uploader.live_part_range(["weird.ts"]) == ""
+def test_live_ledger_round_trip(tmp_path):
+    """已上傳帳本要能持久化，且 elapsed 供時間軸接續。"""
+    bili_uploader.mark_segments_uploaded(
+        str(tmp_path), {"a_000.ts": {"start": 0, "label": "【P1】"}}, elapsed=900
+    )
+    assert bili_uploader.uploaded_segment_names(str(tmp_path)) == {"a_000.ts"}
+    assert bili_uploader.load_live_ledger(str(tmp_path))["elapsed"] == 900
+
+
+def test_pick_live_batch_excludes_already_uploaded(tmp_path):
+    """是否上傳過以帳本為準，不能只靠「TS 還在不在」。"""
+    paths = _mk_ts_sized(tmp_path, [2 * _MB] * 4)
+    names = [os.path.basename(p) for p in paths]
+    batch = bili_uploader.pick_live_batch(
+        str(tmp_path), 4 * _MB, exclude={names[0]}, min_age_seconds=0
+    )
+    assert [os.path.basename(p) for p in batch] == names[1:3]
+
+
+def test_pick_live_batch_single_large_segment_still_uploads(tmp_path):
+    """單段就超過 8 成門檻時仍要出手，否則高碼率下這個功能永遠不觸發。"""
+    _mk_ts_sized(tmp_path, [3 * _MB] * 2)
+    batch = bili_uploader.pick_live_batch(str(tmp_path), 4 * _MB, min_age_seconds=0)
+    assert len(batch) == 1

@@ -213,7 +213,8 @@ def extract_session_bili_metadata(
     llm_api_key: Optional[str] = None,
     llm_api_base: Optional[str] = None,
     llm_model: str = "deepseek-chat",
-    ts_paths: Optional[list] = None
+    ts_paths: Optional[list] = None,
+    part_index_offset: int = 0,
 ) -> Dict[str, str]:
     """汇总整场直播各分段，生成多 P 合集的总标题与分 P 看点。
 
@@ -270,7 +271,8 @@ def extract_session_bili_metadata(
         per_part_lines = 6
 
     for idx, ts_path in enumerate(ts_list):
-        p_label = f"【P{idx+1}】"
+        part_no = idx + 1 + part_index_offset
+        p_label = f"【P{part_no}】"
         md_path = md_map.get(ts_path.stem)
         if md_path:
             meta = extract_bili_metadata(
@@ -295,7 +297,7 @@ def extract_session_bili_metadata(
         part_descs.append(f"{p_label}\n{desc}")
         raw_part_descs.append(desc)
         title = _make_part_title(
-            idx + 1, lines,
+            part_no, lines,
             fallback=("直播录像" if md_path else "录制中断片段"),
         )
         parts_index.append({
@@ -361,17 +363,57 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
 
 # 錄製中提前上傳：分段完成後至少等這麼久才上傳，給轉寫留出時間（標題才不會退化）
 LIVE_UPLOAD_MIN_AGE_SECONDS = 180
+# 已提前上傳的分段帳本（放在場次目錄內），避免僅靠「TS 是否還在」判斷
+LIVE_LEDGER_NAME = ".bili_live_uploaded.json"
 
 
-def pick_live_batch(session_dir: str, max_bytes: int,
+def load_live_ledger(session_dir: str) -> dict:
+    path = Path(session_dir) / LIVE_LEDGER_NAME
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_live_ledger(session_dir: str, ledger: dict) -> None:
+    path = Path(session_dir) / LIVE_LEDGER_NAME
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(ledger, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning(f"保存直播中上傳帳本失敗 {path}: {e}")
+
+
+def uploaded_segment_names(session_dir: str) -> set:
+    return set((load_live_ledger(session_dir).get("uploaded") or {}).keys())
+
+
+def mark_segments_uploaded(session_dir: str, segments: dict, elapsed: float = None) -> None:
+    """把已上傳的分段寫進帳本（segments: 檔名 -> 時間軸/分P 資訊）。
+
+    elapsed 記錄這些分段的結束時間點，供錄製結束時把時間軸接續上去。
+    """
+    ledger = load_live_ledger(session_dir)
+    uploaded = ledger.setdefault("uploaded", {})
+    uploaded.update(segments)
+    if elapsed is not None:
+        ledger["elapsed"] = elapsed
+    save_live_ledger(session_dir, ledger)
+
+
+def pick_live_batch(session_dir: str, max_bytes: int, exclude=frozenset(),
                     min_age_seconds: int = LIVE_UPLOAD_MIN_AGE_SECONDS) -> list:
     """從錄製中的場次挑一批「已錄完但還沒上傳」的分段。
 
-    上傳成功後會依策略刪除本地 TS，所以目錄裡剩下的 .ts 天然就是還沒傳的，
-    重啟後也能正確恢復，不需要額外的已上傳清單。
+    是否上傳過以帳本（exclude）為準，而不是「TS 還在不在」——後者只在刪除策略下
+    成立；設成保留 TS 或串流 30 分鐘內重連重用同目錄時，同一批會被反覆上傳。
 
-    只有累積到 max_bytes 的 8 成才出手：太早傳小批次會把一次投稿拆成好幾次，
-    反而多吃掉好幾個投稿時段。最後剩下不滿一批的尾巴留給錄製結束後的正常流程。
+    出手時機：累積到 max_bytes 的 8 成，或已裝到「再加一段就超過上限」為止。
+    後者涵蓋高碼率的情況——單段就超過 8 成時，若不允許，這個功能會永遠不觸發。
     """
     if max_bytes <= 0:
         return []
@@ -381,8 +423,10 @@ def pick_live_batch(session_dir: str, max_bytes: int,
     except OSError:
         return []
 
-    batch, total = [], 0
+    batch, total, full = [], 0, False
     for f in files:
+        if f.name in exclude:
+            continue
         try:
             st = f.stat()
         except OSError:
@@ -393,22 +437,14 @@ def pick_live_batch(session_dir: str, max_bytes: int,
         if min_age_seconds > 0 and time.time() - st.st_mtime < min_age_seconds:
             break
         if batch and total + st.st_size > max_bytes:
+            full = True
             break
         batch.append(str(f))
         total += st.st_size
         if total >= max_bytes:
+            full = True
             break
-    return batch if total >= min_bytes else []
-
-
-def live_part_range(ts_paths: list) -> str:
-    """由分段檔名的序號產生 `P12-P19` 這種標示，用於直播中提前上傳的標題。"""
-    nums = []
-    for p in ts_paths:
-        m = re.search(r"_(\d{3})\.ts$", os.path.basename(p))
-        if m:
-            nums.append(int(m.group(1)))
-    return f"P{min(nums)}-{max(nums)}" if nums else ""
+    return batch if batch and (total >= min_bytes or full) else []
 
 
 def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:

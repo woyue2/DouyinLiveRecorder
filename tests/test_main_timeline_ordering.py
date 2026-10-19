@@ -32,7 +32,9 @@ def test_timeline_is_built_after_upload_from_precomputed_start_times():
     )
     # 不可再退回用整場 meta 直接排程（會與拆稿後重新編號的分P 標籤對不上）
     assert "schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)" not in MAIN_SRC
-    assert "_build_successful_timeline(meta, chunks, timeline_start_times)" in MAIN_SRC
+    assert "_build_successful_timeline(" in MAIN_SRC
+    # 提前上傳的分段也要進時間軸，否則文件只覆蓋錄製結束時剩下的尾巴
+    assert "timeline_prefix" in MAIN_SRC
 
 
 def test_live_transcription_archives_to_timeline_not_works_library():
