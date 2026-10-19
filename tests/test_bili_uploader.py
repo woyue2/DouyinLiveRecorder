@@ -497,3 +497,52 @@ def test_merge_queue_job_keeps_original_position_on_dedupe():
     pos, _ = bili_uploader.merge_queue_job(q, {"session_dir": "/a", "ts_paths": ["a1.ts", "a2.ts"]})
     assert pos == 1
     assert [j["session_dir"] for j in q] == ["/a", "/b", "/c"]
+
+
+_MB = 1024 * 1024
+
+
+def _mk_ts_sized(dir_path, sizes):
+    """建立指定大小的 .ts（sparse，速度快）。"""
+    out = []
+    for i, n in enumerate(sizes):
+        p = dir_path / f"主播_2026-10-19_00-00-00_{i:03d}.ts"
+        with open(p, "wb") as f:
+            f.truncate(n)
+        out.append(str(p))
+    return out
+
+
+def test_pick_live_batch_waits_until_80_percent(tmp_path):
+    """未累積到門檻 8 成時不出手，避免把一次投稿拆成好幾次。"""
+    _mk_ts_sized(tmp_path, [2 * _MB] * 3)
+    assert bili_uploader.pick_live_batch(str(tmp_path), 10 * _MB, min_age_seconds=0) == []
+
+
+def test_pick_live_batch_returns_full_batch(tmp_path):
+    _mk_ts_sized(tmp_path, [2 * _MB] * 4)
+    batch = bili_uploader.pick_live_batch(str(tmp_path), 10 * _MB, min_age_seconds=0)
+    assert len(batch) == 4
+
+
+def test_pick_live_batch_respects_max_bytes(tmp_path):
+    _mk_ts_sized(tmp_path, [2 * _MB] * 3)
+    batch = bili_uploader.pick_live_batch(str(tmp_path), 5 * _MB, min_age_seconds=0)
+    assert len(batch) == 2
+
+
+def test_pick_live_batch_skips_fresh_segments(tmp_path):
+    """剛完成的分段先別傳，給轉寫留時間；年齡門檻未到就整批不取。"""
+    _mk_ts_sized(tmp_path, [2 * _MB] * 4)
+    assert bili_uploader.pick_live_batch(str(tmp_path), 10 * _MB, min_age_seconds=600) == []
+
+
+def test_pick_live_batch_disabled_when_limit_is_zero(tmp_path):
+    _mk_ts_sized(tmp_path, [2 * _MB] * 4)
+    assert bili_uploader.pick_live_batch(str(tmp_path), 0, min_age_seconds=0) == []
+
+
+def test_live_part_range_from_segment_numbers():
+    paths = ["主播_2026-10-19_00-00-00_012.ts", "主播_2026-10-19_00-00-00_019.ts"]
+    assert bili_uploader.live_part_range(paths) == "P12-19"
+    assert bili_uploader.live_part_range(["weird.ts"]) == ""

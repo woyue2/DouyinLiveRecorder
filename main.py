@@ -60,6 +60,8 @@ from src.bili_uploader import (
     build_parts_timeline_markdown,
     compute_part_start_times,
     chunk_session_meta,
+    pick_live_batch,
+    live_part_range,
     merge_queue_job,
     build_part_links,
     cleanup_part_links,
@@ -537,6 +539,13 @@ bili_pending_queue: list[dict] = []
 bili_queue_lock = threading.Lock()
 bili_queue_worker_started = False
 bili_queue_file = f"{script_path}/bili_pending_queue.json"
+# 录制中的场次：session_dir -> {record_name, record_url}。
+# 队列空闲且投稿时段可用时，提前把已完成的分段传上去，吃掉长直播期间被浪费的空档。
+bili_live_upload_enabled = True
+live_sessions: dict[str, dict] = {}
+live_sessions_lock = threading.Lock()
+# 正在被「直播中提前上傳」的場次，避免錄製結束時同一場次同時再開一個上傳
+live_uploads_in_progress: set[str] = set()
 
 
 def _save_bili_queue() -> None:
@@ -644,11 +653,13 @@ def enqueue_bili_job(job: dict) -> None:
         session_time = job.get('session_dir', '').split('/')[-1]
         part_count = len(job.get('ts_paths', []))
         part_info = f"（共 {part_count}P）" if part_count > 0 else ""
+        # 從實際設定取值，避免文案與 config 的「最小投稿间隔」再次漂移
+        interval_min = max(1, int(bili_min_interval_seconds) // 60)
         push_message(
             raw_name,
             "",
             f"[B站投稿排队] 【{clean_name}】场次《{session_time}》{part_info}{action}"
-            f"（第 {position} 位）。新号限制每 6 小时仅可投稿一次，"
+            f"（第 {position} 位）。当前投稿间隔 {interval_min} 分钟（新号风控限制），"
             f"视频全程加锁保护，不会被删除或上传网盘。",
         )
     except Exception as e:
@@ -664,6 +675,11 @@ def bili_queue_worker() -> None:
         with bili_queue_lock:
             job = bili_pending_queue[0] if bili_pending_queue else None
         if job is None:
+            # 佇列空了：用空檔提前上傳正在錄製的場次，縮短「錄完 → 上線」的延遲
+            try:
+                _try_upload_live_batch()
+            except Exception as e:
+                logger.error(f"直播中提前上传异常: {type(e).__name__}: {e}")
             continue
         ready, reason, wait_seconds = bili_slot_status()
         if not ready:
@@ -1122,6 +1138,96 @@ def run_bili_session_job(job: dict) -> None:
             )
 
 
+def upload_live_batch(session_dir: str, info: dict, ts_paths: list) -> bool:
+    """把錄製中已完成的一批分段當成一份獨立稿件提前上傳。"""
+    global bili_cooldown_until
+    record_name = info.get("record_name", "")
+    record_url = info.get("record_url", "")
+    clean_name, streamer_type = _resolve_streamer_type(record_name)
+    meta = extract_session_bili_metadata(
+        session_dir=session_dir,
+        record_name=record_name,
+        streamer_type=streamer_type,
+        default_tags=bili_default_tags,
+        llm_api_key=bili_llm_api_key or None,
+        llm_api_base=bili_llm_api_base or None,
+        llm_model=bili_llm_model or "deepseek-chat",
+        ts_paths=ts_paths,
+    )
+    part_range = live_part_range(ts_paths)
+    suffix = f" [直播中 {part_range}]" if part_range else " [直播中]"
+    title = meta["title"][:80 - len(suffix)] + suffix
+
+    is_only_self = _is_only_self(record_name, record_url, clean_name)
+    vis_label = " (仅自己可见)" if is_only_self else ""
+    chunk = {
+        "title": title,
+        "desc": meta["desc"],
+        "tags": meta["tags"],
+        "parts": meta.get("parts") or [],
+        "ts_paths": ts_paths,
+    }
+    # 復用一般投稿的上傳路徑（含重投、打卡、清理）以保持行為一致
+    success, output = _upload_one_chunk(chunk, is_only_self)
+    if not success and _bili_upload_retryable(output):
+        logger.warning(
+            f"直播中投稿失败，{bili_upload_retry_wait} 秒后重投一次 {record_name}: {output[:200]}"
+        )
+        time.sleep(bili_upload_retry_wait)
+        success, output = _upload_one_chunk(chunk, is_only_self)
+
+    if success:
+        bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
+        bvid = bvid_match.group(0) if bvid_match else "已提交"
+        _push_bili_notice(
+            record_name,
+            f"[B站直播中投稿成功{vis_label}] {record_name}\n标题: {title}\nBV号: {bvid}\n"
+            f"集数: {len(ts_paths)}P（录制中提前上传）",
+        )
+        # 成功才刪本地 TS，剩下的自然就是還沒傳的
+        handle_post_upload_cleanup(ts_paths, policy=bili_post_policy)
+        return True
+
+    content = _handle_bili_failure(
+        output, record_name, f"集数: {len(ts_paths)}P（直播中）", vis_label
+    )
+    if content is None:
+        bili_cooldown_until = time.time() + bili_cooldown_minutes * 60
+        _save_bili_queue()
+        _push_bili_notice(record_name, _rate_limit_notice(record_name))
+    else:
+        _push_bili_notice(record_name, content)
+    return False
+
+
+def _try_upload_live_batch() -> None:
+    """佇列空閒時，若投稿時段可用，就提前上傳一段錄製中的內容。"""
+    if not bili_live_upload_enabled or bili_max_chunk_bytes <= 0:
+        return
+    ready, _, _ = bili_slot_status()
+    if not ready:
+        return
+    with bili_queue_lock:
+        if bili_pending_queue:
+            return          # 已錄完的場次優先
+    with live_sessions_lock:
+        sessions = list(live_sessions.items())
+    for session_dir, info in sessions:
+        batch = pick_live_batch(session_dir, bili_max_chunk_bytes)
+        if not batch:
+            continue
+        logger.info(
+            f"直播中上传：{info.get('record_name')} 已完成 {len(batch)} 段，"
+            f"開始提前投稿 ({Path(session_dir).name})"
+        )
+        live_uploads_in_progress.add(session_dir)
+        try:
+            upload_live_batch(session_dir, info, batch)
+        finally:
+            live_uploads_in_progress.discard(session_dir)
+        return
+
+
 def process_session_multi_p_upload(save_file_path: str, record_name: str, record_url: str) -> None:
     """录制结束：收集整场 TS，满足间隔限制则立即投稿，否则入队由后台线程稍后提交。"""
     session_dir = str(Path(save_file_path).parent)
@@ -1170,10 +1276,12 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         "record_url": record_url,
     }
     ready, reason, wait_seconds = bili_slot_status()
-    if ready:
+    # 同一場次正在被「直播中提前上傳」時改為入隊：該上傳由佇列執行緒持有，
+    # 直接再跑一個會和它同時上傳同一批分段。
+    if ready and session_dir not in live_uploads_in_progress:
         run_bili_job(job)
     else:
-        job["reason"] = reason
+        job["reason"] = reason if not ready else "直播中上传进行中"
         job["wait_seconds"] = wait_seconds
         enqueue_bili_job(job)
 
@@ -1373,7 +1481,7 @@ def submit_transcribe(published_files: list, record_name: str, record_url: str =
 
 def cleanup_stale_transcribe_placeholders(save_root: str) -> None:
     """启动时仅清理残留的 *.transcribing 占位文件，避免程序崩溃后对应音频被永久跳过上传。
-    注意：绝不清理 *.bili_uploading，因为在等6小时排队的视频需要靠它阻止百度云抢先上传。"""
+    注意：绝不清理 *.bili_uploading，因为在等最小投稿间隔排队的视频需要靠它阻止百度云抢先上传。"""
     removed = 0
     try:
         for root, _dirs, files in os.walk(save_root):
@@ -1544,29 +1652,40 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
         create_var[subs_thread_name].start()
 
     stop_requested = False
-    while process.poll() is None:
-        if not should_convert_to_mp4:
-            completed_segments = publish_completed_segments(working_file_path)
-            for extra_working in (extra_working_paths or []):
-                completed_segments.extend(publish_completed_segments(extra_working))
-            if record_url in bili_upload_urls and bili_upload_enabled:
-                hold_videos_for_bili(completed_segments)
-            if should_transcribe:
-                submit_transcribe(completed_segments, record_name, record_url)
-        if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
-            color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
-            clear_record_info(record_name, record_url)
-            # process.terminate()
-            if os.name == 'nt':
-                if process.stdin:
-                    process.stdin.write(b'q')
-                    process.stdin.close()
-            else:
-                process.send_signal(signal.SIGINT)
-            process.wait()
-            stop_requested = True
-            break
-        time.sleep(1)
+    # 登記為「錄製中場次」，讓佇列在空檔時可以提前上傳已完成的分段
+    live_key = None
+    if not should_convert_to_mp4 and record_url in bili_upload_urls and bili_upload_enabled:
+        live_key = str(Path(working_file_path).parent)
+        with live_sessions_lock:
+            live_sessions[live_key] = {"record_name": record_name, "record_url": record_url}
+    try:
+        while process.poll() is None:
+            if not should_convert_to_mp4:
+                completed_segments = publish_completed_segments(working_file_path)
+                for extra_working in (extra_working_paths or []):
+                    completed_segments.extend(publish_completed_segments(extra_working))
+                if record_url in bili_upload_urls and bili_upload_enabled:
+                    hold_videos_for_bili(completed_segments)
+                if should_transcribe:
+                    submit_transcribe(completed_segments, record_name, record_url)
+            if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
+                color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
+                clear_record_info(record_name, record_url)
+                # process.terminate()
+                if os.name == 'nt':
+                    if process.stdin:
+                        process.stdin.write(b'q')
+                        process.stdin.close()
+                else:
+                    process.send_signal(signal.SIGINT)
+                process.wait()
+                stop_requested = True
+                break
+            time.sleep(1)
+    finally:
+        if live_key:
+            with live_sessions_lock:
+                live_sessions.pop(live_key, None)
 
     return_code = process.returncode
     ffmpeg_output_thread.join(timeout=5)
@@ -3432,6 +3551,9 @@ while True:
         read_config_float(config, 'B站投稿', '单稿最大体积(GB)', 1.5) * 1024 ** 3
     )
     bili_split_interval_seconds = int(read_config_float(config, 'B站投稿', '拆稿投稿间隔(分钟)', 90)) * 60
+    bili_live_upload_enabled = options.get(
+        read_config_value(config, 'B站投稿', '直播中上传(是/否)', "是"), True
+    )
     streamer_types = {}
     if '主播类型配置' in config.sections():
         for k, v in config.items('主播类型配置'):

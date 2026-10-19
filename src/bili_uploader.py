@@ -11,6 +11,7 @@
 import os
 import re
 import json
+import time
 import subprocess
 import shutil
 import logging
@@ -356,6 +357,58 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
             return i + 1, True
     queue.append(job)
     return len(queue), False
+
+
+# 錄製中提前上傳：分段完成後至少等這麼久才上傳，給轉寫留出時間（標題才不會退化）
+LIVE_UPLOAD_MIN_AGE_SECONDS = 180
+
+
+def pick_live_batch(session_dir: str, max_bytes: int,
+                    min_age_seconds: int = LIVE_UPLOAD_MIN_AGE_SECONDS) -> list:
+    """從錄製中的場次挑一批「已錄完但還沒上傳」的分段。
+
+    上傳成功後會依策略刪除本地 TS，所以目錄裡剩下的 .ts 天然就是還沒傳的，
+    重啟後也能正確恢復，不需要額外的已上傳清單。
+
+    只有累積到 max_bytes 的 8 成才出手：太早傳小批次會把一次投稿拆成好幾次，
+    反而多吃掉好幾個投稿時段。最後剩下不滿一批的尾巴留給錄製結束後的正常流程。
+    """
+    if max_bytes <= 0:
+        return []
+    min_bytes = int(max_bytes * 0.8)
+    try:
+        files = sorted(Path(session_dir).glob("*.ts"))
+    except OSError:
+        return []
+
+    batch, total = [], 0
+    for f in files:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if st.st_size < 2 * 1024 * 1024:
+            continue
+        # 給轉寫留時間：剛完成的分段先別急著傳，否則標題會退化成「本段無轉寫內容」
+        if min_age_seconds > 0 and time.time() - st.st_mtime < min_age_seconds:
+            break
+        if batch and total + st.st_size > max_bytes:
+            break
+        batch.append(str(f))
+        total += st.st_size
+        if total >= max_bytes:
+            break
+    return batch if total >= min_bytes else []
+
+
+def live_part_range(ts_paths: list) -> str:
+    """由分段檔名的序號產生 `P12-P19` 這種標示，用於直播中提前上傳的標題。"""
+    nums = []
+    for p in ts_paths:
+        m = re.search(r"_(\d{3})\.ts$", os.path.basename(p))
+        if m:
+            nums.append(int(m.group(1)))
+    return f"P{min(nums)}-{max(nums)}" if nums else ""
 
 
 def chunk_session_meta(meta: dict, ts_paths: list, max_bytes: int) -> list:
