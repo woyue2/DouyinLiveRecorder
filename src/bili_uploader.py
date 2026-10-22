@@ -226,13 +226,7 @@ def extract_session_bili_metadata(
     if ts_paths:
         ts_list = [Path(t) for t in ts_paths]
     else:
-        ts_list = []
-        for f in sorted(p.glob("*.ts")):
-            try:
-                if f.stat().st_size >= 2 * 1024 * 1024:
-                    ts_list.append(f)
-            except OSError:
-                pass
+        ts_list = list_session_videos(session_dir)
     ts_list.sort(key=lambda x: x.name)
 
     if not ts_list:
@@ -363,6 +357,29 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
 
 # 錄製中提前上傳：分段完成後至少等這麼久才上傳，給轉寫留出時間（標題才不會退化）
 LIVE_UPLOAD_MIN_AGE_SECONDS = 180
+# 場次目錄裡算作「已完成影片」的副檔名（逐段轉碼後 TS 會變成 MP4）
+SESSION_VIDEO_EXTS = (".ts", ".mp4", ".flv", ".mkv")
+_SESSION_MIN_BYTES = 2 * 1024 * 1024
+
+
+def list_session_videos(session_dir: str, min_bytes: int = _SESSION_MIN_BYTES) -> list:
+    """列出場次目錄裡已完成的影片檔（不含正在寫入的 .part）。
+
+    逐段轉碼開啟後，已轉好的分段是 .mp4、還沒轉的仍是 .ts，兩者都要算。
+    """
+    out = []
+    try:
+        for f in Path(session_dir).iterdir():
+            if f.suffix.lower() not in SESSION_VIDEO_EXTS:
+                continue
+            try:
+                if f.stat().st_size >= min_bytes:
+                    out.append(f)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(out)
 # 已提前上傳的分段帳本（放在場次目錄內），避免僅靠「TS 是否還在」判斷
 LIVE_LEDGER_NAME = ".bili_live_uploaded.json"
 
@@ -418,10 +435,7 @@ def pick_live_batch(session_dir: str, max_bytes: int, exclude=frozenset(),
     if max_bytes <= 0:
         return []
     min_bytes = int(max_bytes * 0.8)
-    try:
-        files = sorted(Path(session_dir).glob("*.ts"))
-    except OSError:
-        return []
+    files = list_session_videos(session_dir)
 
     batch, total, full = [], 0, False
     for f in files:
@@ -1122,7 +1136,8 @@ def build_part_links(ts_paths: list, parts: list) -> Tuple[list, str]:
             safe = f"{base}_{n}"
             n += 1
         used_names.add(safe)
-        link = os.path.join(tmp_dir, f"{safe}.ts")
+        # 保留原副檔名：逐段轉碼後來源可能是 .mp4，硬寫 .ts 會讓 biliup 認不出格式
+        link = os.path.join(tmp_dir, f"{safe}{Path(src).suffix.lower() or '.ts'}")
         try:
             os.link(src, link)
         except OSError:

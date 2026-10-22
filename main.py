@@ -61,6 +61,7 @@ from src.bili_uploader import (
     compute_part_start_times,
     chunk_session_meta,
     pick_live_batch,
+    list_session_videos,
     load_live_ledger,
     mark_segments_uploaded,
     uploaded_segment_names,
@@ -107,6 +108,16 @@ transcribe_urls: set[str] = set()
 bili_upload_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bili_upload")
 # 需要上传 B 站的直播 URL 集合，由 URL_config.ini 中 "传B站" 登记
 bili_upload_urls: set[str] = set()
+
+# 逐段转码压缩：录制中把已完成的 TS 转成低码率 MP4 并删除 TS，体积约剩 1/5。
+# 好处是磁盘占用大幅下降、单场体积缩到 1.5GB 门槛以内（拆稿份数与投稿次数随之减少）。
+# 代价是每个 15 分钟分段约 1 分钟 CPU；用单线程池 + -threads 1，避免抢占录制与转写。
+LIVE_TRANSCODE_CRF = 30
+live_transcode_enabled = False
+live_transcode_exclude: set[str] = set()
+transcode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="transcode")
+_transcoding_inflight: set[str] = set()
+_transcoding_lock = threading.Lock()
 # 仅自己可见的 B 站投稿 URL 集合，由 URL_config.ini 中 "仅自己可见" 登记
 bili_self_only_urls: set[str] = set()
 url_tuples_list = []
@@ -620,6 +631,97 @@ def hold_videos_for_bili(files: list) -> None:
                     Path(marker).touch()
                 except OSError as e:
                     logger.warning(f"创建B站占位失败 {marker}: {e}")
+
+
+def _transcode_segment_to_mp4(seg_path: str) -> bool:
+    """把一個已完成的 TS 分段轉成低碼率 MP4，成功後刪除原 TS。
+
+    失敗時保留原 TS（不影響後續投稿），只是沒省到空間。
+    """
+    src = Path(seg_path)
+    if src.suffix.lower() != ".ts" or not src.exists():
+        return False
+    dst = src.with_suffix(".mp4")
+    tmp = str(dst) + ".part"
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", str(src),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(LIVE_TRANSCODE_CRF),
+        "-threads", "1",              # 只吃一個核心，留給錄製與轉寫
+        "-vf", "format=yuv420p",
+        "-c:a", "copy",
+        "-f", "mp4", tmp,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=1800)
+        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            raise RuntimeError("輸出為空")
+        os.replace(tmp, dst)
+    except Exception as e:
+        logger.warning(f"分段转码失败，保留原 TS: {src.name}: {e}")
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+    # 佔位從 TS 移到 MP4，讓百度雲繼續跳過它
+    old_marker = str(src) + ".bili_uploading"
+    if os.path.exists(old_marker):
+        try:
+            os.remove(old_marker)
+        except OSError:
+            pass
+        try:
+            Path(str(dst) + ".bili_uploading").touch()
+        except OSError as e:
+            logger.warning(f"创建MP4占位失败: {e}")
+
+    try:
+        os.remove(src)
+    except OSError as e:
+        logger.warning(f"删除已转码的 TS 失败 {src}: {e}")
+
+    before = os.path.getsize(dst)
+    logger.info(f"分段转码完成: {dst.name} ({before / 1024 / 1024:.0f}MB, CRF{LIVE_TRANSCODE_CRF})")
+    return True
+
+
+def _transcode_worker(seg_path: str) -> None:
+    try:
+        _transcode_segment_to_mp4(seg_path)
+    finally:
+        with _transcoding_lock:
+            _transcoding_inflight.discard(seg_path)
+
+
+def submit_live_transcode(files: list) -> None:
+    """把剛完成的 TS 分段排進逐段轉碼佇列（單執行緒，避免與錄製爭 CPU）。"""
+    if not live_transcode_enabled:
+        return
+    for f in files:
+        if not f.lower().endswith(".ts"):
+            continue
+        if Path(f).with_suffix(".mp4").exists():
+            continue
+        with _transcoding_lock:
+            if f in _transcoding_inflight:
+                continue
+            _transcoding_inflight.add(f)
+        try:
+            transcode_executor.submit(_transcode_worker, f)
+        except RuntimeError:
+            with _transcoding_lock:
+                _transcoding_inflight.discard(f)
+
+
+def should_live_transcode(record_name: str) -> bool:
+    if not live_transcode_enabled:
+        return False
+    name = record_name or ""
+    return not any(x and x in name for x in live_transcode_exclude)
 
 
 def bili_slot_status() -> tuple[bool, str, int]:
@@ -1336,14 +1438,10 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
 
     valid_ts_paths = []
     uploaded = uploaded_segment_names(session_dir)
-    for f in sorted(p.glob("*.ts")):
+    for f in list_session_videos(session_dir):
         if f.name in uploaded:
             continue        # 已由「直播中提前上傳」處理過
-        try:
-            if f.stat().st_size >= 2 * 1024 * 1024:
-                valid_ts_paths.append(str(f))
-        except OSError:
-            pass
+        valid_ts_paths.append(str(f))
 
     if not valid_ts_paths:
         # 兼容：如果 TS 文件曾被移动到 converted 目录，从 converted 目录检索
@@ -1352,14 +1450,10 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
             idx = rel_parts.index("downloads")
             conv_dir = Path(*rel_parts[:idx+1]) / "converted" / Path(*rel_parts[idx+1:])
             if conv_dir.exists():
-                for f in sorted(conv_dir.glob("*.ts")):
+                for f in list_session_videos(str(conv_dir)):
                     if f.name in uploaded:
                         continue
-                    try:
-                        if f.stat().st_size >= 2 * 1024 * 1024:
-                            valid_ts_paths.append(str(f))
-                    except OSError:
-                        pass
+                    valid_ts_paths.append(str(f))
                 if valid_ts_paths:
                     logger.info(f"整场多P投稿：从 converted 目录检索到 {len(valid_ts_paths)} 个视频")
 
@@ -1791,6 +1885,9 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     completed_segments.extend(publish_completed_segments(extra_working))
                 if record_url in bili_upload_urls and bili_upload_enabled:
                     hold_videos_for_bili(completed_segments)
+                # 逐段转码压缩：先把佔位建好，轉碼成功後換成 MP4 並刪掉 TS
+                if should_live_transcode(record_name):
+                    submit_live_transcode(completed_segments)
                 if should_transcribe:
                     submit_transcribe(completed_segments, record_name, record_url)
             if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
@@ -3544,6 +3641,19 @@ while True:
     split_time = str(read_config_value(config, '录制设置', '视频分段时间(秒)', 1800))
     converts_to_mp4 = options.get(read_config_value(config, '录制设置', '录制完成后自动转为mp4格式', "否"), False)
     converts_to_h264 = options.get(read_config_value(config, '录制设置', 'mp4格式重新编码为h264', "否"), False)
+    # 逐段转码压缩：录制中把已完成 TS 转成低码率 MP4，体积约剩 1/5
+    live_transcode_enabled = options.get(
+        read_config_value(config, '录制设置', '逐段转码压缩(是/否)', "否"), False
+    ) and not converts_to_mp4
+    try:
+        LIVE_TRANSCODE_CRF = int(read_config_float(config, '录制设置', '转码CRF值', 30))
+    except Exception:
+        LIVE_TRANSCODE_CRF = 30
+    live_transcode_exclude = {
+        s.strip() for s in
+        read_config_value(config, '录制设置', '转码排除主播', "").split(",")
+        if s.strip()
+    }
     delete_origin_file = options.get(read_config_value(config, '录制设置', '追加格式后删除原文件', "否"), False)
     create_time_file = options.get(read_config_value(config, '录制设置', '生成时间字幕文件', "否"), False)
     is_run_script = options.get(read_config_value(config, '录制设置', '是否录制完成后执行自定义脚本', "否"), False)

@@ -566,3 +566,15 @@ def test_pick_live_batch_single_large_segment_still_uploads(tmp_path):
     _mk_ts_sized(tmp_path, [3 * _MB] * 2)
     batch = bili_uploader.pick_live_batch(str(tmp_path), 4 * _MB, min_age_seconds=0)
     assert len(batch) == 1
+
+
+def test_list_session_videos_includes_mp4_and_ts_excludes_part(tmp_path):
+    """逐段轉碼後分段會變成 .mp4，尚未轉的仍是 .ts，兩者都要算；正在寫的 .part 不算。"""
+    for name, size in [("a_000.ts", 3 * _MB), ("a_001.mp4", 3 * _MB), ("a_002.ts.part", 5 * _MB)]:
+        with open(tmp_path / name, "wb") as f:
+            f.truncate(size)
+    with open(tmp_path / "tiny.ts", "wb") as f:
+        f.truncate(1024)          # 小於 2MB，忽略
+
+    names = sorted(p.name for p in bili_uploader.list_session_videos(str(tmp_path)))
+    assert names == ["a_000.ts", "a_001.mp4"]
