@@ -115,3 +115,12 @@ def test_final_segments_get_transcoded_when_queued():
     i_enqueue = body.index("enqueue_bili_job(job)")
     i_transcode = body.index("submit_live_transcode(valid_ts_paths)")
     assert i_enqueue < i_transcode
+
+
+def test_session_job_waits_for_transcode_before_resolving_paths():
+    """轉碼完成會刪原 TS；上傳前必須等該場次的轉碼收尾，否則 biliup 讀到一半檔案就沒了。"""
+    i_def = MAIN_SRC.index("def run_bili_session_job")
+    body = MAIN_SRC[i_def:i_def + 900]
+    i_wait = body.index("_wait_transcode_drain(session_dir)")
+    i_resolve = body.index("_resolve_session_video_paths(job)")
+    assert i_wait < i_resolve

@@ -729,6 +729,31 @@ def should_live_transcode(record_name: str) -> bool:
     return not any(x and x in name for x in live_transcode_exclude)
 
 
+def _inflight_transcodes(session_dir: str) -> list:
+    """回傳這個場次還在轉碼中的分段路徑。"""
+    prefix = str(Path(session_dir))
+    with _transcoding_lock:
+        return [p for p in _transcoding_inflight if p.startswith(prefix)]
+
+
+def _wait_transcode_drain(session_dir: str, timeout: float = 900.0) -> None:
+    """等這場次的逐段轉碼做完再開始投稿。
+
+    轉碼完成會刪掉原 TS；若 biliup 正在讀同一個檔案，會中途讀不到而整批
+    投稿失敗，還要多吃一次 288 分鐘冷卻。等幾分鐘比失敗划算。
+    呼叫端已持有投稿閘門，所以不會和「直播中提前上傳」互相插隊。
+    """
+    deadline = time.time() + timeout
+    pending = _inflight_transcodes(session_dir)
+    while pending and time.time() < deadline:
+        time.sleep(5)
+        pending = _inflight_transcodes(session_dir)
+    if pending:
+        logger.warning(
+            f"等待转码超时（{timeout:.0f} 秒），仍有 {len(pending)} 段在转码: {session_dir}"
+        )
+
+
 def bili_slot_status() -> tuple[bool, str, int]:
     """非阻塞检查当前是否允许投稿。返回 (是否可投, 原因, 还需等待秒数)。"""
     now = time.time()
@@ -1195,6 +1220,8 @@ def run_bili_session_job(job: dict) -> None:
     session_dir = job["session_dir"]
     record_name = job["record_name"]
     record_url = job.get("record_url", "")
+    # 先等轉碼收尾：轉碼完成會刪原 TS，撞上正在上傳的檔案會讓整批投稿失敗
+    _wait_transcode_drain(session_dir)
     valid_ts_paths = _resolve_session_video_paths(job)
 
     if not valid_ts_paths:
@@ -1439,6 +1466,7 @@ def _try_upload_live_batch() -> None:
                 session_dir,
                 bili_max_chunk_bytes,
                 exclude=uploaded_segment_names(session_dir),
+                skip=_inflight_transcodes(session_dir),
             )
             if not batch:
                 continue

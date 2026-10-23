@@ -431,7 +431,8 @@ def mark_segments_uploaded(session_dir: str, segments: dict, elapsed: float = No
 
 
 def pick_live_batch(session_dir: str, max_bytes: int, exclude=frozenset(),
-                    min_age_seconds: int = LIVE_UPLOAD_MIN_AGE_SECONDS) -> list:
+                    min_age_seconds: int = LIVE_UPLOAD_MIN_AGE_SECONDS,
+                    skip=frozenset()) -> list:
     """從錄製中的場次挑一批「已錄完但還沒上傳」的分段。
 
     是否上傳過以帳本（exclude）為準，而不是「TS 還在不在」——後者只在刪除策略下
@@ -450,6 +451,9 @@ def pick_live_batch(session_dir: str, max_bytes: int, exclude=frozenset(),
     batch, total, full = [], 0, False
     for f in files:
         if f.stem in exclude_stems:
+            continue
+        if str(f) in skip:
+            # 這一段還在轉碼，轉完會刪掉原 TS；等下一批再傳，否則上傳到一半檔案消失
             continue
         try:
             st = f.stat()

@@ -614,3 +614,20 @@ def test_list_session_videos_ignores_other_containers(tmp_path):
 
     names = sorted(p.name for p in bili_uploader.list_session_videos(str(tmp_path)))
     assert names == ["a_000.ts"]
+
+
+def test_pick_live_batch_skips_segments_still_transcoding(tmp_path):
+    """還在轉碼的分段不能進批次：轉完會刪原 TS，上傳到一半檔案就消失了。"""
+    import os
+    import time
+    for name in ["a_000.ts", "a_001.ts"]:
+        p = tmp_path / name
+        with open(p, "wb") as f:
+            f.truncate(3 * _MB)
+        os.utime(p, (time.time() - 600, time.time() - 600))
+
+    busy = str(tmp_path / "a_000.ts")
+    batch = bili_uploader.pick_live_batch(
+        str(tmp_path), max_bytes=3 * _MB, min_age_seconds=0, skip={busy}
+    )
+    assert [p.name for p in map(__import__("pathlib").Path, batch)] == ["a_001.ts"]
