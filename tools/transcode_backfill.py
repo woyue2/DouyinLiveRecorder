@@ -75,15 +75,32 @@ def transcode(src: Path) -> tuple[bool, str]:
     return True, f"{os.path.getsize(dst) / 1024 / 1024:.1f}MB"
 
 
-def collect_ts(jobs: list) -> list[Path]:
+def collect_ts(jobs: list, exclude: set) -> list[Path]:
     seen, out = set(), []
     for job in jobs:
+        name = job.get("record_name") or ""
+        if any(x and x in name for x in exclude):
+            print(f"  跳過（轉碼排除主播）: {name}")
+            continue
         for p in job.get("ts_paths", []):
             path = Path(p)
             if path.suffix.lower() == ".ts" and path.exists() and str(path) not in seen:
                 seen.add(str(path))
                 out.append(path)
     return out
+
+
+def load_exclude(config_path: Path) -> set:
+    """讀 config.ini 的轉碼排除主播，避免把排除名單的主播補轉掉。"""
+    try:
+        import configparser
+        cp = configparser.ConfigParser()
+        cp.read(config_path, encoding="utf-8-sig")
+        raw = cp.get("录制设置", "转码排除主播", fallback="")
+    except Exception as e:
+        print(f"  讀取排除名單失敗（視為空）: {e}")
+        return set()
+    return {x.strip() for x in raw.replace("，", ",").split(",") if x.strip()}
 
 
 def stage_transcode(paths: list[Path], dry_run: bool) -> int:
@@ -128,13 +145,16 @@ def stage_transcode(paths: list[Path], dry_run: bool) -> int:
     return 0
 
 
-def stage_finalize(queue_path: Path, dry_run: bool) -> int:
+def stage_finalize(queue_path: Path, dry_run: bool, exclude: set) -> int:
     data = json.loads(queue_path.read_text(encoding="utf-8"))
     jobs = data.get("queue", [])
     swapped = removed = 0
     changed = False
 
     for job in jobs:
+        name = job.get("record_name") or ""
+        if any(x and x in name for x in exclude):
+            continue
         new_paths = []
         for p in job.get("ts_paths", []):
             src = Path(p)
@@ -180,6 +200,9 @@ def main() -> int:
     ap.add_argument("--stage", choices=["transcode", "finalize"], default="transcode")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--queue", default="bili_pending_queue.json")
+    ap.add_argument("--config", default="config/config.ini")
+    ap.add_argument("--exclude", default=None,
+                    help="額外排除的主播名（逗號分隔）；預設讀 config 的轉碼排除主播")
     args = ap.parse_args()
 
     queue_path = Path(args.queue)
@@ -192,11 +215,17 @@ def main() -> int:
         print("佇列為空，無需補轉")
         return 0
 
-    paths = collect_ts(jobs)
+    exclude = load_exclude(Path(args.config))
+    if args.exclude is not None:
+        exclude |= {x.strip() for x in args.exclude.replace("，", ",").split(",") if x.strip()}
+    if exclude:
+        print(f"轉碼排除主播: {', '.join(sorted(exclude))}")
+
+    paths = collect_ts(jobs, exclude)
     print(f"佇列 {len(jobs)} 場，待處理分段 {len(paths)} 個\n")
     if args.stage == "transcode":
         return stage_transcode(paths, args.dry_run)
-    return stage_finalize(queue_path, args.dry_run)
+    return stage_finalize(queue_path, args.dry_run, exclude)
 
 
 if __name__ == "__main__":

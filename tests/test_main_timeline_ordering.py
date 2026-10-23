@@ -92,3 +92,24 @@ def test_schedule_bili_timeline_passes_start_times_through():
     assert "start_times" in arg_names
     body_src = ast.get_source_segment(MAIN_SRC, fn) or ""
     assert "probe_duration_seconds" not in body_src
+
+
+def test_session_job_resolves_paths_from_disk():
+    """入隊後逐段轉碼會把 TS 換成 MP4 並刪掉原檔，投稿前必須重新掃描目錄，
+    不能直接信任入隊時記下的 ts_paths。"""
+    i_def = MAIN_SRC.index("def run_bili_session_job")
+    body = MAIN_SRC[i_def:i_def + 1200]
+    assert "_resolve_session_video_paths(job)" in body
+    assert 'job.get("ts_paths", [])' not in body, (
+        "run_bili_session_job 不應再直接讀 job['ts_paths']，否則轉碼後路徑失效"
+    )
+
+
+def test_final_segments_get_transcoded_when_queued():
+    """场次结束时才 flush 的最后一段走不到录制循环的转码提交点，
+    必须在入队后补提交转码，且要在 enqueue 之后。"""
+    i_fn = MAIN_SRC.index("def process_session_multi_p_upload")
+    body = MAIN_SRC[i_fn:MAIN_SRC.index("def transcribe_and_notify")]
+    i_enqueue = body.index("enqueue_bili_job(job)")
+    i_transcode = body.index("submit_live_transcode(valid_ts_paths)")
+    assert i_enqueue < i_transcode

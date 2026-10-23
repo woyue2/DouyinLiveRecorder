@@ -578,3 +578,13 @@ def test_list_session_videos_includes_mp4_and_ts_excludes_part(tmp_path):
 
     names = sorted(p.name for p in bili_uploader.list_session_videos(str(tmp_path)))
     assert names == ["a_000.ts", "a_001.mp4"]
+
+
+def test_list_session_videos_prefers_mp4_when_both_exist(tmp_path):
+    """轉碼完成寫入 MP4 後才刪 TS，這段空窗兩者並存；同一段只能算一次，取 MP4。"""
+    for name in ["a_000.ts", "a_000.mp4", "a_001.ts"]:
+        with open(tmp_path / name, "wb") as f:
+            f.truncate(3 * _MB)
+
+    names = sorted(p.name for p in bili_uploader.list_session_videos(str(tmp_path)))
+    assert names == ["a_000.mp4", "a_001.ts"]

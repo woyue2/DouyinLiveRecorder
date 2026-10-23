@@ -1158,13 +1158,28 @@ def _build_successful_timeline(meta: dict, chunks: list, start_times: list,
     return {"meta": {**meta, "parts": parts}, "starts": starts}
 
 
+def _resolve_session_video_paths(job: dict) -> list:
+    """取得這場要投稿的影片檔。
+
+    佇列任務建立後，逐段轉碼可能才把 TS 換成 MP4（並刪掉原 TS），入隊時
+    記下的路徑會失效；投稿前重新掃描目錄，並用帳本濾掉「直播中提前上傳」
+    已處理過的分段。掃不到才退回入隊時的路徑。
+    """
+    session_dir = job.get("session_dir") or ""
+    uploaded = {Path(n).stem for n in uploaded_segment_names(session_dir)}
+    fresh = [str(f) for f in list_session_videos(session_dir) if f.stem not in uploaded]
+    if fresh:
+        return sorted(fresh)
+    return [p for p in job.get("ts_paths", []) if os.path.exists(p)]
+
+
 def run_bili_session_job(job: dict) -> None:
     """整场多 P 合集投稿；分P过多会自动拆成多份独立稿件，避免整包上传超时丢场。"""
     global bili_cooldown_until
     session_dir = job["session_dir"]
     record_name = job["record_name"]
     record_url = job.get("record_url", "")
-    valid_ts_paths = [p for p in job.get("ts_paths", []) if os.path.exists(p)]
+    valid_ts_paths = _resolve_session_video_paths(job)
 
     if not valid_ts_paths:
         logger.info(f"整场多P投稿：视频文件已不存在，跳过 ({session_dir})")
@@ -1502,6 +1517,12 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         job["reason"] = reason if not ready else "另一个投稿正在进行"
         job["wait_seconds"] = wait_seconds
         enqueue_bili_job(job)
+        # 场次结束时才 flush 的最后一段走不到录制循环里的转码提交点，这里补上。
+        # 只对「已入队」的情况做：立即投稿那条路径上传完就删档，没必要再花几分钟
+        # 转码；而队列里的任务要等几十分钟以上，转码后由
+        # _resolve_session_video_paths 重新解析路径，不会失效。
+        if should_live_transcode(record_name):
+            submit_live_transcode(valid_ts_paths)
 
 
 def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "") -> None:

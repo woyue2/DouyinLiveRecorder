@@ -366,20 +366,25 @@ def list_session_videos(session_dir: str, min_bytes: int = _SESSION_MIN_BYTES) -
     """列出場次目錄裡已完成的影片檔（不含正在寫入的 .part）。
 
     逐段轉碼開啟後，已轉好的分段是 .mp4、還沒轉的仍是 .ts，兩者都要算。
+    同一分段可能短暫同時存在 TS 與 MP4（轉碼完成寫入後才刪 TS），
+    此時只取 MP4，否則同一段會被當成兩個分P重複投稿。
     """
-    out = []
+    by_stem: dict[str, Path] = {}
     try:
         for f in Path(session_dir).iterdir():
             if f.suffix.lower() not in SESSION_VIDEO_EXTS:
                 continue
             try:
-                if f.stat().st_size >= min_bytes:
-                    out.append(f)
+                if f.stat().st_size < min_bytes:
+                    continue
             except OSError:
                 continue
+            prev = by_stem.get(f.stem)
+            if prev is None or f.suffix.lower() == ".mp4" and prev.suffix.lower() != ".mp4":
+                by_stem[f.stem] = f
     except OSError:
         return []
-    return sorted(out)
+    return sorted(by_stem.values())
 # 已提前上傳的分段帳本（放在場次目錄內），避免僅靠「TS 是否還在」判斷
 LIVE_LEDGER_NAME = ".bili_live_uploaded.json"
 
