@@ -362,10 +362,11 @@ LIVE_UPLOAD_MIN_AGE_SECONDS = 180
 # 原本各處只 glob *.ts，把它們納進來會讓「錄製完成後轉出的整場檔案」
 # 與分段一起被當成分P上傳。
 SESSION_VIDEO_EXTS = (".ts", ".mp4")
-_SESSION_MIN_BYTES = 2 * 1024 * 1024
+# 低於這個大小的分段視為碎片：碎片不進投稿佇列，也不該長期佔著 B 站佔位
+SESSION_MIN_BYTES = 2 * 1024 * 1024
 
 
-def list_session_videos(session_dir: str, min_bytes: int = _SESSION_MIN_BYTES) -> list:
+def list_session_videos(session_dir: str, min_bytes: int = SESSION_MIN_BYTES) -> list:
     """列出場次目錄裡已完成的影片檔（不含正在寫入的 .part）。
 
     逐段轉碼開啟後，已轉好的分段是 .mp4、還沒轉的仍是 .ts，兩者都要算。
@@ -388,6 +389,32 @@ def list_session_videos(session_dir: str, min_bytes: int = _SESSION_MIN_BYTES) -
     except OSError:
         return []
     return sorted(by_stem.values())
+def release_small_placeholders(session_dir: str) -> int:
+    """解除不會投稿的碎片分段的 .bili_uploading 占位。
+
+    低於 SESSION_MIN_BYTES 的分段永遠進不了 B 站投稿佇列（清單與單檔投稿都會
+    跳過），但占位還在，百度雲腳本就會一直繞過它們，檔案永遠留在磁碟上。
+    解除占位後由百度雲照常上傳 mp3/md 並在成功後刪掉本地檔。
+    """
+    released = 0
+    for f in list_session_videos(session_dir, min_bytes=0):
+        try:
+            if f.stat().st_size >= SESSION_MIN_BYTES:
+                continue
+        except OSError:
+            continue
+        marker = str(f) + ".bili_uploading"
+        if os.path.exists(marker):
+            try:
+                os.remove(marker)
+                released += 1
+            except OSError as e:
+                logger.warning(f"解除占位失败 {marker}: {e}")
+    if released:
+        logger.info(f"已解除 {released} 个碎片分段的B站占位: {Path(session_dir).name}")
+    return released
+
+
 # 已提前上傳的分段帳本（放在場次目錄內），避免僅靠「TS 是否還在」判斷
 LIVE_LEDGER_NAME = ".bili_live_uploaded.json"
 

@@ -62,6 +62,8 @@ from src.bili_uploader import (
     chunk_session_meta,
     pick_live_batch,
     list_session_videos,
+    release_small_placeholders,
+    SESSION_MIN_BYTES,
     load_live_ledger,
     mark_segments_uploaded,
     uploaded_segment_names,
@@ -691,6 +693,14 @@ def _transcode_segment_to_mp4(seg_path: str) -> bool:
 
     before = os.path.getsize(dst)
     logger.info(f"分段转码完成: {dst.name} ({before / 1024 / 1024:.0f}MB, CRF{LIVE_TRANSCODE_CRF})")
+    if before < SESSION_MIN_BYTES:
+        # 转码后掉到碎片门槛以下，永远不会投稿；留着占位只会让百度云一直跳过它
+        small_marker = str(dst) + ".bili_uploading"
+        try:
+            if os.path.exists(small_marker):
+                os.remove(small_marker)
+        except OSError as e:
+            logger.warning(f"解除碎片占位失败 {small_marker}: {e}")
     return True
 
 
@@ -1494,6 +1504,10 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         if not list(p.glob("*.transcribing")):
             break
         time.sleep(2)
+
+    # 碎片分段不会进投稿队列，先解除占位让百度云接手。
+    # 转码后才缩到门檻以下的那些，由 _transcode_segment_to_mp4 自己解除。
+    release_small_placeholders(session_dir)
 
     valid_ts_paths = []
     # 帳本鍵是檔名；逐段轉碼會把 TS 換成同名 MP4，用 stem 比對才不會漏掉

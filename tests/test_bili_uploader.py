@@ -631,3 +631,20 @@ def test_pick_live_batch_skips_segments_still_transcoding(tmp_path):
         str(tmp_path), max_bytes=3 * _MB, min_age_seconds=0, skip={busy}
     )
     assert [p.name for p in map(__import__("pathlib").Path, batch)] == ["a_001.ts"]
+
+
+def test_release_small_placeholders_unlocks_fragments(tmp_path):
+    """<2MB 的碎片永远进不了投稿队列，占位要解除让百度云接手；
+    >=2MB 的还要投稿，占位必须留着。"""
+    big = tmp_path / "a_000.mp4"
+    small = tmp_path / "a_001.mp4"
+    with open(big, "wb") as f:
+        f.truncate(3 * _MB)
+    with open(small, "wb") as f:
+        f.truncate(1 * _MB)
+    for p in (big, small):
+        (tmp_path / (p.name + ".bili_uploading")).touch()
+
+    assert bili_uploader.release_small_placeholders(str(tmp_path)) == 1
+    assert not (tmp_path / "a_001.mp4.bili_uploading").exists()
+    assert (tmp_path / "a_000.mp4.bili_uploading").exists()
