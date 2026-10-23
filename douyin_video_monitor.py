@@ -86,10 +86,15 @@ def load_project_config() -> Dict[str, Any]:
         "dingtalk_phone": "",
         "dingtalk_is_atall": False,
         "dingtalk_enabled": False,
+        "douyin_cookie": "",
     }
 
     if not loaded:
         return settings
+
+    # 抖音登入 Cookie：沿用直播錄製那一份，訪客身分抓不到新作品
+    if config.has_section("Cookie"):
+        settings["douyin_cookie"] = config.get("Cookie", "抖音cookie", fallback="").strip()
 
     # 轉寫腳本
     if config.has_section("录制设置"):
@@ -138,7 +143,8 @@ def load_project_config() -> Dict[str, Any]:
 
 
 class DouyinVideoMonitor:
-    def __init__(self, user_agent: str = DEFAULT_UA, timeout: float = 15.0):
+    def __init__(self, user_agent: str = DEFAULT_UA, timeout: float = 15.0,
+                 login_cookie: str = ""):
         self.ua = user_agent
         self.timeout = timeout
         self.client = httpx.Client(
@@ -148,6 +154,7 @@ class DouyinVideoMonitor:
         )
         self._cookie_str: Optional[str] = None
         self._cookie_expire_at: float = 0
+        self._login_cookie = (login_cookie or "").strip()
 
     def parse_sec_user_id(self, url_or_id: str) -> str:
         """從抖音用戶主頁連結提取 sec_user_id"""
@@ -173,9 +180,21 @@ class DouyinVideoMonitor:
         raise ValueError(f"無法從該網址提取 sec_user_id: {url_or_id}")
 
     def get_visitor_cookies(self, force_refresh: bool = False) -> str:
-        """獲取訪客 Cookie (包含 ttwid 與 UIFID)"""
+        """取得請求用的 Cookie。
+
+        有登入 Cookie（直播用的那一份）就用登入身分：抖音對訪客大幅限制
+        aweme/post 的返回範圍，實測訪客清單只到 9 月初、詳情接口直接
+        403（ArgusSecurityPlugin），訂閱的新作品完全看不到。
+        沒有登入 Cookie 才退回訪客 ttwid/UIFID。
+        """
         now = time.time()
         if not force_refresh and self._cookie_str and now < self._cookie_expire_at:
+            return self._cookie_str
+
+        if self._login_cookie:
+            self._cookie_str = self._login_cookie
+            self._cookie_expire_at = now + 3600
+            logger.info("使用設定的抖音登入 Cookie 抓取作品")
             return self._cookie_str
 
         logger.info("正在取得訪客 Session Cookie (ttwid / UIFID)...")
@@ -861,7 +880,7 @@ def main():
     args = parser.parse_args()
 
     config_settings = load_project_config()
-    monitor = DouyinVideoMonitor()
+    monitor = DouyinVideoMonitor(login_cookie=config_settings.get("douyin_cookie", ""))
 
     if args.daemon:
         interval_secs = int(args.interval_hours * 3600)
