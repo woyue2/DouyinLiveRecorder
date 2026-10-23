@@ -129,8 +129,12 @@ class CooldownManager:
                 f"提示：请勿手动频繁重试，静置 24 小时后系统将自动恢复巡检。"
             )
             try:
-                msg_push.dingtalk(dingtalk_webhook, alert_msg, dingtalk_phone, dingtalk_is_atall)
-                logger.info("釘釘風控緊急警報發送成功")
+                res = msg_push.dingtalk(dingtalk_webhook, alert_msg, dingtalk_phone, dingtalk_is_atall)
+                if res.get("success"):
+                    logger.info(f"釘釘風控緊急警報發送成功（{len(res['success'])} 個通道）")
+                else:
+                    # msg_push 失敗時只印訊息不拋錯，不看回傳值就會誤記成功
+                    logger.error(f"釘釘風控警報發送失敗：{res.get('error')}")
             except Exception as e:
                 logger.error(f"發送釘釘風控警報失敗: {e}")
 
@@ -169,11 +173,17 @@ class CooldownManager:
         )
         try:
             if feishu_webhook:
-                msg_push.feishu_bot(feishu_webhook, msg)
-                logger.info("飛書登入提醒發送成功")
+                res = msg_push.feishu_bot(feishu_webhook, msg)
+                if res.get("success"):
+                    logger.info("飛書登入提醒發送成功")
+                else:
+                    logger.error(f"飛書登入提醒發送失敗：{res.get('error')}")
             elif dingtalk_webhook:
-                msg_push.dingtalk(dingtalk_webhook, msg, dingtalk_phone, dingtalk_is_atall)
-                logger.info("登入提醒已改發到釘釘（未設定飛書 webhook）")
+                res = msg_push.dingtalk(dingtalk_webhook, msg, dingtalk_phone, dingtalk_is_atall)
+                if res.get("success"):
+                    logger.info("登入提醒已發到釘釘")
+                else:
+                    logger.error(f"釘釘登入提醒發送失敗：{res.get('error')}")
             else:
                 logger.warning("登入提醒未發送：沒有飛書或釘釘 webhook")
         except Exception as e:
