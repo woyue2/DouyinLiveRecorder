@@ -667,22 +667,27 @@ def _transcode_segment_to_mp4(seg_path: str) -> bool:
                 pass
         return False
 
-    # 佔位從 TS 移到 MP4，讓百度雲繼續跳過它
+    # 佔位從 TS 移到 MP4，讓百度雲繼續跳過它。
+    # 先建新的再刪舊的：反過來的話，新建失敗時檔案會在刪掉 TS 前出現無保護的空窗。
+    protected = True
     old_marker = str(src) + ".bili_uploading"
     if os.path.exists(old_marker):
         try:
-            os.remove(old_marker)
-        except OSError:
-            pass
-        try:
             Path(str(dst) + ".bili_uploading").touch()
         except OSError as e:
-            logger.warning(f"创建MP4占位失败: {e}")
+            protected = False
+            logger.warning(f"创建MP4占位失败，保留原 TS 不删: {e}")
+        else:
+            try:
+                os.remove(old_marker)
+            except OSError:
+                pass
 
-    try:
-        os.remove(src)
-    except OSError as e:
-        logger.warning(f"删除已转码的 TS 失败 {src}: {e}")
+    if protected:
+        try:
+            os.remove(src)
+        except OSError as e:
+            logger.warning(f"删除已转码的 TS 失败 {src}: {e}")
 
     before = os.path.getsize(dst)
     logger.info(f"分段转码完成: {dst.name} ({before / 1024 / 1024:.0f}MB, CRF{LIVE_TRANSCODE_CRF})")
@@ -1161,16 +1166,27 @@ def _build_successful_timeline(meta: dict, chunks: list, start_times: list,
 def _resolve_session_video_paths(job: dict) -> list:
     """取得這場要投稿的影片檔。
 
-    佇列任務建立後，逐段轉碼可能才把 TS 換成 MP4（並刪掉原 TS），入隊時
-    記下的路徑會失效；投稿前重新掃描目錄，並用帳本濾掉「直播中提前上傳」
-    已處理過的分段。掃不到才退回入隊時的路徑。
+    以入隊時記下的清單為準，不能改用整場重新掃描：風控重投時清單只含
+    未投完的分片，擴回整場會讓已發佈的那幾份被重投一次。
+    逐項檢查，TS 已被逐段轉碼換掉的就改指向同名 MP4。
+    清單整個失效（檔案都被搬走）時才退回掃描目錄，並用帳本濾掉
+    「直播中提前上傳」已處理過的分段。
     """
+    resolved = []
+    for p in job.get("ts_paths") or []:
+        f = Path(p)
+        if f.exists():
+            resolved.append(str(f))
+            continue
+        mp4 = f.with_suffix(".mp4")
+        if mp4.exists():
+            resolved.append(str(mp4))
+    if resolved:
+        return resolved
+
     session_dir = job.get("session_dir") or ""
     uploaded = {Path(n).stem for n in uploaded_segment_names(session_dir)}
-    fresh = [str(f) for f in list_session_videos(session_dir) if f.stem not in uploaded]
-    if fresh:
-        return sorted(fresh)
-    return [p for p in job.get("ts_paths", []) if os.path.exists(p)]
+    return sorted(str(f) for f in list_session_videos(session_dir) if f.stem not in uploaded)
 
 
 def run_bili_session_job(job: dict) -> None:
@@ -1452,9 +1468,10 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         time.sleep(2)
 
     valid_ts_paths = []
-    uploaded = uploaded_segment_names(session_dir)
+    # 帳本鍵是檔名；逐段轉碼會把 TS 換成同名 MP4，用 stem 比對才不會漏掉
+    uploaded = {Path(n).stem for n in uploaded_segment_names(session_dir)}
     for f in list_session_videos(session_dir):
-        if f.name in uploaded:
+        if f.stem in uploaded:
             continue        # 已由「直播中提前上傳」處理過
         valid_ts_paths.append(str(f))
 
@@ -1466,7 +1483,7 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
             conv_dir = Path(*rel_parts[:idx+1]) / "converted" / Path(*rel_parts[idx+1:])
             if conv_dir.exists():
                 for f in list_session_videos(str(conv_dir)):
-                    if f.name in uploaded:
+                    if f.stem in uploaded:
                         continue
                     valid_ts_paths.append(str(f))
                 if valid_ts_paths:
@@ -3672,7 +3689,7 @@ while True:
         LIVE_TRANSCODE_CRF = 30
     live_transcode_exclude = {
         s.strip() for s in
-        read_config_value(config, '录制设置', '转码排除主播', "").split(",")
+        re.split(r"[,，]", read_config_value(config, '录制设置', '转码排除主播', ""))
         if s.strip()
     }
     delete_origin_file = options.get(read_config_value(config, '录制设置', '追加格式后删除原文件', "否"), False)

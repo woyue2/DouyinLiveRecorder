@@ -357,8 +357,11 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
 
 # 錄製中提前上傳：分段完成後至少等這麼久才上傳，給轉寫留出時間（標題才不會退化）
 LIVE_UPLOAD_MIN_AGE_SECONDS = 180
-# 場次目錄裡算作「已完成影片」的副檔名（逐段轉碼後 TS 會變成 MP4）
-SESSION_VIDEO_EXTS = (".ts", ".mp4", ".flv", ".mkv")
+# 場次目錄裡算作「已完成影片」的副檔名。
+# 逐段轉碼後分段會由 .ts 變成 .mp4，兩種都要算；刻意不含 .flv/.mkv——
+# 原本各處只 glob *.ts，把它們納進來會讓「錄製完成後轉出的整場檔案」
+# 與分段一起被當成分P上傳。
+SESSION_VIDEO_EXTS = (".ts", ".mp4")
 _SESSION_MIN_BYTES = 2 * 1024 * 1024
 
 
@@ -441,10 +444,12 @@ def pick_live_batch(session_dir: str, max_bytes: int, exclude=frozenset(),
         return []
     min_bytes = int(max_bytes * 0.8)
     files = list_session_videos(session_dir)
+    # 帳本鍵是檔名；逐段轉碼會把 TS 換成同名 MP4，用 stem 比對才不會重傳
+    exclude_stems = {Path(n).stem for n in exclude}
 
     batch, total, full = [], 0, False
     for f in files:
-        if f.name in exclude:
+        if f.stem in exclude_stems:
             continue
         try:
             st = f.stat()

@@ -95,14 +95,16 @@ def test_schedule_bili_timeline_passes_start_times_through():
 
 
 def test_session_job_resolves_paths_from_disk():
-    """入隊後逐段轉碼會把 TS 換成 MP4 並刪掉原檔，投稿前必須重新掃描目錄，
-    不能直接信任入隊時記下的 ts_paths。"""
-    i_def = MAIN_SRC.index("def run_bili_session_job")
-    body = MAIN_SRC[i_def:i_def + 1200]
-    assert "_resolve_session_video_paths(job)" in body
-    assert 'job.get("ts_paths", [])' not in body, (
-        "run_bili_session_job 不應再直接讀 job['ts_paths']，否則轉碼後路徑失效"
-    )
+    """投稿前要以入隊清單為準逐項解析（TS 被轉碼換掉就改指向同名 MP4），
+    不能整場重新掃描——風控重投時清單只含未投完的分片。"""
+    i_def = MAIN_SRC.index("def _resolve_session_video_paths")
+    body = MAIN_SRC[i_def:MAIN_SRC.index("def run_bili_session_job")]
+    assert 'job.get("ts_paths")' in body, "應以入隊時記下的清單為主"
+    assert 'with_suffix(".mp4")' in body, "TS 被轉碼換掉後要改指向同名 MP4"
+    # 重新掃描只能當清單整體失效時的退路
+    assert body.index('with_suffix(".mp4")') < body.index("list_session_videos(")
+    assert "_resolve_session_video_paths(job)" in MAIN_SRC[
+        MAIN_SRC.index("def run_bili_session_job"):][:1200]
 
 
 def test_final_segments_get_transcoded_when_queued():

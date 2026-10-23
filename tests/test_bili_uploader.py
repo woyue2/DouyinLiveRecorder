@@ -588,3 +588,29 @@ def test_list_session_videos_prefers_mp4_when_both_exist(tmp_path):
 
     names = sorted(p.name for p in bili_uploader.list_session_videos(str(tmp_path)))
     assert names == ["a_000.mp4", "a_001.ts"]
+
+
+def test_pick_live_batch_excludes_by_stem_after_transcode_rename(tmp_path):
+    """帳本記的是 a_000.ts，但該分段已被轉碼成 a_000.mp4；用 stem 比對才不會重傳。"""
+    import os
+    import time
+    for name in ["a_000.mp4", "a_001.mp4"]:
+        p = tmp_path / name
+        with open(p, "wb") as f:
+            f.truncate(3 * _MB)
+        os.utime(p, (time.time() - 600, time.time() - 600))
+
+    batch = bili_uploader.pick_live_batch(
+        str(tmp_path), max_bytes=3 * _MB, exclude={"a_000.ts"}, min_age_seconds=0
+    )
+    assert [p.name for p in map(__import__("pathlib").Path, batch)] == ["a_001.mp4"]
+
+
+def test_list_session_videos_ignores_other_containers(tmp_path):
+    """.flv/.mkv 不在納入範圍：原本各處只 glob *.ts，收進來會讓整場轉檔變額外分P。"""
+    for name in ["a_000.ts", "a_001.flv", "a_002.mkv"]:
+        with open(tmp_path / name, "wb") as f:
+            f.truncate(3 * _MB)
+
+    names = sorted(p.name for p in bili_uploader.list_session_videos(str(tmp_path)))
+    assert names == ["a_000.ts"]
