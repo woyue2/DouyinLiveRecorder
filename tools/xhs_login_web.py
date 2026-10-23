@@ -81,13 +81,28 @@ def _sweep() -> None:
             _sessions.pop(sid, None)
 
 
-def new_session() -> tuple:
+def new_session(reuse_window: float = 90.0) -> tuple:
+    """建一個新的掃碼會話；短時間內重開頁面時重用上一張還沒被掃的碼。
+
+    7 分鐘連建 3 張碼就被小紅書 471 過（風控對高頻 create 敏感），
+    所以重新整理不換新碼，除非上一張已超過 reuse_window 或已被掃過。
+    """
+    now = time.time()
+    with _lock:
+        for sess in _sessions.values():
+            if (now - sess["created"] < reuse_window
+                    and sess["state"] == "waiting"):
+                sess_qr = sess.get("qr_url")
+                if sess_qr:
+                    return sess["sid"], sess_qr
+
     client, signer, qr_id, code, qr_url = create_login_session()
     sid = secrets.token_urlsafe(12)
     with _lock:
         _sessions[sid] = {
-            "client": client, "signer": signer, "qr_id": qr_id, "code": code,
-            "created": time.time(), "state": "waiting", "info": None,
+            "sid": sid, "client": client, "signer": signer, "qr_id": qr_id,
+            "code": code, "qr_url": qr_url, "created": now,
+            "state": "waiting", "info": None,
         }
     return sid, qr_url
 
