@@ -76,6 +76,40 @@ def dingtalk(url: str, content: str, number: str = None, is_atall: bool = False)
     return {"success": success, "error": error}
 
 
+def feishu_bot(url: str, content: str) -> Dict[str, Any]:
+    """飛書自訂機器人 webhook 純文字推送。
+
+    回傳 {"success": [...], "error": [...]}，與其他通道一致。
+    飛書成功時回 {"code": 0, "msg": "success"}（舊版為 StatusCode）。
+    """
+    success = []
+    error = []
+    api_list = url.replace('，', ',').split(',') if url.strip() else []
+    for api_index, api in enumerate(api_list, start=1):
+        json_data = {
+            "msg_type": "text",
+            "content": {"text": content},
+        }
+        try:
+            data = json.dumps(json_data).encode('utf-8')
+            req = urllib.request.Request(api, data=data, headers=headers)
+            response = opener.open(req, timeout=10)
+            result = json.loads(response.read().decode('utf-8'))
+            code = result.get('code', result.get('StatusCode'))
+            if code == 0:
+                success.append(api)
+            else:
+                error.append(api)
+                print(f'飛書推送失敗, 第{api_index}个推送地址, {result.get("msg")}')
+        except Exception as e:
+            error.append(api)
+            print(
+                f'飛書推送失敗, 第{api_index}个推送地址, '
+                f'错误信息:{_safe_push_error(e)}'
+            )
+    return {"success": success, "error": error}
+
+
 def xizhi(url: str, title: str, content: str) -> Dict[str, Any]:
     success = []
     error = []

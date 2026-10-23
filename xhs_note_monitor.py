@@ -95,7 +95,9 @@ class CooldownManager:
         reason: str = "",
         dingtalk_webhook: str = "",
         dingtalk_phone: str = "",
-        dingtalk_is_atall: bool = False
+        dingtalk_is_atall: bool = False,
+        feishu_webhook: str = "",
+        login_url: str = ""
     ):
         """激活風控熔斷保護：寫入冷卻記錄並發送釘釘緊急報警"""
         now = time.time()
@@ -132,6 +134,67 @@ class CooldownManager:
             except Exception as e:
                 logger.error(f"發送釘釘風控警報失敗: {e}")
 
+        # 登入態失效要人工掃碼，單獨再發一則帶「真連結」的通知：
+        # 點開就是伺服器上的登入頁，掃完 cookie 自動寫回，不必手動搬檔。
+        if self._is_login_expired(reason):
+            self._notify_login_needed(
+                feishu_webhook=feishu_webhook,
+                dingtalk_webhook=dingtalk_webhook,
+                dingtalk_phone=dingtalk_phone,
+                dingtalk_is_atall=dingtalk_is_atall,
+                login_url=login_url,
+                expire_dt=expire_dt,
+                reason=reason,
+            )
+
+    @staticmethod
+    def _is_login_expired(reason: str) -> bool:
+        text = reason or ""
+        return ("登录已过期" in text or "登入態失效" in text or "請更新 Cookie" in text
+                or "请更新 Cookie" in text)
+
+    def _notify_login_needed(self, feishu_webhook: str, dingtalk_webhook: str,
+                             dingtalk_phone: str, dingtalk_is_atall: bool,
+                             login_url: str, expire_dt: str, reason: str) -> None:
+        link_line = (f"\n點此掃碼登入（伺服器端，掃完自動寫回 cookie）：\n{login_url}\n"
+                     f"\n二維碼約 3 分鐘失效，過期就重新打開同一個連結。\n"
+                     if login_url else
+                     "\n（未設定登入連結：請確認 xhs_login_web 服務與 token 檔）\n")
+        msg = (
+            f"🔑 【小紅書需要重新登入】\n\n"
+            f"原因：{reason}\n"
+            f"已暫停抓取，預計恢復：{expire_dt}\n"
+            + link_line +
+            f"\n登入完成後熔斷記錄會自動清除，下一次巡檢就會用新的 cookie。"
+        )
+        try:
+            if feishu_webhook:
+                msg_push.feishu_bot(feishu_webhook, msg)
+                logger.info("飛書登入提醒發送成功")
+            elif dingtalk_webhook:
+                msg_push.dingtalk(dingtalk_webhook, msg, dingtalk_phone, dingtalk_is_atall)
+                logger.info("登入提醒已改發到釘釘（未設定飛書 webhook）")
+            else:
+                logger.warning("登入提醒未發送：沒有飛書或釘釘 webhook")
+        except Exception as e:
+            logger.error(f"發送登入提醒失敗: {e}")
+
+
+def xhs_login_url() -> str:
+    """伺服器掃碼登入頁的真連結（含 token）。
+
+    token 由 tools/xhs_login_web.py 首次啟動時產生並寫入
+    config/xhs_login_token.txt；取不到就回空字串，通知會提示未設定。
+    """
+    base = os.environ.get("XHS_LOGIN_BASE_URL", "http://101.35.47.249:8080").rstrip("/")
+    token_path = os.path.join(_CURRENT_DIR, "config", "xhs_login_token.txt")
+    try:
+        with open(token_path, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        return ""
+    return f"{base}/xhs-login?t={token}" if token else ""
+
 
 def load_project_config() -> Dict[str, Any]:
     """讀取專案 config.ini 中的小紅書配置、轉寫與推送設定"""
@@ -158,6 +221,7 @@ def load_project_config() -> Dict[str, Any]:
         "dingtalk_phone": "",
         "dingtalk_is_atall": False,
         "dingtalk_enabled": False,
+        "feishu_webhook": "",
         "web_enabled": True,
         "web_outdir": "./web_posts",
         "web_base_url": "http://101.35.47.249:8080/posts",
@@ -184,6 +248,7 @@ def load_project_config() -> Dict[str, Any]:
         at_all_str = config.get("推送配置", "钉钉通知@全体(是/否)", fallback="否").strip()
         settings["dingtalk_is_atall"] = at_all_str in {"是", "true", "1", "yes"}
         settings["dingtalk_enabled"] = bool("钉钉" in push_types and settings["dingtalk_webhook"])
+        settings["feishu_webhook"] = config.get("推送配置", "飞书webhook", fallback="").strip()
 
     if config.has_section("Web服务配置"):
         settings["web_enabled"] = config.get("Web服务配置", "启用网页生成", fallback="是").strip() in {"是", "true", "1", "yes"}
@@ -969,7 +1034,9 @@ def process_monitor_once(
                 reason=str(rce),
                 dingtalk_webhook=dingtalk_webhook,
                 dingtalk_phone=dingtalk_phone,
-                dingtalk_is_atall=dingtalk_is_atall
+                dingtalk_is_atall=dingtalk_is_atall,
+                feishu_webhook=config_settings.get("feishu_webhook", ""),
+                login_url=xhs_login_url(),
             )
             break
         except Exception as e:
