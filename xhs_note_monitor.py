@@ -71,6 +71,10 @@ class CooldownManager:
         """
         檢查目前是否處於風控冷卻期
         返回 (是否處於冷卻期, 剩餘小時數, 觸發原因)
+
+        登入態失效（login_expired）是無限期熔斷：睡 24 小時也不會好，睡醒
+        再打 API 只是拿死 cookie 去撞風控。只有使用者掃碼登入（web 服務
+        清除記錄檔）才會解除。
         """
         if not os.path.exists(self.filepath):
             return False, 0.0, ""
@@ -84,10 +88,20 @@ class CooldownManager:
             if now < expire_at:
                 remaining_hours = (expire_at - now) / 3600.0
                 return True, remaining_hours, reason
+            if data.get("login_expired"):
+                return True, 0.0, reason
         except Exception as e:
             logger.warning(f"讀取冷卻紀錄檔案失敗: {e}")
 
         return False, 0.0, ""
+
+    def is_login_expired_cooldown(self) -> bool:
+        """目前熔斷是否因登入態失效（決定要不要改發登入提醒而不是等睡醒）。"""
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                return bool(json.load(f).get("login_expired"))
+        except Exception:
+            return False
 
     def activate_cooldown(
         self,
@@ -105,6 +119,7 @@ class CooldownManager:
         expire_dt = datetime.datetime.fromtimestamp(expire_at).strftime("%Y-%m-%d %H:%M:%S")
 
         os.makedirs(os.path.dirname(os.path.abspath(self.filepath)), exist_ok=True)
+        login_expired = self._is_login_expired(reason)
         try:
             with open(self.filepath, "w", encoding="utf-8") as f:
                 json.dump({
@@ -112,9 +127,14 @@ class CooldownManager:
                     "expire_at": expire_at,
                     "expire_dt": expire_dt,
                     "cooldown_hours": hours,
+                    "login_expired": login_expired,
                     "reason": reason
                 }, f, ensure_ascii=False, indent=2)
-            logger.error(f"⚠️ [風控熔斷激活] 系統將自動休眠 {hours:.1f} 小時（至 {expire_dt}），原因: {reason}")
+            if login_expired:
+                logger.error(f"⚠️ [風控熔斷激活·登入失效] 這是無限期熔斷：睡醒也不會好，"
+                             f"每次醒來再打 API 只是拿死 cookie 撞風控。請透過登入連結掃碼解除。原因: {reason}")
+            else:
+                logger.error(f"⚠️ [風控熔斷激活] 系統將自動休眠 {hours:.1f} 小時（至 {expire_dt}），原因: {reason}")
         except Exception as e:
             logger.error(f"寫入冷卻紀錄檔案失敗: {e}")
 
@@ -826,6 +846,21 @@ def process_monitor_once(
     # 1. 檢查是否處於風控冷卻期
     is_cooling, remain_hours, cool_reason = cooldown_mgr.check_cooldown()
     if is_cooling:
+        if cooldown_mgr.is_login_expired_cooldown():
+            # 登入態失效是無限期熔斷：等 24 小時不會好，醒來再打 API 只是拿
+            # 死 cookie 去撞風控。改為每次巡檢重發登入提醒，直到使用者掃碼
+            # 登入（web 服務會清除熔斷記錄）。巡檢一天只跑一次，不會轟炸。
+            logger.warning("⛔ [登入失效熔斷中] 不嘗試存取小紅書，重發登入提醒。")
+            cooldown_mgr._notify_login_needed(
+                feishu_webhook=config_settings.get("feishu_webhook", ""),
+                dingtalk_webhook=args.dingtalk_webhook or config_settings.get("dingtalk_webhook", ""),
+                dingtalk_phone=config_settings.get("dingtalk_phone", ""),
+                dingtalk_is_atall=config_settings.get("dingtalk_is_atall", False),
+                login_url=xhs_login_url(),
+                expire_dt="掃碼登入後立即恢復",
+                reason=cool_reason,
+            )
+            return
         logger.warning(
             f"⛔ [風控熔斷保護生效中] 系統目前處於休眠狀態（尚餘 {remain_hours:.1f} 小時）。\n"
             f"觸發原因: {cool_reason}。\n"
