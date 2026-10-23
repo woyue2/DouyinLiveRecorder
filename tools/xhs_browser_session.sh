@@ -5,7 +5,7 @@
 set -u
 export DISPLAY=:99
 
-Xvfb :99 -screen 0 1280x900x24 &
+Xvfb :99 -screen 0 900x1500x24 &
 sleep 1
 
 x11vnc -display :99 -passwd xhs8888 -forever -shared -rfbport 5900 -quiet &
@@ -18,6 +18,6 @@ exec /home/ubuntu/chromium/chrome-linux/chrome \
     --user-data-dir=/home/ubuntu/.xhs-chrome \
     --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=* \
     --no-first-run --no-default-browser-check --disable-gpu --disable-dev-shm-usage \
-    --disable-features=Translate --lang=zh-CN \
-    --window-size=1280,900 --start-maximized \
+    --disable-features=Translate,LocalNetworkAccessChecks --lang=zh-CN \
+    --window-size=900,1500 --start-maximized \
     "https://www.xiaohongshu.com"
