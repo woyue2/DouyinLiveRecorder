@@ -818,8 +818,69 @@ def process_blogger_videos(
     return downloaded_count
 
 
+def check_login_state(monitor: DouyinVideoMonitor) -> Optional[bool]:
+    """檢查抖音登入是否有效。True=已登入、False=未登入、None=無法判斷。
+
+    訪客身分下抖音只回截斷的舊作品清單（實測只給 18 部、最新停在 10-17），
+    照跑只會得到「符合 0 部」的假結果，必須先擋下來並通知重新登入。
+    """
+    try:
+        q = urllib.parse.urlencode({
+            "device_platform": "webapp", "aid": "6383",
+            "pc_client_type": "1", "version_code": "190500",
+            "version_name": "19.5.0", "cookie_enabled": "true",
+        })
+        url = (f"https://www.douyin.com/aweme/v1/web/user/profile/self/"
+               f"?{q}&a_bogus={ab_sign(q, monitor.ua)}")
+        r = monitor.client.get(url, headers={
+            "User-Agent": monitor.ua,
+            "Cookie": monitor.get_visitor_cookies(),
+            "Referer": "https://www.douyin.com/",
+        })
+        data = r.json()
+        if data.get("status_code") == 8 or "未登录" in str(data.get("status_msg", "")):
+            return False
+        return bool((data.get("user") or {}).get("uid")) or True
+    except Exception as e:
+        logger.warning(f"檢查抖音登入狀態失敗（視為未知）: {e}")
+        return None
+
+
+def notify_douyin_login_needed(config_settings: Dict[str, Any]) -> None:
+    """登入失效時發釘釘，帶可直接操作的 noVNC 瀏覽器連結。"""
+    webhook = config_settings.get("dingtalk_webhook", "")
+    if not webhook:
+        logger.warning("抖音登入失效，但未設定釘釘 webhook，無法通知")
+        return
+    msg = (
+        "🔑 【抖音登入已失效】\n\n"
+        "作品監控目前是訪客身分，抖音只回截斷的舊清單，抓不到新作品。\n\n"
+        "點此登入（伺服器上的真瀏覽器）：\n"
+        "http://101.35.47.249:8080/vnc/vnc.html?autoconnect=1&resize=scale&password=xhs8888\n\n"
+        "VNC 密碼：xhs8888\n"
+        "登入完成後 cookie 會自動收割，下一輪巡檢恢復正常。\n\n"
+        "（同一個 cookie 也給直播錄製用，登入後直播監測一併恢復）"
+    )
+    try:
+        res = msg_push.dingtalk(webhook, msg,
+                               config_settings.get("dingtalk_phone", ""),
+                               config_settings.get("dingtalk_is_atall", False))
+        if res.get("success"):
+            logger.info("已發送抖音登入提醒到釘釘")
+        else:
+            logger.error(f"抖音登入提醒發送失敗: {res.get('error')}")
+    except Exception as e:
+        logger.error(f"發送抖音登入提醒異常: {e}")
+
+
 def process_monitor_once(args, monitor: DouyinVideoMonitor, config_settings: Dict[str, Any]):
     """執行一次輪詢（支援單一 URL 或從 video_URL_config.ini 批量讀取）"""
+    state = check_login_state(monitor)
+    if state is False:
+        logger.error("⛔ 抖音登入已失效，跳過本輪巡檢（訪客身分只會拿到截斷的舊清單）")
+        notify_douyin_login_needed(config_settings)
+        return
+
     targets = []
     if args.url:
         targets.append({"url": args.url, "name": ""})
