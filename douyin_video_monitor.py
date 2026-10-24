@@ -143,6 +143,27 @@ def load_project_config() -> Dict[str, Any]:
     return settings
 
 
+def _read_douyin_cookie_from_disk() -> str:
+    """直接從設定檔讀抖音 cookie（local_secrets.ini 優先）。
+
+    收割器登入後會寫檔；監控是常駐的，不能只在啟動時讀一次。
+    """
+    value = ""
+    for path in (os.path.join(_CURRENT_DIR, "config", "config.ini"),
+                 os.path.join(_CURRENT_DIR, "config", "local_secrets.ini")):
+        if not os.path.exists(path):
+            continue
+        try:
+            cp = configparser.RawConfigParser()
+            cp.read(path, encoding="utf-8-sig")
+            got = cp.get("Cookie", "抖音cookie", fallback="").strip()
+            if got:
+                value = got
+        except Exception:
+            continue
+    return value
+
+
 class DouyinVideoMonitor:
     def __init__(self, user_agent: str = DEFAULT_UA, timeout: float = 15.0,
                  login_cookie: str = ""):
@@ -193,6 +214,11 @@ class DouyinVideoMonitor:
             return self._cookie_str
 
         if self._login_cookie:
+            if force_refresh:
+                # 被 Argus 攔截時重讀設定檔：使用者可能剛透過 noVNC 重新登入，
+                # 收割器已把新 cookie 寫回 config，不必重啟監控。
+                self._login_cookie = _read_douyin_cookie_from_disk() or self._login_cookie
+                logger.info("已重新讀取抖音登入 Cookie")
             self._cookie_str = self._login_cookie
             self._cookie_expire_at = now + 3600
             logger.info("使用設定的抖音登入 Cookie 抓取作品")
@@ -841,7 +867,9 @@ def check_login_state(monitor: DouyinVideoMonitor) -> Optional[bool]:
         data = r.json()
         if data.get("status_code") == 8 or "未登录" in str(data.get("status_msg", "")):
             return False
-        return bool((data.get("user") or {}).get("uid")) or True
+        # 只有明確拿到 user.uid 才算已登入；其他異常回應不可當成已登入，
+        # 否則又會用截斷的訪客清單跑出「符合 0 部」的假結果。
+        return bool((data.get("user") or {}).get("uid"))
     except Exception as e:
         logger.warning(f"檢查抖音登入狀態失敗（視為未知）: {e}")
         return None

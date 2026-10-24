@@ -1,0 +1,21 @@
+[Unit]
+Description=XHS real-browser login session (Xvfb+x11vnc+noVNC+Chromium)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/home/ubuntu/DouyinLiveRecorder-main/tools/xhs_browser_session.sh
+Restart=always
+RestartSec=5
+# 這台機器只有 1.9GB：Chromium 曾吃到約 1GB 並把整機拖進 swap，
+# 導致 sshd/nginx 全部無回應（2026-10-24 實際發生，需重啟主機）。
+# 鎖上限讓 Chromium 自己被回收，而不是拖垮整台機器。
+MemoryMax=900M
+MemorySwapMax=800M
+# 安全閥：長時間掛著對 ram 不友善，也順便讓瀏覽器定期換新 profile。
+RuntimeMaxSec=21600
+
+[Install]
+WantedBy=multi-user.target

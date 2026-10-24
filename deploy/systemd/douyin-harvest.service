@@ -1,0 +1,15 @@
+[Unit]
+Description=Douyin cookie harvester (watches CDP for sessionid)
+After=xhs-browser.service
+Wants=xhs-browser.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/DouyinLiveRecorder-main
+ExecStart=/usr/bin/python3 -u tools/douyin_harvest_cookies.py --wait
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

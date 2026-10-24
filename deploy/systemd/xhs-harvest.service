@@ -1,0 +1,17 @@
+[Unit]
+Description=XHS cookie harvester (watches CDP for id_token)
+After=xhs-browser.service
+Wants=xhs-browser.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/DouyinLiveRecorder-main
+ExecStart=/usr/bin/python3 -u tools/xhs_harvest_cookies.py --wait
+# 腳本寫完 cookie 不會退出（要持續等下次登入），所以這裡的 Restart
+# 只在真的崩潰時生效。
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
