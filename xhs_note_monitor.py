@@ -36,6 +36,7 @@ _SRC_DIR = os.path.join(_CURRENT_DIR, "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
+import browser_login
 import msg_push
 from md_to_html import HTML_TEMPLATE, render_markdown_inline
 from filename_utils import sanitize_filename_part
@@ -180,10 +181,10 @@ class CooldownManager:
     def _notify_login_needed(self, feishu_webhook: str, dingtalk_webhook: str,
                              dingtalk_phone: str, dingtalk_is_atall: bool,
                              login_url: str, expire_dt: str, reason: str) -> None:
-        link_line = (f"\n點此掃碼登入（伺服器端，掃完自動寫回 cookie）：\n{login_url}\n"
-                     f"\n二維碼約 3 分鐘失效，過期就重新打開同一個連結。\n"
+        link_line = (f"\n點此登入（伺服器上的真瀏覽器，滑塊自己拖）：\n{login_url}\n"
+                     f"\nVNC 密碼：{browser_login.VNC_PASSWORD}\n"
                      if login_url else
-                     "\n（未設定登入連結：請確認 xhs_login_web 服務與 token 檔）\n")
+                     "\n（未取得登入連結，請確認 xhs-browser 服務是否在跑）\n")
         msg = (
             f"🔑 【小紅書需要重新登入】\n\n"
             f"原因：{reason}\n"
@@ -211,19 +212,8 @@ class CooldownManager:
 
 
 def xhs_login_url() -> str:
-    """伺服器掃碼登入頁的真連結（含 token）。
-
-    token 由 tools/xhs_login_web.py 首次啟動時產生並寫入
-    config/xhs_login_token.txt；取不到就回空字串，通知會提示未設定。
-    """
-    base = os.environ.get("XHS_LOGIN_BASE_URL", "http://101.35.47.249:8080").rstrip("/")
-    token_path = os.path.join(_CURRENT_DIR, "config", "xhs_login_token.txt")
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            token = f.read().strip()
-    except OSError:
-        return ""
-    return f"{base}/xhs-login?t={token}" if token else ""
+    """伺服器 noVNC 登入入口（小紅書與抖音共用同一個真瀏覽器）。"""
+    return browser_login.login_url()
 
 
 def load_project_config() -> Dict[str, Any]:

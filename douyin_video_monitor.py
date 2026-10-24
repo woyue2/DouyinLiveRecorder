@@ -39,6 +39,7 @@ if _SRC_DIR not in sys.path:
 
 from ab_sign import ab_sign
 import msg_push
+import browser_login
 from filename_utils import sanitize_filename_part
 
 logging.basicConfig(
@@ -855,9 +856,8 @@ def notify_douyin_login_needed(config_settings: Dict[str, Any]) -> None:
     msg = (
         "🔑 【抖音登入已失效】\n\n"
         "作品監控目前是訪客身分，抖音只回截斷的舊清單，抓不到新作品。\n\n"
-        "點此登入（伺服器上的真瀏覽器）：\n"
-        "http://101.35.47.249:8080/vnc/vnc.html?autoconnect=1&resize=scale&password=xhs8888\n\n"
-        "VNC 密碼：xhs8888\n"
+        f"點此登入（伺服器上的真瀏覽器）：\n{browser_login.login_url()}\n\n"
+        f"VNC 密碼：{browser_login.VNC_PASSWORD}\n"
         "登入完成後 cookie 會自動收割，下一輪巡檢恢復正常。\n\n"
         "（同一個 cookie 也給直播錄製用，登入後直播監測一併恢復）"
     )

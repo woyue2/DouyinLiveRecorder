@@ -71,18 +71,25 @@ def write_cookie(cookies: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wait", action="store_true", help="持續輪詢直到登入成功")
+    ap.add_argument("--wait", action="store_true", help="常駐待命（systemd 用）")
     ap.add_argument("--interval", type=float, default=5.0)
     args = ap.parse_args()
 
+    # 寫過就不再重寫，但**不退出**：收割完就結束的話，下次 cookie 過期
+    # 時沒有任何進程在監看，使用者登入了也收不到（通知卻承諾會自動收割）。
+    last_written = ""
     while True:
         try:
             cookies = get_xhs_cookies()
+            session = cookies.get("web_session", "")
             if has_session(cookies):
-                write_cookie(cookies)
-                logger.info("🎉 已收割小紅書登入 cookie 並寫回設定")
-                return 0
-            if not args.wait:
+                if session != last_written:
+                    write_cookie(cookies)
+                    last_written = session
+                    logger.info("🎉 已收割小紅書登入 cookie 並寫回設定（繼續待命）")
+                if not args.wait:
+                    return 0
+            elif not args.wait:
                 logger.info("瀏覽器裡還沒有登入 session（缺 id_token）")
                 return 1
         except Exception as e:

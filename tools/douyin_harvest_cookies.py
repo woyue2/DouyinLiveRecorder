@@ -76,14 +76,20 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=10.0)
     args = ap.parse_args()
 
+    # 同小紅書：寫過就不重寫，但不退出——結束的話下次過期就沒人收割。
+    last_written = ""
     while True:
         try:
             cookies = get_douyin_cookies()
+            session = cookies.get("sessionid", "")
             if is_logged_in(cookies):
-                write_cookie(cookies)
-                logger.info("🎉 已收割抖音登入 cookie")
-                return 0
-            if not args.wait:
+                if session != last_written:
+                    write_cookie(cookies)
+                    last_written = session
+                    logger.info("🎉 已收割抖音登入 cookie（繼續待命）")
+                if not args.wait:
+                    return 0
+            elif not args.wait:
                 logger.info("瀏覽器裡還沒有抖音登入 session")
                 return 1
         except Exception as e:

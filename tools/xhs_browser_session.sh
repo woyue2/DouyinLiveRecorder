@@ -8,7 +8,10 @@ export DISPLAY=:99
 Xvfb :99 -screen 0 900x1500x24 &
 sleep 1
 
-x11vnc -display :99 -passwd xhs8888 -forever -shared -rfbport 5900 -quiet &
+# -localhost：只綁 127.0.0.1，對外一律走 nginx /vnc/ 代理。
+# 不綁的話 RFB 直接裸奔在 0.0.0.0:5900，弱密碼被爆破等於交出已登入的帳號。
+x11vnc -display :99 -passwd "${VNC_PASSWORD:-xhs8888}" -localhost \
+       -forever -shared -rfbport 5900 -quiet &
 sleep 1
 
 websockify --web=/usr/share/novnc 6080 localhost:5900 &
