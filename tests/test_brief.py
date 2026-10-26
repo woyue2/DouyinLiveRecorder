@@ -35,3 +35,17 @@ def test_skips_bare_label_without_emoji():
 
 def test_returns_empty_when_only_label():
     assert brief.to_one_sentence("💡 **精彩看点**\n") == ""
+
+
+def test_label_with_trailing_colon_is_skipped():
+    """實際摘要可能寫成「精彩看点：」，結尾冒號要一併去掉才認得。"""
+    assert brief.to_one_sentence("精彩看点：\n真正的第一句内容在这里") == "真正的第一句内容在这里"
+
+
+def test_decimal_number_is_not_treated_as_ordinal():
+    """「3.15」不是序號，不能砍成「15」。"""
+    assert brief.to_one_sentence("3.15 消费者权益日的影响") == "3.15 消费者权益日的影响"
+
+
+def test_chinese_ordinal_is_stripped():
+    assert brief.to_one_sentence("1、第一句正文内容") == "第一句正文内容"

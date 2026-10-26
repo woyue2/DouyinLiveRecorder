@@ -25,6 +25,8 @@ import msg_push
 
 logger = logging.getLogger("brief")
 
+_webhook_cache = None  # (mtime 元組, webhook)，見 _load_webhook
+
 _MAX_SENTENCE = 60
 _SENTENCE_END = "。！？!?\n"
 # 摘要區塊的第一行通常只是標題（「💡 **精彩看点**」），不該當成內容
@@ -35,17 +37,35 @@ _LABEL_ONLY = {"精彩看点", "精彩看點", "看点", "看點", "摘要", "�
 def _clean_line(line: str) -> str:
     """去掉 markdown 標記、行首 emoji 與序號，留下可讀文字。"""
     line = line.replace("**", "").replace("__", "").lstrip("#> ").strip()
+    # 序號必須以空白或行尾收尾才算序號，否則「3.15 消費者權益日」會被砍成
+    # 「15 消費者權益日」。中文常見的「1、」「1）」沒有這個歧義，照砍。
+    line = re.sub(r"^\d+\.\s+", "", line)
+    line = re.sub(r"^\d+[、)）]\s*", "", line)
+    line = re.sub(r"^[①-⑳]\s*", "", line)
     # 行首的裝飾字元（emoji、項目符號）不對應任何文字或數字
     line = re.sub(r"^[^\w一-鿿]+", "", line)
-    # 「1.」「2、」「①」這類編號對一句話沒有意義
-    line = re.sub(r"^\d+\s*[.、)）]\s*", "", line)
-    line = re.sub(r"^[①-⑳]\s*", "", line)
-    return line.strip()
+    # 標題行可能寫成「精彩看点：」，結尾標點一併去掉才吃得進 _LABEL_ONLY
+    return line.strip().strip("：:　 ")
 
 
 def _load_webhook() -> str:
-    for name in ("local_secrets.ini", "config.ini"):
-        path = os.path.join(_CURRENT_DIR, "config", name)
+    """讀取「一句」群 Webhook，依檔案 mtime 快取。
+
+    一次監控會發十幾條，每條重讀兩個 ini（local_secrets 內含數千字 cookie）
+    是純浪費；設定變更時 mtime 會變，快取自動失效。
+    """
+    global _webhook_cache
+    paths = [os.path.join(_CURRENT_DIR, "config", name)
+             for name in ("local_secrets.ini", "config.ini")]
+    try:
+        stamp = tuple(os.path.getmtime(p) if os.path.exists(p) else 0 for p in paths)
+    except OSError:
+        stamp = None
+    if _webhook_cache and stamp is not None and stamp == _webhook_cache[0]:
+        return _webhook_cache[1]
+
+    value = ""
+    for path in paths:
         if not os.path.exists(path):
             continue
         try:
@@ -53,10 +73,13 @@ def _load_webhook() -> str:
             cp.read(path, encoding="utf-8-sig")
             got = cp.get("推送配置", "钉钉一句接口链接", fallback="").strip()
             if got:
-                return got
+                value = got
+                break
         except Exception:
             continue
-    return ""
+    if stamp is not None:
+        _webhook_cache = (stamp, value)
+    return value
 
 
 def to_one_sentence(text: str) -> str:

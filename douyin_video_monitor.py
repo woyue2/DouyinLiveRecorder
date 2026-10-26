@@ -41,6 +41,7 @@ from ab_sign import ab_sign
 import msg_push
 import browser_login
 import brief
+import notify_route
 from filename_utils import sanitize_filename_part
 
 logging.basicConfig(
@@ -107,14 +108,11 @@ def load_project_config() -> Dict[str, Any]:
     # 推送設定
     if config.has_section("推送配置"):
         push_types = config.get("推送配置", "直播状态推送渠道", fallback="").strip()
-        settings["dingtalk_webhook"] = config.get("推送配置", "钉钉推送接口链接", fallback="").strip()
         # 作品產出（轉寫+飛書）走內容群；登入失效等需人處理的走告警群
-        settings["dingtalk_content_webhook"] = (
-            config.get("推送配置", "钉钉作品接口链接", fallback="").strip()
-            or settings["dingtalk_webhook"])
-        settings["dingtalk_alert_webhook"] = (
-            config.get("推送配置", "钉钉告警接口链接", fallback="").strip()
-            or settings["dingtalk_webhook"])
+        routes = notify_route.load(config)
+        settings["dingtalk_webhook"] = routes["default"]
+        settings["dingtalk_content_webhook"] = routes["content"]
+        settings["dingtalk_alert_webhook"] = routes["alert"]
         settings["dingtalk_phone"] = config.get("推送配置", "钉钉通知@对象(填手机号)", fallback="").strip()
         at_all_str = config.get("推送配置", "钉钉通知@全体(是/否)", fallback="否").strip()
         settings["dingtalk_is_atall"] = at_all_str in {"是", "true", "1", "yes"}

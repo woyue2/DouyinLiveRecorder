@@ -38,6 +38,7 @@ if _SRC_DIR not in sys.path:
 
 import browser_login
 import brief
+import notify_route
 import msg_push
 from md_to_html import HTML_TEMPLATE, render_markdown_inline
 from filename_utils import sanitize_filename_part
@@ -266,13 +267,10 @@ def load_project_config() -> Dict[str, Any]:
 
     if config.has_section("推送配置"):
         push_types = config.get("推送配置", "直播状态推送渠道", fallback="").strip()
-        settings["dingtalk_webhook"] = config.get("推送配置", "钉钉推送接口链接", fallback="").strip()
-        settings["dingtalk_content_webhook"] = (
-            config.get("推送配置", "钉钉作品接口链接", fallback="").strip()
-            or settings["dingtalk_webhook"])
-        settings["dingtalk_alert_webhook"] = (
-            config.get("推送配置", "钉钉告警接口链接", fallback="").strip()
-            or settings["dingtalk_webhook"])
+        routes = notify_route.load(config)
+        settings["dingtalk_webhook"] = routes["default"]
+        settings["dingtalk_content_webhook"] = routes["content"]
+        settings["dingtalk_alert_webhook"] = routes["alert"]
         settings["dingtalk_phone"] = config.get("推送配置", "钉钉通知@对象(填手机号)", fallback="").strip()
         at_all_str = config.get("推送配置", "钉钉通知@全体(是/否)", fallback="否").strip()
         settings["dingtalk_is_atall"] = at_all_str in {"是", "true", "1", "yes"}
@@ -852,7 +850,8 @@ def process_monitor_once(
             logger.warning("⛔ [登入失效熔斷中] 不嘗試存取小紅書，重發登入提醒。")
             cooldown_mgr._notify_login_needed(
                 feishu_webhook=config_settings.get("feishu_webhook", ""),
-                dingtalk_webhook=(config_settings.get("dingtalk_alert_webhook", "")
+                dingtalk_webhook=(args.dingtalk_webhook
+                                  or config_settings.get("dingtalk_alert_webhook", "")
                                   or config_settings.get("dingtalk_webhook", "")),
                 dingtalk_phone=config_settings.get("dingtalk_phone", ""),
                 dingtalk_is_atall=config_settings.get("dingtalk_is_atall", False),
@@ -1059,9 +1058,13 @@ def process_monitor_once(
                         f"发布时间：{detail['publish_time']}\n"
                         f"点赞：{n.get('liked_count', '0')}"
                     )
-                    msg_push.dingtalk(dingtalk_webhook, msg_content, dingtalk_phone, dingtalk_is_atall)
-                    logger.info("釘釘推送成功")
-                    brief.push("小紅書", author_name, title)
+                    res = msg_push.dingtalk(dingtalk_webhook, msg_content, dingtalk_phone, dingtalk_is_atall)
+                    if res.get("success"):
+                        logger.info("釘釘推送成功")
+                        # 內容群沒送到就不要發一句，否則兩群訊息不同步
+                        brief.push("小紅書", author_name, title)
+                    else:
+                        logger.error(f"釘釘推送失敗: {res.get('error')}")
 
                 history.add(note_id)
                 save_history(args.history_file, history)

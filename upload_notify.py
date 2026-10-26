@@ -5,25 +5,27 @@ import configparser
 import sys
 from pathlib import Path
 
+import notify_route
 from msg_push import dingtalk
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = PROJECT_DIR / "config" / "config.ini"
+SECRETS_FILE = PROJECT_DIR / "config" / "local_secrets.ini"
 PUSH_SECTION = "推送配置"
 TRUE_VALUES = {"是", "true", "1", "yes", "on"}
 
 
 def send_upload_notification(content: str, config_file: Path = CONFIG_FILE) -> bool:
-    config = configparser.RawConfigParser()
-    loaded_files = config.read(config_file, encoding="utf-8-sig")
-    if not loaded_files:
+    # 密鑰在 local_secrets.ini、通用設定在 config.ini，兩份都要讀。
+    # 只讀 config.ini 的話，分群鍵（寫在私密檔）永遠讀不到。
+    config = notify_route.merge_config_files(str(config_file), str(SECRETS_FILE))
+    if not config.has_section(PUSH_SECTION):
         print(f"无法读取推送配置文件: {config_file}")
         return False
 
     # 網盤上傳屬於背景流水，走「錄播流水線」群；未設定才回退通用通道
-    webhook = (config.get(PUSH_SECTION, "钉钉录播接口链接", fallback="").strip()
-               or config.get(PUSH_SECTION, "钉钉推送接口链接", fallback="").strip())
+    webhook = notify_route.pick(notify_route.load(config), "pipeline")
     phone = config.get(
         PUSH_SECTION, "钉钉通知@对象(填手机号)", fallback=""
     ).strip()
