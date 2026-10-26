@@ -21,3 +21,17 @@ def test_truncates_long_sentence():
 def test_empty_text_returns_empty():
     assert brief.to_one_sentence("") == ""
     assert brief.to_one_sentence("   \n ") == ""
+
+
+def test_skips_markdown_label_line():
+    """實際摘要以「💡 **精彩看点**」開頭，不能把它當成內容。"""
+    text = "💡 **精彩看点**\n> 男人三四十岁的顶级状态：身材、钱、心态。后面还有内容"
+    assert brief.to_one_sentence(text) == "男人三四十岁的顶级状态：身材、钱、心态"
+
+
+def test_skips_bare_label_without_emoji():
+    assert brief.to_one_sentence("精彩看点\n真正的第一句内容在这里") == "真正的第一句内容在这里"
+
+
+def test_returns_empty_when_only_label():
+    assert brief.to_one_sentence("💡 **精彩看点**\n") == ""

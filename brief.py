@@ -13,6 +13,7 @@
 import configparser
 import datetime
 import os
+import re
 import sys
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +24,17 @@ import msg_push
 
 _MAX_SENTENCE = 60
 _SENTENCE_END = "。！？!?\n"
+# 摘要區塊的第一行通常只是標題（「💡 **精彩看点**」），不該當成內容
+_LABEL_ONLY = {"精彩看点", "精彩看點", "看点", "看點", "摘要", "总结", "總結",
+               "核心内容", "核心內容", "重点", "重點"}
+
+
+def _clean_line(line: str) -> str:
+    """去掉 markdown 標記與行首 emoji/符號，留下可讀文字。"""
+    line = line.replace("**", "").replace("__", "").lstrip("#> ").strip()
+    # 行首的裝飾字元（emoji、項目符號）不對應任何文字或數字
+    line = re.sub(r"^[^\w一-鿿]+", "", line)
+    return line.strip()
 
 
 def _load_webhook() -> str:
@@ -42,16 +54,26 @@ def _load_webhook() -> str:
 
 
 def to_one_sentence(text: str) -> str:
-    """取第一句並截斷，用來把長摘要壓成一行。"""
-    text = (text or "").strip().replace("\r", " ")
-    for i, ch in enumerate(text):
-        if ch in _SENTENCE_END:
-            text = text[:i]
-            break
-    text = " ".join(text.split())
-    if len(text) > _MAX_SENTENCE:
-        text = text[:_MAX_SENTENCE].rstrip() + "…"
-    return text
+    """取第一句並截斷，用來把長摘要壓成一行。
+
+    摘要常以「💡 **精彩看点**」這種標題行開頭，直接取第一個換行前的內容會
+    得到標題而不是重點，所以先逐行清洗、跳過標題行與過短殘片。
+    """
+    for raw_line in (text or "").splitlines():
+        line = _clean_line(raw_line)
+        if not line or line in _LABEL_ONLY or len(line) < 2:
+            continue
+        for i, ch in enumerate(line):
+            if ch in _SENTENCE_END:
+                line = line[:i]
+                break
+        line = " ".join(line.split())
+        if len(line) < 2:
+            continue
+        if len(line) > _MAX_SENTENCE:
+            line = line[:_MAX_SENTENCE].rstrip() + "…"
+        return line
+    return ""
 
 
 def push(kind: str, name: str, sentence: str) -> bool:
