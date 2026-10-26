@@ -12,6 +12,7 @@
 """
 import configparser
 import datetime
+import logging
 import os
 import re
 import sys
@@ -22,6 +23,8 @@ if _CURRENT_DIR not in sys.path:
 
 import msg_push
 
+logger = logging.getLogger("brief")
+
 _MAX_SENTENCE = 60
 _SENTENCE_END = "。！？!?\n"
 # 摘要區塊的第一行通常只是標題（「💡 **精彩看点**」），不該當成內容
@@ -30,10 +33,13 @@ _LABEL_ONLY = {"精彩看点", "精彩看點", "看点", "看點", "摘要", "�
 
 
 def _clean_line(line: str) -> str:
-    """去掉 markdown 標記與行首 emoji/符號，留下可讀文字。"""
+    """去掉 markdown 標記、行首 emoji 與序號，留下可讀文字。"""
     line = line.replace("**", "").replace("__", "").lstrip("#> ").strip()
     # 行首的裝飾字元（emoji、項目符號）不對應任何文字或數字
     line = re.sub(r"^[^\w一-鿿]+", "", line)
+    # 「1.」「2、」「①」這類編號對一句話沒有意義
+    line = re.sub(r"^\d+\s*[.、)）]\s*", "", line)
+    line = re.sub(r"^[①-⑳]\s*", "", line)
     return line.strip()
 
 
@@ -90,6 +96,11 @@ def push(kind: str, name: str, sentence: str) -> bool:
     line = f"{stamp} ｜【{kind}】｜{name}｜{sentence}"
     try:
         res = msg_push.dingtalk(webhook, line, "", False)
-        return bool(res.get("success"))
-    except Exception:
+    except Exception as e:
+        logger.warning(f"一句摘要發送異常: {e}")
         return False
+    if res.get("success"):
+        return True
+    # 失敗不能靜默：關鍵詞不匹配這類問題會讓整個群一條都收不到
+    logger.warning(f"一句摘要發送失敗: {res.get('error')}")
+    return False
