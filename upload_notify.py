@@ -21,9 +21,9 @@ def send_upload_notification(content: str, config_file: Path = CONFIG_FILE) -> b
         print(f"无法读取推送配置文件: {config_file}")
         return False
 
-    webhook = config.get(
-        PUSH_SECTION, "钉钉推送接口链接", fallback=""
-    ).strip()
+    # 網盤上傳屬於背景流水，走「錄播流水線」群；未設定才回退通用通道
+    webhook = (config.get(PUSH_SECTION, "钉钉录播接口链接", fallback="").strip()
+               or config.get(PUSH_SECTION, "钉钉推送接口链接", fallback="").strip())
     phone = config.get(
         PUSH_SECTION, "钉钉通知@对象(填手机号)", fallback=""
     ).strip()

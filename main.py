@@ -471,11 +471,28 @@ def adjust_max_request() -> None:
         error_count = 0
 
 
-def push_message(record_name: str, live_url: str, content: str) -> None:
+def _dingtalk_webhook(category: str) -> str:
+    """依通知性質選釘釘群，未設定就回退到原本的通用通道。
+
+    alert   ：需要人處理（登入過期、風控熔斷），低頻高優先
+    content ：產出的乾貨（作品轉寫、直播時間軸、B站投稿成功）
+    pipeline：背景流水（開播關播、排隊等待）
+    """
+    mapping = {
+        "alert": dingtalk_alert_api_url,
+        "content": dingtalk_content_api_url,
+        "pipeline": dingtalk_recorder_api_url,
+    }
+    return mapping.get(category) or dingtalk_api_url
+
+
+def push_message(record_name: str, live_url: str, content: str,
+                 category: str = "pipeline") -> None:
     msg_title = push_message_title.strip() or "直播间状态更新通知"
     push_functions = {
         '微信': lambda: xizhi(xizhi_api_url, msg_title, content),
-        '钉钉': lambda: dingtalk(dingtalk_api_url, content, dingtalk_phone_num, dingtalk_is_atall),
+        '钉钉': lambda: dingtalk(_dingtalk_webhook(category), content,
+                                 dingtalk_phone_num, dingtalk_is_atall),
         '邮箱': lambda: send_email(
             email_host, login_email, email_password, sender_email, sender_name,
             to_email, msg_title, content, smtp_port, open_smtp_ssl
@@ -1012,7 +1029,8 @@ def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
                 try:
                     push_message(
                         record_name, "",
-                        f"[直播时间轴已生成] 【{clean_name}】\n{url}"
+                        f"[直播时间轴已生成] 【{clean_name}】\n{url}",
+                        category="content",
                     )
                 except Exception as e:
                     logger.warning(f"推送直播时间轴通知失败: {e}")
@@ -1094,7 +1112,7 @@ def run_bili_single_job(job: dict) -> None:
             except OSError:
                 pass
     try:
-        push_message(record_name, "", content)
+        push_message(record_name, "", content, category="content")
     except Exception as e:
         logger.error(f"B站投稿通知发送失败 {video_name}: {e}")
 
@@ -1137,7 +1155,7 @@ def _bili_upload_retryable(output: str) -> bool:
 
 def _push_bili_notice(record_name: str, content: str) -> None:
     try:
-        push_message(record_name, "", content)
+        push_message(record_name, "", content, category="content")
     except Exception as e:
         logger.error(f"B站投稿通知发送失败: {e}")
 
@@ -1727,7 +1745,7 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
         except OSError:
             pass
     try:
-        push_message(record_name, "", content)
+        push_message(record_name, "", content, category="content")
     except Exception as e:
         logger.error(f"转写通知发送失败 {mp3_name}: {e}")
 
@@ -3748,6 +3766,9 @@ while True:
     extra_enable_proxy_platform_list = extra_enable_proxy.replace('，', ',').split(',') if extra_enable_proxy else None
     live_status_push = read_config_value(config, '推送配置', '直播状态推送渠道', "")
     dingtalk_api_url = read_config_value(config, '推送配置', '钉钉推送接口链接', "")
+    dingtalk_alert_api_url = read_config_value(config, '推送配置', '钉钉告警接口链接', "")
+    dingtalk_content_api_url = read_config_value(config, '推送配置', '钉钉作品接口链接', "")
+    dingtalk_recorder_api_url = read_config_value(config, '推送配置', '钉钉录播接口链接', "")
     xizhi_api_url = read_config_value(config, '推送配置', '微信推送接口链接', "")
     bark_msg_api = read_config_value(config, '推送配置', 'bark推送接口链接', "")
     bark_msg_level = read_config_value(config, '推送配置', 'bark推送中断级别', "active")

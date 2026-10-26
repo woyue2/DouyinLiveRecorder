@@ -84,6 +84,8 @@ def load_project_config() -> Dict[str, Any]:
     settings = {
         "transcribe_script": "",
         "dingtalk_webhook": "",
+        "dingtalk_content_webhook": "",
+        "dingtalk_alert_webhook": "",
         "dingtalk_phone": "",
         "dingtalk_is_atall": False,
         "dingtalk_enabled": False,
@@ -105,6 +107,13 @@ def load_project_config() -> Dict[str, Any]:
     if config.has_section("推送配置"):
         push_types = config.get("推送配置", "直播状态推送渠道", fallback="").strip()
         settings["dingtalk_webhook"] = config.get("推送配置", "钉钉推送接口链接", fallback="").strip()
+        # 作品產出（轉寫+飛書）走內容群；登入失效等需人處理的走告警群
+        settings["dingtalk_content_webhook"] = (
+            config.get("推送配置", "钉钉作品接口链接", fallback="").strip()
+            or settings["dingtalk_webhook"])
+        settings["dingtalk_alert_webhook"] = (
+            config.get("推送配置", "钉钉告警接口链接", fallback="").strip()
+            or settings["dingtalk_webhook"])
         settings["dingtalk_phone"] = config.get("推送配置", "钉钉通知@对象(填手机号)", fallback="").strip()
         at_all_str = config.get("推送配置", "钉钉通知@全体(是/否)", fallback="否").strip()
         settings["dingtalk_is_atall"] = at_all_str in {"是", "true", "1", "yes"}
@@ -673,7 +682,9 @@ def process_blogger_videos(
 
     history = load_history(args.history_file)
     transcribe_script = args.transcribe_script or config_settings.get("transcribe_script", "")
-    dingtalk_webhook = args.dingtalk_webhook or config_settings.get("dingtalk_webhook", "")
+    dingtalk_webhook = (args.dingtalk_webhook
+                        or config_settings.get("dingtalk_content_webhook", "")
+                        or config_settings.get("dingtalk_webhook", ""))
     dingtalk_phone = config_settings.get("dingtalk_phone", "")
     dingtalk_is_atall = config_settings.get("dingtalk_is_atall", False)
 
@@ -877,7 +888,8 @@ def check_login_state(monitor: DouyinVideoMonitor) -> Optional[bool]:
 
 def notify_douyin_login_needed(config_settings: Dict[str, Any]) -> None:
     """登入失效時發釘釘，帶可直接操作的 noVNC 瀏覽器連結。"""
-    webhook = config_settings.get("dingtalk_webhook", "")
+    webhook = (config_settings.get("dingtalk_alert_webhook", "")
+               or config_settings.get("dingtalk_webhook", ""))
     if not webhook:
         logger.warning("抖音登入失效，但未設定釘釘 webhook，無法通知")
         return

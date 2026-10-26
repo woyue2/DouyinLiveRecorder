@@ -238,6 +238,8 @@ def load_project_config() -> Dict[str, Any]:
         "xhs_cookie": "",
         "transcribe_script": "",
         "dingtalk_webhook": "",
+        "dingtalk_content_webhook": "",
+        "dingtalk_alert_webhook": "",
         "dingtalk_phone": "",
         "dingtalk_is_atall": False,
         "dingtalk_enabled": False,
@@ -264,6 +266,12 @@ def load_project_config() -> Dict[str, Any]:
     if config.has_section("推送配置"):
         push_types = config.get("推送配置", "直播状态推送渠道", fallback="").strip()
         settings["dingtalk_webhook"] = config.get("推送配置", "钉钉推送接口链接", fallback="").strip()
+        settings["dingtalk_content_webhook"] = (
+            config.get("推送配置", "钉钉作品接口链接", fallback="").strip()
+            or settings["dingtalk_webhook"])
+        settings["dingtalk_alert_webhook"] = (
+            config.get("推送配置", "钉钉告警接口链接", fallback="").strip()
+            or settings["dingtalk_webhook"])
         settings["dingtalk_phone"] = config.get("推送配置", "钉钉通知@对象(填手机号)", fallback="").strip()
         at_all_str = config.get("推送配置", "钉钉通知@全体(是/否)", fallback="否").strip()
         settings["dingtalk_is_atall"] = at_all_str in {"是", "true", "1", "yes"}
@@ -843,7 +851,8 @@ def process_monitor_once(
             logger.warning("⛔ [登入失效熔斷中] 不嘗試存取小紅書，重發登入提醒。")
             cooldown_mgr._notify_login_needed(
                 feishu_webhook=config_settings.get("feishu_webhook", ""),
-                dingtalk_webhook=args.dingtalk_webhook or config_settings.get("dingtalk_webhook", ""),
+                dingtalk_webhook=(config_settings.get("dingtalk_alert_webhook", "")
+                                  or config_settings.get("dingtalk_webhook", "")),
                 dingtalk_phone=config_settings.get("dingtalk_phone", ""),
                 dingtalk_is_atall=config_settings.get("dingtalk_is_atall", False),
                 login_url=xhs_login_url(),
@@ -870,7 +879,11 @@ def process_monitor_once(
 
     history = load_history(args.history_file)
     retry_queue = load_retry_queue(args.retry_file)
-    dingtalk_webhook = args.dingtalk_webhook or config_settings.get("dingtalk_webhook", "")
+    dingtalk_webhook = (args.dingtalk_webhook
+                        or config_settings.get("dingtalk_content_webhook", "")
+                        or config_settings.get("dingtalk_webhook", ""))
+    dingtalk_alert_webhook = (config_settings.get("dingtalk_alert_webhook", "")
+                              or dingtalk_webhook)
     dingtalk_phone = config_settings.get("dingtalk_phone", "")
     dingtalk_is_atall = config_settings.get("dingtalk_is_atall", False)
     transcribe_script = config_settings.get("transcribe_script", "")
@@ -1067,7 +1080,7 @@ def process_monitor_once(
             cooldown_mgr.activate_cooldown(
                 hours=24.0,
                 reason=str(rce),
-                dingtalk_webhook=dingtalk_webhook,
+                dingtalk_webhook=dingtalk_alert_webhook,
                 dingtalk_phone=dingtalk_phone,
                 dingtalk_is_atall=dingtalk_is_atall,
                 feishu_webhook=config_settings.get("feishu_webhook", ""),
