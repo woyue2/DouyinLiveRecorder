@@ -37,6 +37,7 @@ if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
 import browser_login
+import brief
 import msg_push
 from md_to_html import HTML_TEMPLATE, render_markdown_inline
 from filename_utils import sanitize_filename_part
@@ -1060,6 +1061,7 @@ def process_monitor_once(
                     )
                     msg_push.dingtalk(dingtalk_webhook, msg_content, dingtalk_phone, dingtalk_is_atall)
                     logger.info("釘釘推送成功")
+                    brief.push("小紅書", author_name, title)
 
                 history.add(note_id)
                 save_history(args.history_file, history)

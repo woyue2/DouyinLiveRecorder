@@ -80,6 +80,7 @@ from src import utils
 from msg_push import (
     dingtalk, xizhi, tg_bot, send_email, bark, ntfy, pushplus
 )
+import brief
 from ffmpeg_install import (
     check_ffmpeg, ffmpeg_path, current_env_path
 )
@@ -1032,6 +1033,7 @@ def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
                         f"[直播时间轴已生成] 【{clean_name}】\n{url}",
                         category="content",
                     )
+                    brief.push("直播", clean_name, "全场时间轴已生成")
                 except Exception as e:
                     logger.warning(f"推送直播时间轴通知失败: {e}")
             else:
@@ -1098,6 +1100,7 @@ def run_bili_single_job(job: dict) -> None:
                    f"标题: {meta['title']}\n"
                    f"BV号: {bvid}\n"
                    f"文件: {video_name}")
+        brief.push("B站", clean_name, f"《{meta['title']}》{bvid}")
         handle_post_upload_cleanup(video_path, policy=bili_post_policy)
     else:
         content = _handle_bili_failure(output, record_name, f"文件: {video_name}", vis_label)
@@ -1329,6 +1332,7 @@ def run_bili_session_job(job: dict) -> None:
                 f"标题: {chunk['title']}\n"
                 f"BV号: {bvid}{part_note}",
             )
+            brief.push("B站", clean_name, f"《{chunk['title']}》{bvid}{part_note}")
             handle_post_upload_cleanup(chunk["ts_paths"], policy=bili_post_policy)
         else:
             content = _handle_bili_failure(
@@ -1437,6 +1441,7 @@ def upload_live_batch(session_dir: str, info: dict, ts_paths: list) -> bool:
             f"[B站直播中投稿成功{vis_label}] {record_name}\n标题: {title}\nBV号: {bvid}\n"
             f"集数: {len(ts_paths)}P（录制中提前上传）",
         )
+        brief.push("B站", clean_name, f"《{title}》{bvid}（录播中提前上传）")
         # 先寫帳本再清理：清理策略若保留 TS，也不會被重複上傳
         segments = {}
         for path, start, dur, part in zip(

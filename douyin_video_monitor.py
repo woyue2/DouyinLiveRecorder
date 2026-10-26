@@ -40,6 +40,7 @@ if _SRC_DIR not in sys.path:
 from ab_sign import ab_sign
 import msg_push
 import browser_login
+import brief
 from filename_utils import sanitize_filename_part
 
 logging.basicConfig(
@@ -555,6 +556,7 @@ class DouyinVideoMonitor:
         success = len(res.get("success", [])) > 0
         if success:
             logger.info("釘釘推送成功")
+            brief.push("抖音", author, summary or title)
         else:
             logger.error(f"釘釘推送失敗: {res.get('error')}")
         return success
