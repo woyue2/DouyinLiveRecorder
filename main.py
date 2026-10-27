@@ -2055,13 +2055,14 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             )
         status_text = "录制已安全停止" if stop_requested else "直播录制完成"
         print(f"\n{record_name} {stop_time} {status_text}\n")
-        # 收播摘要進「一句」群：一眼看到這場播了多久
+        # 收播摘要進「一句」群：一眼看到幾點開播、播了多久
         duration_sec = max(0, time.time() - record_started_at)
         if duration_sec >= 60:
+            start_hm = datetime.datetime.fromtimestamp(record_started_at).strftime("%H:%M")
             brief.push(
                 "直播", _resolve_streamer_type(record_name)[0],
-                f"{status_text}，本场 {brief.format_duration(duration_sec)}，"
-                f"共 {len(published_files)} 段",
+                f"{status_text}，{start_hm} 开播，播了 "
+                f"{brief.format_duration(duration_sec)}，共 {len(published_files)} 段",
             )
         if record_url in bili_upload_urls and bili_upload_enabled:
             hold_videos_for_bili(published_files)
