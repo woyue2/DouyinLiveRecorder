@@ -105,6 +105,15 @@ def to_one_sentence(text: str) -> str:
     return ""
 
 
+def format_duration(seconds: float) -> str:
+    """把秒數寫成「2 小时 13 分」／「45 分钟」這種口語時長。"""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    if hours:
+        return f"{hours} 小时 {remainder // 60} 分"
+    return f"{max(1, remainder // 60)} 分钟"
+
+
 def push(kind: str, name: str, sentence: str) -> bool:
     """發一條濃縮摘要。任何失敗都只記錄、不影響主流程。"""
     webhook = _load_webhook()

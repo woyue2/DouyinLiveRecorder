@@ -1939,6 +1939,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     )
     logger.debug(f"FFmpeg输入源: {actual_input_url}")
     logger.debug(f"FFmpeg完整日志: {ffmpeg_log_path}")
+    # 收播時要報本場時長，從 ffmpeg 真正開跑算起（等待開播的时间不算）
+    record_started_at = time.time()
     process = subprocess.Popen(
         ffmpeg_command,
         stdin=subprocess.PIPE,
@@ -2053,6 +2055,14 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             )
         status_text = "录制已安全停止" if stop_requested else "直播录制完成"
         print(f"\n{record_name} {stop_time} {status_text}\n")
+        # 收播摘要進「一句」群：一眼看到這場播了多久
+        duration_sec = max(0, time.time() - record_started_at)
+        if duration_sec >= 60:
+            brief.push(
+                "直播", _resolve_streamer_type(record_name)[0],
+                f"{status_text}，本场 {brief.format_duration(duration_sec)}，"
+                f"共 {len(published_files)} 段",
+            )
         if record_url in bili_upload_urls and bili_upload_enabled:
             hold_videos_for_bili(published_files)
             if bili_upload_mode == "整场多P投稿":

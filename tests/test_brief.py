@@ -49,3 +49,23 @@ def test_decimal_number_is_not_treated_as_ordinal():
 
 def test_chinese_ordinal_is_stripped():
     assert brief.to_one_sentence("1、第一句正文内容") == "第一句正文内容"
+
+
+def test_format_duration_hours_and_minutes():
+    assert brief.format_duration(2 * 3600 + 13 * 60) == "2 小时 13 分"
+
+
+def test_format_duration_under_one_hour():
+    assert brief.format_duration(45 * 60) == "45 分钟"
+    # 61 秒也要顯示 1 分鐘，不能變 0
+    assert brief.format_duration(61) == "1 分钟"
+
+
+def test_format_duration_clamps_negative():
+    assert brief.format_duration(-5) == "1 分钟"
+
+
+def test_recording_summary_line_is_not_truncated_by_label_filter():
+    """收播摘要用的是逗號串接，不能被 to_one_sentence 誤切。"""
+    text = "直播录制完成，本场 2 小时 13 分，共 9 段"
+    assert brief.to_one_sentence(text) == text
