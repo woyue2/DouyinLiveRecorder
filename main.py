@@ -1017,38 +1017,84 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
 
 
 TIMELINE_DOC_MAP = os.path.join(script_path, "downloads", "bili_timeline_docs.json")
+_timeline_map_lock = threading.Lock()
 
 
-def _remember_timeline_doc(session_dir: str, doc_token: str, url: str) -> None:
-    """記下這場的時間軸文檔，投稿成功後要把 BV 號補進同一篇。"""
-    if not session_dir or not doc_token:
-        return
+def _load_timeline_map() -> dict:
     try:
-        data = {}
         if os.path.exists(TIMELINE_DOC_MAP):
             with open(TIMELINE_DOC_MAP, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        data[session_dir] = {"doc_token": doc_token, "url": url, "at": time.time()}
-        with open(TIMELINE_DOC_MAP, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"记录时间轴文档失败: {e}")
-
-
-def _take_timeline_doc(session_dir: str) -> Optional[dict]:
-    """取出并移除这场的时间轴文档记录（同一个文档只补一次）。"""
-    try:
-        if not os.path.exists(TIMELINE_DOC_MAP):
-            return None
-        with open(TIMELINE_DOC_MAP, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        entry = data.pop(session_dir, None)
-        with open(TIMELINE_DOC_MAP, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return entry
+            return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.warning(f"读取时间轴文档记录失败: {e}")
+    return {}
+
+
+def _save_timeline_map(data: dict) -> None:
+    """先用临时文件再原子替换，避免并发读到写了一半的 JSON。"""
+    try:
+        tmp = TIMELINE_DOC_MAP + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TIMELINE_DOC_MAP)
+    except Exception as e:
+        logger.warning(f"保存时间轴文档记录失败: {e}")
+
+
+def _peek_timeline_doc(session_dir: str) -> Optional[dict]:
+    """讀取但不定刪——用來判斷這場是否已經建過文檔。"""
+    if not session_dir:
         return None
+    with _timeline_map_lock:
+        return _load_timeline_map().get(session_dir)
+
+
+def _remember_timeline_doc(session_dir: str, doc_token: str, url: str,
+                           meta: Optional[dict] = None) -> None:
+    """記下這場的時間軸文檔；meta 一併存，投稿時可重用不必重打大模型。"""
+    if not session_dir or not doc_token:
+        return
+    with _timeline_map_lock:
+        data = _load_timeline_map()
+        entry = data.get(session_dir) or {}
+        entry.update({"doc_token": doc_token, "url": url, "at": time.time()})
+        if meta is not None:
+            entry["meta"] = meta
+        entry.setdefault("published", [])
+        data[session_dir] = entry
+        _save_timeline_map(data)
+
+
+def _claim_unpublished_bvids(session_dir: str, chunks: list) -> list:
+    """記下這次已回填的分稿，回傳本次真正需要補寫的那些。
+
+    拆稿 + 風控重投時，同一場會分好幾輪投稿；用 bvid 去重才不會重複補寫，
+    也不會因為第一輪就刪掉記錄而讓後續分稿的 BV 永遠補不上。
+    """
+    if not session_dir or not chunks:
+        return []
+    with _timeline_map_lock:
+        data = _load_timeline_map()
+        entry = data.get(session_dir)
+        if not entry:
+            return []
+        done = entry.setdefault("published", [])
+        fresh = [c for c in chunks if c.get("bvid") and c["bvid"] not in done]
+        if fresh:
+            done.extend(c["bvid"] for c in fresh)
+            _save_timeline_map(data)
+        return fresh
+
+
+def _drop_timeline_doc(session_dir: str) -> None:
+    """整場投稿完成後移除記錄（還有未投完的分稿時不要呼叫）。"""
+    if not session_dir:
+        return
+    with _timeline_map_lock:
+        data = _load_timeline_map()
+        if data.pop(session_dir, None) is not None:
+            _save_timeline_map(data)
 
 
 def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
@@ -1083,6 +1129,98 @@ def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
 
     t = threading.Thread(target=_worker, daemon=True, name="bili-timeline")
     t.start()
+
+
+def schedule_session_timeline(session_dir: str, record_name: str, clean_name: str,
+                              ts_paths: list, fallback_seconds: int) -> None:
+    """收播後在背景生成時間軸，不等投稿排隊。
+
+    要等轉寫跑完才有分P看點，所以整段丟到背景（最多等 20 分鐘），
+    不能卡住入隊流程。同一場次斷流重連會再進來一次：已建過文檔就只把
+    新增段落追加進去，不重建第二篇——否則同目錄多段錄製會產生同名文檔。
+    """
+    if not bili_timeline_enabled:
+        return
+
+    def _worker():
+        try:
+            deadline = time.time() + 1200
+            while time.time() < deadline and list(Path(session_dir).glob("*.transcribing")):
+                time.sleep(10)
+
+            meta = extract_session_bili_metadata(
+                session_dir=session_dir,
+                record_name=record_name,
+                streamer_type=_resolve_streamer_type(record_name)[1],
+                default_tags=bili_default_tags,
+                llm_api_key=bili_llm_api_key or None,
+                llm_api_base=bili_llm_api_base or None,
+                llm_model=bili_llm_model or "deepseek-chat",
+                ts_paths=ts_paths,
+            )
+            parts = meta.get("parts") or []
+            if not parts:
+                logger.info(f"时间轴跳过：没有分P看点 ({session_dir})")
+                return
+
+            ledger = load_live_ledger(session_dir)
+            elapsed = float(ledger.get("elapsed", 0) or 0)
+            prefix = sorted(
+                (v for v in (ledger.get("uploaded") or {}).values() if isinstance(v, dict)),
+                key=lambda v: v.get("start", 0),
+            )
+            seg_starts = [elapsed + s for s in compute_part_start_times(
+                ts_paths, fallback_seconds=fallback_seconds)]
+
+            entry = _peek_timeline_doc(session_dir)
+            if entry and entry.get("doc_token"):
+                # 同一場次又錄了一段：追加到既有文檔，不再建第二篇
+                lines = [f"本场新增 {len(parts)} 段（{_fmt_hms(seg_starts[0]) if seg_starts else '--'} 起）："]
+                for part, start in zip(parts, seg_starts):
+                    lines.append(f"· {_fmt_hms(start)} {part.get('title', '')}")
+                from src.feishu_uploader import FeishuDocManager
+                mgr = FeishuDocManager(
+                    feishu_app_id, feishu_app_secret,
+                    folder_token=feishu_folder_token,
+                    wiki_space_id=feishu_wiki_space_id,
+                    wiki_root_node=bili_timeline_node,
+                    wiki_domain=bili_timeline_domain,
+                )
+                if mgr.append_text_block(entry["doc_token"], chr(10).join(lines)):
+                    logger.info(f"已把新增分段追加到既有时间轴 ({session_dir})")
+                return
+
+            all_parts = [
+                {"label": v.get("label", ""), "title": v.get("title", ""),
+                 "lines": v.get("lines") or []}
+                for v in prefix
+            ] + list(parts)
+            starts = [v.get("start", 0) for v in prefix] + seg_starts
+            url, doc_token, err = build_bili_timeline_doc(
+                {"parts": all_parts}, record_name, clean_name, starts,
+                session_dir=session_dir)
+            if not url:
+                logger.info(f"直播时间轴文档跳过 ({record_name}): {err}")
+                return
+            logger.info(f"直播时间轴飞书文档已生成: {url}")
+            _remember_timeline_doc(session_dir, doc_token, url, meta=meta)
+            try:
+                push_message(record_name, "",
+                             f"[直播时间轴已生成] 【{clean_name}】" + chr(10) + url,
+                             category="content")
+                brief.push("直播", clean_name, "全场时间轴已生成")
+            except Exception as e:
+                logger.warning(f"推送直播时间轴通知失败: {e}")
+        except Exception as e:
+            logger.error(f"收播生成时间轴异常 ({record_name}): {e}")
+
+    threading.Thread(target=_worker, daemon=True, name="bili-timeline").start()
+
+
+def _fmt_hms(seconds: float) -> str:
+    """秒數轉 HH:MM:SS，用於文檔內的段落時刻。"""
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
 def run_bili_single_job(job: dict) -> None:
@@ -1265,17 +1403,19 @@ def run_bili_session_job(job: dict) -> None:
         return
 
     clean_name, streamer_type = _resolve_streamer_type(record_name)
-    # 收播時已生成過時間軸並把 meta 存進任務，這裡直接重用，不再重打大模型
-    meta = job.get("timeline_meta") or extract_session_bili_metadata(
-        session_dir=session_dir,
-        record_name=record_name,
-        streamer_type=streamer_type,
-        default_tags=bili_default_tags,
-        llm_api_key=bili_llm_api_key or None,
-        llm_api_base=bili_llm_api_base or None,
-        llm_model=bili_llm_model or "deepseek-chat",
-        ts_paths=valid_ts_paths
-    )
+    # 收播生成時間軸時已算過 meta，優先重用，不再重打大模型
+    meta = (job.get("timeline_meta")
+            or (_peek_timeline_doc(session_dir) or {}).get("meta")
+            or extract_session_bili_metadata(
+                session_dir=session_dir,
+                record_name=record_name,
+                streamer_type=streamer_type,
+                default_tags=bili_default_tags,
+                llm_api_key=bili_llm_api_key or None,
+                llm_api_base=bili_llm_api_base or None,
+                llm_model=bili_llm_model or "deepseek-chat",
+                ts_paths=valid_ts_paths
+            ))
     is_only_self = _is_only_self(record_name, record_url, clean_name)
     vis_label = " (仅自己可见)" if is_only_self else ""
 
@@ -1357,8 +1497,10 @@ def run_bili_session_job(job: dict) -> None:
 
     # 把 BV 號補回收播時建好的時間軸文檔，讓文檔自帶發布資訊
     if published_chunks:
-        entry = _take_timeline_doc(session_dir)
-        if entry and entry.get("doc_token"):
+        # 只補「這輪新增」的分稿：拆稿遇風控重投時，後續成功的分稿才不会被漏掉
+        fresh = _claim_unpublished_bvids(session_dir, published_chunks)
+        entry = _peek_timeline_doc(session_dir)
+        if fresh and entry and entry.get("doc_token"):
             try:
                 from src.feishu_uploader import FeishuDocManager
                 mgr = FeishuDocManager(
@@ -1369,7 +1511,7 @@ def run_bili_session_job(job: dict) -> None:
                     wiki_domain=bili_timeline_domain,
                 )
                 lines = [f"已发布到 B 站（{record_name}）："]
-                for c in published_chunks:
+                for c in fresh:
                     tag = (f"第 {c['index']}/{c['total']} 份"
                            if c.get("total", 1) > 1 else "全集")
                     lines.append(f"· {tag} {c['bvid']}（{c['parts']}P）{c['title']}")
@@ -1377,6 +1519,9 @@ def run_bili_session_job(job: dict) -> None:
                     logger.info(f"已把 BV 号补进时间轴文档 ({session_dir})")
             except Exception as e:
                 logger.warning(f"回填时间轴文档失败（不影响投稿）: {e}")
+        # 只有整場都投完才移除記錄；還有分稿在佇列裡時要留著下次補
+        if all(c.get("uploaded") for c in chunks):
+            _drop_timeline_doc(session_dir)
 
 
 def upload_live_batch(session_dir: str, info: dict, ts_paths: list) -> bool:
@@ -1571,53 +1716,21 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
             ]
             clean_name, _ = _resolve_streamer_type(record_name)
             schedule_bili_timeline({"parts": parts}, record_name, clean_name,
-                                   [v.get("start", 0) for v in items])
+                                   [v.get("start", 0) for v in items],
+                                   session_dir=session_dir)
             logger.info(f"直播中提前上传已涵蓋全場，補生成時間軸 ({session_dir})")
         logger.info(f"整场多P投稿：未找到有效视频文件 ({session_dir})")
         return
 
-    # 時間軸在收播時就生成，不等投稿排隊：B 站有 288 分鐘最小間隔，
-    # 積壓時文檔會延遲好幾天，而時間軸需要的資料（起點、看點）此刻已經齊了。
-    # meta 一併塞進 job，投稿端直接重用，避免重複呼叫大模型。
-    clean_name, streamer_type = _resolve_streamer_type(record_name)
-    timeline_meta = None
+    # 時間軸在收播時就生成，不等投稿排隊（B 站 288 分鐘間隔會讓文檔延遲數天）。
+    # 放到背景執行：要等轉寫跑完才有看點，不能卡住入隊流程。
+    clean_name, _streamer_type = _resolve_streamer_type(record_name)
     try:
-        timeline_meta = extract_session_bili_metadata(
-            session_dir=session_dir,
-            record_name=record_name,
-            streamer_type=streamer_type,
-            default_tags=bili_default_tags,
-            llm_api_key=bili_llm_api_key or None,
-            llm_api_base=bili_llm_api_base or None,
-            llm_model=bili_llm_model or "deepseek-chat",
-            ts_paths=valid_ts_paths,
-        )
-        if bili_timeline_enabled and (timeline_meta.get("parts") or []):
-            try:
-                _seg_fallback = int(str(split_time).strip())
-            except Exception:
-                _seg_fallback = 0
-            ledger = load_live_ledger(session_dir)
-            elapsed = float(ledger.get("elapsed", 0) or 0)
-            prefix = sorted(
-                (v for v in (ledger.get("uploaded") or {}).values() if isinstance(v, dict)),
-                key=lambda v: v.get("start", 0),
-            )
-            seg_starts = [
-                elapsed + s
-                for s in compute_part_start_times(valid_ts_paths, fallback_seconds=_seg_fallback)
-            ]
-            parts = [
-                {"label": v.get("label", ""), "title": v.get("title", ""),
-                 "lines": v.get("lines") or []}
-                for v in prefix
-            ] + list(timeline_meta.get("parts") or [])
-            starts = [v.get("start", 0) for v in prefix] + seg_starts
-            schedule_bili_timeline({"parts": parts}, record_name, clean_name, starts,
-                                   session_dir=session_dir)
-            logger.info(f"收播即生成时间轴（不等投稿）: {session_dir}")
-    except Exception as e:
-        logger.warning(f"收播生成时间轴失败（不影响投稿）: {e}")
+        _seg_fallback = int(str(split_time).strip())
+    except Exception:
+        _seg_fallback = 0
+    schedule_session_timeline(session_dir, record_name, clean_name,
+                              list(valid_ts_paths), _seg_fallback)
 
     job = {
         "kind": "session",
@@ -1626,13 +1739,6 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         "record_name": record_name,
         "record_url": record_url,
     }
-    if timeline_meta:
-        try:
-            json.dumps(timeline_meta, ensure_ascii=False)
-            job["timeline_meta"] = timeline_meta
-        except (TypeError, ValueError):
-            # 存不進佇列就讓投稿端自己重算，不能因此讓 _save_bili_queue 失敗
-            logger.warning("时间轴 meta 无法序列化，投稿时将重新生成")
     ready, reason, wait_seconds = bili_slot_status()
     # 用共用的投稿閘門序列化：拿不到就入隊，由佇列執行緒接續，
     # 避免和正在進行的投稿（例如直播中提前上傳）在同一個時段連投兩次。

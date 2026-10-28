@@ -16,18 +16,20 @@ def test_timeline_is_generated_at_session_end_not_after_upload():
     """時間軸在收播時就生成，不等 B 站投稿排隊（288 分鐘間隔會延遲數天）。"""
     i_fn = MAIN_SRC.index("def process_session_multi_p_upload")
     body = MAIN_SRC[i_fn:MAIN_SRC.index("def transcribe_and_notify")]
-    assert "schedule_bili_timeline(" in body, "收播流程應直接生成時間軸"
+    assert "schedule_session_timeline(" in body, "收播流程應直接生成時間軸"
     # 必須早於投稿動作，不能退回「投完才生成」
-    assert body.index("schedule_bili_timeline(") < body.index("run_bili_job(job)")
+    assert body.index("schedule_session_timeline(") < body.index("run_bili_job(job)")
 
 
 def test_start_times_probed_before_files_could_be_cleaned():
     """時間軸靠 ffprobe 讀檔，必須先算好再排程。"""
     i_fn = MAIN_SRC.index("def process_session_multi_p_upload")
     body = MAIN_SRC[i_fn:MAIN_SRC.index("def transcribe_and_notify")]
-    i_compute = body.index("compute_part_start_times(")
-    # 收播流程裡另有一處「整場已由提前上傳涵蓋」的排程，取「算完之後」那次
-    assert body.index("schedule_bili_timeline(", i_compute) > i_compute
+    assert body.index("schedule_session_timeline(") > 0
+    # 起始時間在背景 worker 裡、建文檔之前才算（那时檔案还在）
+    i_worker = MAIN_SRC.index("def schedule_session_timeline(")
+    wbody = MAIN_SRC[i_worker:MAIN_SRC.index("def _fmt_hms(")]
+    assert wbody.index("compute_part_start_times(") < wbody.index("build_bili_timeline_doc(")
 
 
 def test_upload_path_does_not_build_timeline():
@@ -131,7 +133,8 @@ def test_timeline_doc_is_remembered_then_backfilled_after_upload():
     assert "_remember_timeline_doc(" in MAIN_SRC, "收播生成后应记录文档"
     i_fn = MAIN_SRC.index("def run_bili_session_job")
     body = MAIN_SRC[i_fn:MAIN_SRC.index("def upload_live_batch")]
-    assert "_take_timeline_doc(session_dir)" in body, "投稿后应取回这场文档"
+    assert "_claim_unpublished_bvids(session_dir" in body, "只补本次新增的分稿"
     assert "append_text_block(" in body, "应把 BV 号追加进文档"
+    assert "_drop_timeline_doc(session_dir)" in body, "整场投完才移除记录"
     # 补写失败不能影响投稿结果
     assert "回填时间轴文档失败" in body

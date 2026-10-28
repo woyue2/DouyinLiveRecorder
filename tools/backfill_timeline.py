@@ -109,6 +109,21 @@ def main() -> int:
         url, token = mgr.create_article_docx(tmp, author=clean_name, doc_title=doc_title)
         print("文檔:", url)
         print("doc_token:", token)
+        # 登記起來，之後投稿成功才能把 BV 號補進這篇（與 main.py 用同一個檔案）
+        if url and token:
+            import json
+            map_path = _ROOT / "downloads" / "bili_timeline_docs.json"
+            data = {}
+            if map_path.exists():
+                try:
+                    data = json.loads(map_path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data[session_dir] = {"doc_token": token, "url": url,
+                                 "at": time.time(), "meta": meta, "published": []}
+            map_path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+            print("已登記，投稿成功後會自動補 BV 號")
     finally:
         os.remove(tmp)
     return 0 if 'url' in dir() and url else 1
