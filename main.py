@@ -475,6 +475,18 @@ def adjust_max_request() -> None:
         error_count = 0
 
 
+def _ensure_bracket_keyword(text: str) -> str:
+    """釘釘群機器人多把「【」設為自定義關鍵詞，缺了就整條被拒。
+
+    專案裡的訊息有的用 [B站投稿成功] 有的用 【直播时间轴】，這裡在發送邊界
+    統一開頭那組方括號，避免逐條模板各改一次、日後新增模板又漏。
+    """
+    if text.startswith("[") and "]" in text:
+        end = text.index("]")
+        return "【" + text[1:end] + "】" + text[end + 1:]
+    return text
+
+
 def _dingtalk_webhook(category: str) -> str:
     """依通知性質選釘釘群；未設定就回退通用通道。
 
@@ -489,9 +501,10 @@ def _dingtalk_webhook(category: str) -> str:
 def push_message(record_name: str, live_url: str, content: str,
                  category: str = "pipeline") -> None:
     msg_title = push_message_title.strip() or "直播间状态更新通知"
+    dingtalk_content = _ensure_bracket_keyword(content)
     push_functions = {
         '微信': lambda: xizhi(xizhi_api_url, msg_title, content),
-        '钉钉': lambda: dingtalk(_dingtalk_webhook(category), content,
+        '钉钉': lambda: dingtalk(_dingtalk_webhook(category), dingtalk_content,
                                  dingtalk_phone_num, dingtalk_is_atall),
         '邮箱': lambda: send_email(
             email_host, login_email, email_password, sender_email, sender_name,
