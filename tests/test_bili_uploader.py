@@ -648,3 +648,18 @@ def test_release_small_placeholders_unlocks_fragments(tmp_path):
     assert bili_uploader.release_small_placeholders(str(tmp_path)) == 1
     assert not (tmp_path / "a_001.mp4.bili_uploading").exists()
     assert (tmp_path / "a_000.mp4.bili_uploading").exists()
+
+
+def test_session_date_label_uses_broadcast_date_not_today():
+    """時間軸標題要用直播日期：場次可能在佇列裡排好幾天才投出去。"""
+    d = "downloads/抖音直播/黃財神/2026-10-24_21-36"
+    assert bili_uploader.session_date_label(d) == "2026-10-24 21:36"
+
+
+def test_session_date_label_handles_date_only_dir():
+    assert bili_uploader.session_date_label("x/2026-10-23") == "2026-10-23"
+
+
+def test_session_date_label_falls_back_when_unparseable():
+    out = bili_uploader.session_date_label("some/random/dir")
+    assert len(out) == 10 and out[4] == "-"   # 退回今天 YYYY-MM-DD

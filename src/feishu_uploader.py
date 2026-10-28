@@ -310,6 +310,30 @@ class FeishuDocManager:
             logger.warning(f"處理臨時 Markdown 失敗: {e}")
             return False
 
+    def rename_wiki_node(self, node_token: str, title: str) -> bool:
+        """改知識庫節點標題。
+
+        文檔歸檔到知識庫後，標題由 wiki 節點持有；直接 PATCH docx 會回
+        invalid param（實測 1770001），要走 wiki 的 update_title。
+        """
+        token = self.get_tenant_access_token()
+        if not token or not self.wiki_space_id:
+            return False
+        try:
+            resp = httpx.post(
+                f"{FEISHU_HOST}/open-apis/wiki/v2/spaces/{self.wiki_space_id}"
+                f"/nodes/{node_token}/update_title",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"title": title}, timeout=15.0)
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"改知識庫節點標題異常: {e}")
+            return False
+        if data.get("code") == 0:
+            return True
+        logger.error(f"改知識庫節點標題失敗: {data.get('code')} {data.get('msg')}")
+        return False
+
     def append_text_block(self, document_id: str, text: str) -> bool:
         """在既有 Docx 文檔末尾追加一段純文字。
 

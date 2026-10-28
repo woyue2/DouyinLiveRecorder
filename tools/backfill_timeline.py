@@ -23,6 +23,7 @@ from bili_uploader import (  # noqa: E402
     compute_part_start_times,
     extract_session_bili_metadata,
     list_session_videos,
+    session_date_label,
     build_parts_timeline_markdown,
 )
 
@@ -82,9 +83,9 @@ def main() -> int:
     print(f"分P看點: {len(parts)} 條")
 
     starts = compute_part_start_times(videos, fallback_seconds=fallback)
+    date_label = session_date_label(session_dir)
     md = build_parts_timeline_markdown(
-        parts, record_name=args.name,
-        upload_date=time.strftime("%Y-%m-%d"), start_times=starts,
+        parts, record_name=args.name, upload_date=date_label, start_times=starts,
     )
     print(f"Markdown {len(md)} 字，前 3 行:")
     for line in md.splitlines()[:3]:
@@ -92,7 +93,7 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    doc_title = f"{time.strftime('%Y-%m-%d')}【{clean_name}】直播时间轴（补生成）"
+    doc_title = f"{date_label}【{clean_name}】直播时间轴（补生成）"
     tmp = f"/tmp/backfill_timeline_{os.getpid()}.md"
     Path(tmp).write_text(md, encoding="utf-8")
     try:

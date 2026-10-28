@@ -62,6 +62,7 @@ from src.bili_uploader import (
     chunk_session_meta,
     pick_live_batch,
     list_session_videos,
+    session_date_label,
     release_small_placeholders,
     SESSION_MIN_BYTES,
     load_live_ledger,
@@ -966,7 +967,8 @@ def _rate_limit_notice(record_name: str) -> str:
 
 
 def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
-                            start_times: Optional[list] = None
+                            start_times: Optional[list] = None,
+                            session_dir: str = ""
                             ) -> tuple[Optional[str], Optional[str], str]:
     """把直播分P看点整理成「直播时间轴」飞书文档。
 
@@ -982,9 +984,10 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
     if not (feishu_doc_enabled and feishu_app_id and feishu_app_secret and bili_timeline_node):
         return None, None, "未配置飞书时间轴知识库"
 
-    upload_date = time.strftime("%Y-%m-%d")
+    date_label = session_date_label(session_dir)
+    upload_date = date_label.split(" ")[0]
     md = build_parts_timeline_markdown(
-        parts, record_name=record_name, upload_date=upload_date, start_times=start_times
+        parts, record_name=record_name, upload_date=date_label, start_times=start_times
     )
 
     tmp_path = os.path.join("/tmp", f"bili_timeline_{os.getpid()}_{int(time.time() * 1000)}.md")
@@ -999,7 +1002,7 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
             wiki_root_node=bili_timeline_node,
             wiki_domain=bili_timeline_domain,
         )
-        doc_title = f"{upload_date}【{clean_name}】直播时间轴"
+        doc_title = f"{date_label}【{clean_name}】直播时间轴"
         url, doc_token = mgr.create_article_docx(tmp_path, author=clean_name, doc_title=doc_title)
         return url, doc_token, ""
     except Exception as e:
@@ -1059,7 +1062,7 @@ def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
     def _worker():
         try:
             url, doc_token, err = build_bili_timeline_doc(
-                meta, record_name, clean_name, start_times)
+                meta, record_name, clean_name, start_times, session_dir=session_dir)
             if url:
                 logger.info(f"直播时间轴飞书文档已生成: {url}")
                 # 記下來，投稿成功後把 BV 號補進同一篇文檔

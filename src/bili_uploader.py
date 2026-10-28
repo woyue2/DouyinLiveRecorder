@@ -10,6 +10,7 @@
 
 import os
 import re
+import datetime
 import json
 import time
 import subprocess
@@ -364,6 +365,22 @@ LIVE_UPLOAD_MIN_AGE_SECONDS = 180
 SESSION_VIDEO_EXTS = (".ts", ".mp4")
 # 低於這個大小的分段視為碎片：碎片不進投稿佇列，也不該長期佔著 B 站佔位
 SESSION_MIN_BYTES = 2 * 1024 * 1024
+
+
+def session_date_label(session_dir: str) -> str:
+    """從場次目錄名取直播日期與開播時刻（2026-10-24_21-36 → 2026-10-24 21:36）。
+
+    時間軸文檔要用直播日期命名，不能用生成日期：場次可能排在投稿佇列裡
+    好幾天才投出去，用生成日期會讓文檔對不上直播內容，同一天多場也會撞名。
+    """
+    name = os.path.basename(os.path.normpath(session_dir or ""))
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})[_-](\d{2})-(\d{2})", name)
+    if m:
+        return f"{m.group(1)} {m.group(2)}:{m.group(3)}"
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", name)
+    if m:
+        return m.group(1)
+    return datetime.date.today().isoformat()
 
 
 def list_session_videos(session_dir: str, min_bytes: int = SESSION_MIN_BYTES) -> list:
