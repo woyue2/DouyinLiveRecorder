@@ -2221,8 +2221,10 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
             start_hm = datetime.datetime.fromtimestamp(record_started_at).strftime("%H:%M")
             brief.push(
                 "直播", _resolve_streamer_type(record_name)[0],
-                f"{status_text}，{start_hm} 开播，播了 "
-                f"{brief.format_duration(duration_sec)}，共 {len(published_files)} 段",
+                # 這是「開始錄製」時間，不是主播真正開播時間（監測可能晚到），
+                # 措辭不要寫成開播，免得看起來像主播很晚才開
+                f"{status_text}，{start_hm} 开始录制，共 "
+                f"{brief.format_duration(duration_sec)}，{len(published_files)} 段",
             )
         if record_url in bili_upload_urls and bili_upload_enabled:
             hold_videos_for_bili(published_files)
