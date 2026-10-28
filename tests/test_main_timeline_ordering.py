@@ -124,3 +124,14 @@ def test_session_job_waits_for_transcode_before_resolving_paths():
     i_wait = body.index("_wait_transcode_drain(session_dir)")
     i_resolve = body.index("_resolve_session_video_paths(job)")
     assert i_wait < i_resolve
+
+
+def test_timeline_doc_is_remembered_then_backfilled_after_upload():
+    """收播建好文档要记下 doc_token，投稿成功后再把 BV 号补进同一篇。"""
+    assert "_remember_timeline_doc(" in MAIN_SRC, "收播生成后应记录文档"
+    i_fn = MAIN_SRC.index("def run_bili_session_job")
+    body = MAIN_SRC[i_fn:MAIN_SRC.index("def upload_live_batch")]
+    assert "_take_timeline_doc(session_dir)" in body, "投稿后应取回这场文档"
+    assert "append_text_block(" in body, "应把 BV 号追加进文档"
+    # 补写失败不能影响投稿结果
+    assert "回填时间轴文档失败" in body

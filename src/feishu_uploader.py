@@ -310,6 +310,38 @@ class FeishuDocManager:
             logger.warning(f"處理臨時 Markdown 失敗: {e}")
             return False
 
+    def append_text_block(self, document_id: str, text: str) -> bool:
+        """在既有 Docx 文檔末尾追加一段純文字。
+
+        用途：直播時間軸在收播時先建好，投稿成功後把 BV 號與分 P 對照補進來。
+        document_id 是 Docx 的 obj_token（create_article_docx 回傳的第二個值），
+        不是 wiki 節點 token。
+        """
+        token = self.get_tenant_access_token()
+        if not token:
+            logger.error("追加文檔內容失敗: 無法取得 tenant_access_token")
+            return False
+        url = (f"{FEISHU_HOST}/open-apis/docx/v1/documents/{document_id}"
+               f"/blocks/{document_id}/children?document_revision_id=-1")
+        payload = {
+            "index": -1,
+            "children": [{
+                "block_type": 2,  # text
+                "text": {"elements": [{"text_run": {"content": text}}]},
+            }],
+        }
+        try:
+            resp = httpx.post(url, headers={"Authorization": f"Bearer {token}"},
+                              json=payload, timeout=15.0)
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"追加文檔內容異常: {e}")
+            return False
+        if data.get("code") == 0:
+            return True
+        logger.error(f"追加文檔內容失敗: {data.get('code')} {data.get('msg')}")
+        return False
+
     def create_docx_from_markdown(
         self,
         md_path: str,

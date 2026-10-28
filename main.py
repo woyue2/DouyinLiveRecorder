@@ -966,20 +966,21 @@ def _rate_limit_notice(record_name: str) -> str:
 
 
 def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
-                            start_times: Optional[list] = None) -> tuple[Optional[str], str]:
+                            start_times: Optional[list] = None
+                            ) -> tuple[Optional[str], Optional[str], str]:
     """把直播分P看点整理成「直播时间轴」飞书文档。
 
     归档到「直播时间轴」节点下、以主播命名的子节点中（与其他主播并排）。
     start_times 必须由调用方在**清理本地 TS 之前**算好并传入：上传成功后主流程
     会立刻删除 TS（策略「仅百度云上传md(删除ts)」），若此处才去 ffprobe，
     檔案已不存在，所有时间戳都会退化成 00:00。
-    返回 (飞书文档链接, 说明文字)；失败时链接为 None。
+    返回 (飞书文档链接, doc_token, 说明文字)；失败时前两者为 None。
     """
     parts = meta.get("parts") or []
     if not parts:
-        return None, "无可用的分P看点内容"
+        return None, None, "无可用的分P看点内容"
     if not (feishu_doc_enabled and feishu_app_id and feishu_app_secret and bili_timeline_node):
-        return None, "未配置飞书时间轴知识库"
+        return None, None, "未配置飞书时间轴知识库"
 
     upload_date = time.strftime("%Y-%m-%d")
     md = build_parts_timeline_markdown(
@@ -999,11 +1000,11 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
             wiki_domain=bili_timeline_domain,
         )
         doc_title = f"{upload_date}【{clean_name}】直播时间轴"
-        url, _ = mgr.create_article_docx(tmp_path, author=clean_name, doc_title=doc_title)
-        return url, ""
+        url, doc_token = mgr.create_article_docx(tmp_path, author=clean_name, doc_title=doc_title)
+        return url, doc_token, ""
     except Exception as e:
         logger.warning(f"生成直播时间轴飞书文档异常 ({record_name}): {e}")
-        return None, f"异常: {e}"
+        return None, None, f"异常: {e}"
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -1012,8 +1013,44 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
                 pass
 
 
+TIMELINE_DOC_MAP = os.path.join(script_path, "downloads", "bili_timeline_docs.json")
+
+
+def _remember_timeline_doc(session_dir: str, doc_token: str, url: str) -> None:
+    """記下這場的時間軸文檔，投稿成功後要把 BV 號補進同一篇。"""
+    if not session_dir or not doc_token:
+        return
+    try:
+        data = {}
+        if os.path.exists(TIMELINE_DOC_MAP):
+            with open(TIMELINE_DOC_MAP, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data[session_dir] = {"doc_token": doc_token, "url": url, "at": time.time()}
+        with open(TIMELINE_DOC_MAP, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"记录时间轴文档失败: {e}")
+
+
+def _take_timeline_doc(session_dir: str) -> Optional[dict]:
+    """取出并移除这场的时间轴文档记录（同一个文档只补一次）。"""
+    try:
+        if not os.path.exists(TIMELINE_DOC_MAP):
+            return None
+        with open(TIMELINE_DOC_MAP, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entry = data.pop(session_dir, None)
+        with open(TIMELINE_DOC_MAP, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return entry
+    except Exception as e:
+        logger.warning(f"读取时间轴文档记录失败: {e}")
+        return None
+
+
 def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
-                           start_times: Optional[list] = None) -> None:
+                           start_times: Optional[list] = None,
+                           session_dir: str = "") -> None:
     """后台线程：生成直播时间轴飞书文档并推送钉钉通知。
 
     start_times 需由调用方在清理本地 TS 之前算好（见 build_bili_timeline_doc 说明）。
@@ -1021,9 +1058,12 @@ def schedule_bili_timeline(meta: dict, record_name: str, clean_name: str,
     """
     def _worker():
         try:
-            url, err = build_bili_timeline_doc(meta, record_name, clean_name, start_times)
+            url, doc_token, err = build_bili_timeline_doc(
+                meta, record_name, clean_name, start_times)
             if url:
                 logger.info(f"直播时间轴飞书文档已生成: {url}")
+                # 記下來，投稿成功後把 BV 號補進同一篇文檔
+                _remember_timeline_doc(session_dir, doc_token, url)
                 try:
                     push_message(
                         record_name, "",
@@ -1245,6 +1285,7 @@ def run_bili_session_job(job: dict) -> None:
             f"{bili_max_chunk_bytes / 1024 ** 3:.1f}GB，拆成 {len(chunks)} 份稿件 ({record_name})"
         )
 
+    published_chunks = []
     for chunk in chunks:
         if chunk["index"] > 1:
             _wait_for_split_slot(record_name, chunk)
@@ -1266,6 +1307,13 @@ def run_bili_session_job(job: dict) -> None:
         if success:
             bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
             bvid = bvid_match.group(0) if bvid_match else "已提交"
+            published_chunks.append({
+                "bvid": bvid,
+                "title": chunk.get("title", ""),
+                "parts": len(chunk["ts_paths"]),
+                "index": chunk["index"],
+                "total": chunk["total"],
+            })
             # 立即推送：拆稿之間要 sleep 90 分鐘以上，累積到最後才推會因重啟而全數丟失
             _push_bili_notice(
                 record_name,
@@ -1303,6 +1351,29 @@ def run_bili_session_job(job: dict) -> None:
                 )
                 break
             _push_bili_notice(record_name, content)
+
+    # 把 BV 號補回收播時建好的時間軸文檔，讓文檔自帶發布資訊
+    if published_chunks:
+        entry = _take_timeline_doc(session_dir)
+        if entry and entry.get("doc_token"):
+            try:
+                from src.feishu_uploader import FeishuDocManager
+                mgr = FeishuDocManager(
+                    feishu_app_id, feishu_app_secret,
+                    folder_token=feishu_folder_token,
+                    wiki_space_id=feishu_wiki_space_id,
+                    wiki_root_node=bili_timeline_node,
+                    wiki_domain=bili_timeline_domain,
+                )
+                lines = [f"已发布到 B 站（{record_name}）："]
+                for c in published_chunks:
+                    tag = (f"第 {c['index']}/{c['total']} 份"
+                           if c.get("total", 1) > 1 else "全集")
+                    lines.append(f"· {tag} {c['bvid']}（{c['parts']}P）{c['title']}")
+                if mgr.append_text_block(entry["doc_token"], chr(10).join(lines)):
+                    logger.info(f"已把 BV 号补进时间轴文档 ({session_dir})")
+            except Exception as e:
+                logger.warning(f"回填时间轴文档失败（不影响投稿）: {e}")
 
 
 def upload_live_batch(session_dir: str, info: dict, ts_paths: list) -> bool:
@@ -1539,7 +1610,8 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
                 for v in prefix
             ] + list(timeline_meta.get("parts") or [])
             starts = [v.get("start", 0) for v in prefix] + seg_starts
-            schedule_bili_timeline({"parts": parts}, record_name, clean_name, starts)
+            schedule_bili_timeline({"parts": parts}, record_name, clean_name, starts,
+                                   session_dir=session_dir)
             logger.info(f"收播即生成时间轴（不等投稿）: {session_dir}")
     except Exception as e:
         logger.warning(f"收播生成时间轴失败（不影响投稿）: {e}")
