@@ -12,29 +12,29 @@ from pathlib import Path
 MAIN_SRC = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
 
 
-def test_start_times_are_computed_before_ts_cleanup():
-    i_compute = MAIN_SRC.index("compute_part_start_times(valid_ts_paths")
-    i_cleanup = MAIN_SRC.index('handle_post_upload_cleanup(chunk["ts_paths"]')
-    assert i_compute < i_cleanup, (
-        "必須在上傳成功、依策略刪除 TS 之前算好分P起始時間，"
-        "否則 ffprobe 讀不到被刪除的檔案，時間戳會全部變成 00:00"
-    )
+def test_timeline_is_generated_at_session_end_not_after_upload():
+    """時間軸在收播時就生成，不等 B 站投稿排隊（288 分鐘間隔會延遲數天）。"""
+    i_fn = MAIN_SRC.index("def process_session_multi_p_upload")
+    body = MAIN_SRC[i_fn:MAIN_SRC.index("def transcribe_and_notify")]
+    assert "schedule_bili_timeline(" in body, "收播流程應直接生成時間軸"
+    # 必須早於投稿動作，不能退回「投完才生成」
+    assert body.index("schedule_bili_timeline(") < body.index("run_bili_job(job)")
 
 
-def test_timeline_is_built_after_upload_from_precomputed_start_times():
-    """時間軸在所有分片處理完後才生成，且用先前算好的時間戳，不在執行緒內重新探測。"""
-    i_cleanup = MAIN_SRC.index('handle_post_upload_cleanup(chunk["ts_paths"]')
-    i_schedule = MAIN_SRC.index(
-        'timeline["meta"], record_name, clean_name, timeline["starts"]'
-    )
-    assert i_schedule > i_cleanup, (
-        "時間軸應在全部上傳結束後才生成，避免列出上傳失敗、B 站上不存在的分片"
-    )
-    # 不可再退回用整場 meta 直接排程（會與拆稿後重新編號的分P 標籤對不上）
-    assert "schedule_bili_timeline(meta, record_name, clean_name, timeline_start_times)" not in MAIN_SRC
-    assert "_build_successful_timeline(" in MAIN_SRC
-    # 提前上傳的分段也要進時間軸，否則文件只覆蓋錄製結束時剩下的尾巴
-    assert "timeline_prefix" in MAIN_SRC
+def test_start_times_probed_before_files_could_be_cleaned():
+    """時間軸靠 ffprobe 讀檔，必須先算好再排程。"""
+    i_fn = MAIN_SRC.index("def process_session_multi_p_upload")
+    body = MAIN_SRC[i_fn:MAIN_SRC.index("def transcribe_and_notify")]
+    i_compute = body.index("compute_part_start_times(")
+    # 收播流程裡另有一處「整場已由提前上傳涵蓋」的排程，取「算完之後」那次
+    assert body.index("schedule_bili_timeline(", i_compute) > i_compute
+
+
+def test_upload_path_does_not_build_timeline():
+    """投稿端不再生成時間軸，否則同一場會建出第二份文檔。"""
+    i_fn = MAIN_SRC.index("def run_bili_session_job")
+    body = MAIN_SRC[i_fn:MAIN_SRC.index("def upload_live_batch")]
+    assert "schedule_bili_timeline(" not in body
 
 
 def test_live_transcription_archives_to_timeline_not_works_library():
