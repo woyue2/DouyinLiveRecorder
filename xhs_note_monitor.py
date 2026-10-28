@@ -18,6 +18,7 @@ import logging
 import argparse
 import datetime
 import subprocess
+import threading
 import configparser
 import urllib.parse
 from typing import List, Dict, Optional, Any, Tuple
@@ -880,10 +881,8 @@ def process_monitor_once(
     history = load_history(args.history_file)
     retry_queue = load_retry_queue(args.retry_file)
     dingtalk_webhook = (args.dingtalk_webhook
-                        or config_settings.get("dingtalk_content_webhook", "")
-                        or config_settings.get("dingtalk_webhook", ""))
-    dingtalk_alert_webhook = (config_settings.get("dingtalk_alert_webhook", "")
-                              or dingtalk_webhook)
+                        or config_settings.get("dingtalk_content_webhook", ""))
+    dingtalk_alert_webhook = config_settings.get("dingtalk_alert_webhook", "")
     dingtalk_phone = config_settings.get("dingtalk_phone", "")
     dingtalk_is_atall = config_settings.get("dingtalk_is_atall", False)
     transcribe_script = config_settings.get("transcribe_script", "")
@@ -1061,8 +1060,12 @@ def process_monitor_once(
                     res = msg_push.dingtalk(dingtalk_webhook, msg_content, dingtalk_phone, dingtalk_is_atall)
                     if res.get("success"):
                         logger.info("釘釘推送成功")
-                        # 內容群沒送到就不要發一句，否則兩群訊息不同步
-                        brief.push("小紅書", author_name, title)
+                        # 內容群沒送到就不要發一句，否則兩群訊息不同步；
+                        # 丟背景避免釘釘 HTTP 卡住主流程
+                        threading.Thread(
+                            target=brief.push,
+                            args=("小紅書", author_name, title),
+                            daemon=True).start()
                     else:
                         logger.error(f"釘釘推送失敗: {res.get('error')}")
 

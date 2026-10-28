@@ -380,6 +380,8 @@ def session_date_label(session_dir: str) -> str:
     m = re.match(r"^(\d{4}-\d{2}-\d{2})", name)
     if m:
         return m.group(1)
+    # 退回今天會讓補生成的歷史場次被標成今天，至少留個痕跡
+    logger.warning(f"场次目录名无法解析日期，退回今天: {session_dir}")
     return datetime.date.today().isoformat()
 
 
@@ -1238,7 +1240,7 @@ def compute_part_start_times(ts_paths: list, fallback_seconds: int = 0) -> list:
     return starts
 
 
-def _format_timestamp(seconds: float) -> str:
+def format_timestamp(seconds: float) -> str:
     total = max(0, int(seconds))
     hh, rem = divmod(total, 3600)
     mm, ss = divmod(rem, 60)
@@ -1272,7 +1274,7 @@ def build_parts_timeline_markdown(parts: list, record_name: str = "",
         label = part.get("label") or f"【P{idx + 1}】"
         ptitle = re.sub(r'^P\d+\s*', '', (part.get("title") or "").strip()).strip()
         if start_times and idx < len(start_times):
-            ts = _format_timestamp(start_times[idx])
+            ts = format_timestamp(start_times[idx])
             heading = f"## {label} {ts} · {ptitle}" if ptitle else f"## {label} {ts}"
         else:
             heading = f"## {label} {ptitle}" if ptitle else f"## {label}"

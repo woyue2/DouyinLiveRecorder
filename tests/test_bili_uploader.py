@@ -347,9 +347,9 @@ def test_probe_duration_and_start_times_fall_back(monkeypatch):
 
 
 def test_format_timestamp():
-    assert bili_uploader._format_timestamp(0) == "00:00"
-    assert bili_uploader._format_timestamp(901) == "15:01"
-    assert bili_uploader._format_timestamp(3725) == "01:02:05"
+    assert bili_uploader.format_timestamp(0) == "00:00"
+    assert bili_uploader.format_timestamp(901) == "15:01"
+    assert bili_uploader.format_timestamp(3725) == "01:02:05"
 
 
 def test_build_parts_index_chunks():

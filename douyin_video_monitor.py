@@ -683,8 +683,7 @@ def process_blogger_videos(
     history = load_history(args.history_file)
     transcribe_script = args.transcribe_script or config_settings.get("transcribe_script", "")
     dingtalk_webhook = (args.dingtalk_webhook
-                        or config_settings.get("dingtalk_content_webhook", "")
-                        or config_settings.get("dingtalk_webhook", ""))
+                        or config_settings.get("dingtalk_content_webhook", ""))
     dingtalk_phone = config_settings.get("dingtalk_phone", "")
     dingtalk_is_atall = config_settings.get("dingtalk_is_atall", False)
 
@@ -888,8 +887,7 @@ def check_login_state(monitor: DouyinVideoMonitor) -> Optional[bool]:
 
 def notify_douyin_login_needed(config_settings: Dict[str, Any]) -> None:
     """登入失效時發釘釘，帶可直接操作的 noVNC 瀏覽器連結。"""
-    webhook = (config_settings.get("dingtalk_alert_webhook", "")
-               or config_settings.get("dingtalk_webhook", ""))
+    webhook = config_settings.get("dingtalk_alert_webhook", "")
     if not webhook:
         logger.warning("抖音登入失效，但未設定釘釘 webhook，無法通知")
         return

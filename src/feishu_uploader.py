@@ -316,15 +316,14 @@ class FeishuDocManager:
         文檔歸檔到知識庫後，標題由 wiki 節點持有；直接 PATCH docx 會回
         invalid param（實測 1770001），要走 wiki 的 update_title。
         """
-        token = self.get_tenant_access_token()
-        if not token or not self.wiki_space_id:
+        headers = self._wiki_headers()
+        if not headers or not self.wiki_space_id:
             return False
         try:
-            resp = httpx.post(
+            resp = self.client.post(
                 f"{FEISHU_HOST}/open-apis/wiki/v2/spaces/{self.wiki_space_id}"
                 f"/nodes/{node_token}/update_title",
-                headers={"Authorization": f"Bearer {token}"},
-                json={"title": title}, timeout=15.0)
+                headers=headers, json={"title": title})
             data = resp.json()
         except Exception as e:
             logger.error(f"改知識庫節點標題異常: {e}")
@@ -341,8 +340,8 @@ class FeishuDocManager:
         document_id 是 Docx 的 obj_token（create_article_docx 回傳的第二個值），
         不是 wiki 節點 token。
         """
-        token = self.get_tenant_access_token()
-        if not token:
+        headers = self._wiki_headers()
+        if not headers:
             logger.error("追加文檔內容失敗: 無法取得 tenant_access_token")
             return False
         url = (f"{FEISHU_HOST}/open-apis/docx/v1/documents/{document_id}"
@@ -355,8 +354,7 @@ class FeishuDocManager:
             }],
         }
         try:
-            resp = httpx.post(url, headers={"Authorization": f"Bearer {token}"},
-                              json=payload, timeout=15.0)
+            resp = self.client.post(url, headers=headers, json=payload)
             data = resp.json()
         except Exception as e:
             logger.error(f"追加文檔內容異常: {e}")

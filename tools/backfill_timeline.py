@@ -121,8 +121,11 @@ def main() -> int:
                     data = {}
             data[session_dir] = {"doc_token": token, "url": url,
                                  "at": time.time(), "meta": meta, "published": []}
-            map_path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                                encoding="utf-8")
+            # 主程式可能同時在寫同一份檔；先寫暫存再原子替換，避免半截 JSON
+            tmp_map = map_path.with_suffix(".json.tmp")
+            tmp_map.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+            tmp_map.replace(map_path)
             print("已登記，投稿成功後會自動補 BV 號")
     finally:
         os.remove(tmp)

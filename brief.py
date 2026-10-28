@@ -10,7 +10,6 @@
 設定鍵：config/local_secrets.ini [推送配置] 钉钉一句接口链接
 留空則完全不發，不影響既有流程。
 """
-import configparser
 import datetime
 import logging
 import os
@@ -22,6 +21,7 @@ if _CURRENT_DIR not in sys.path:
     sys.path.insert(0, _CURRENT_DIR)
 
 import msg_push
+import notify_route
 
 logger = logging.getLogger("brief")
 
@@ -51,8 +51,8 @@ def _clean_line(line: str) -> str:
 def _load_webhook() -> str:
     """讀取「一句」群 Webhook，依檔案 mtime 快取。
 
-    一次監控會發十幾條，每條重讀兩個 ini（local_secrets 內含數千字 cookie）
-    是純浪費；設定變更時 mtime 會變，快取自動失效。
+    合併讀取交給 notify_route，避免出現第三套「哪些檔、什麼順序」的實作。
+    一次監控會發十幾條，設定檔沒變就不重讀（local_secrets 內含數千字 cookie）。
     """
     global _webhook_cache
     paths = [os.path.join(_CURRENT_DIR, "config", name)
@@ -64,19 +64,8 @@ def _load_webhook() -> str:
     if _webhook_cache and stamp is not None and stamp == _webhook_cache[0]:
         return _webhook_cache[1]
 
-    value = ""
-    for path in paths:
-        if not os.path.exists(path):
-            continue
-        try:
-            cp = configparser.RawConfigParser()
-            cp.read(path, encoding="utf-8-sig")
-            got = cp.get("推送配置", "钉钉一句接口链接", fallback="").strip()
-            if got:
-                value = got
-                break
-        except Exception:
-            continue
+    cp = notify_route.merge_config_files(*paths)
+    value = cp.get("推送配置", "钉钉一句接口链接", fallback="").strip()         if cp.has_section("推送配置") else ""
     if stamp is not None:
         _webhook_cache = (stamp, value)
     return value

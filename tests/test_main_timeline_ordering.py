@@ -28,7 +28,7 @@ def test_start_times_probed_before_files_could_be_cleaned():
     assert body.index("schedule_session_timeline(") > 0
     # 起始時間在背景 worker 裡、建文檔之前才算（那时檔案还在）
     i_worker = MAIN_SRC.index("def schedule_session_timeline(")
-    wbody = MAIN_SRC[i_worker:MAIN_SRC.index("def _fmt_hms(")]
+    wbody = MAIN_SRC[i_worker:MAIN_SRC.index("def run_bili_single_job(")]
     assert wbody.index("compute_part_start_times(") < wbody.index("build_bili_timeline_doc(")
 
 
@@ -133,8 +133,9 @@ def test_timeline_doc_is_remembered_then_backfilled_after_upload():
     assert "_remember_timeline_doc(" in MAIN_SRC, "收播生成后应记录文档"
     i_fn = MAIN_SRC.index("def run_bili_session_job")
     body = MAIN_SRC[i_fn:MAIN_SRC.index("def upload_live_batch")]
-    assert "_claim_unpublished_bvids(session_dir" in body, "只补本次新增的分稿"
+    assert "_unpublished_bvids(session_dir" in body, "只补本次新增的分稿"
     assert "append_text_block(" in body, "应把 BV 号追加进文档"
     assert "_drop_timeline_doc(session_dir)" in body, "整场投完才移除记录"
+    assert "_mark_published(" in body, "追加成功才记帐"
     # 补写失败不能影响投稿结果
     assert "回填时间轴文档失败" in body

@@ -63,6 +63,7 @@ from src.bili_uploader import (
     pick_live_batch,
     list_session_videos,
     session_date_label,
+    format_timestamp,
     release_small_placeholders,
     SESSION_MIN_BYTES,
     load_live_ledger,
@@ -481,8 +482,8 @@ def _dingtalk_webhook(category: str) -> str:
     content ：產出的乾貨（作品轉寫、直播時間軸、B站投稿成功）
     pipeline：背景流水（開播關播、排隊等待）
     """
-    return (notify_route.pick(globals().get("dingtalk_routes") or {}, category)
-            or globals().get("dingtalk_api_url", ""))
+    # pick() 內部已回退到通用通道，不必再 or 一次
+    return notify_route.pick(globals().get("dingtalk_routes") or {}, category)
 
 
 def push_message(record_name: str, live_url: str, content: str,
@@ -985,7 +986,6 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
         return None, None, "未配置飞书时间轴知识库"
 
     date_label = session_date_label(session_dir)
-    upload_date = date_label.split(" ")[0]
     md = build_parts_timeline_markdown(
         parts, record_name=record_name, upload_date=date_label, start_times=start_times
     )
@@ -994,14 +994,7 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(md)
-        from src.feishu_uploader import FeishuDocManager
-        mgr = FeishuDocManager(
-            feishu_app_id, feishu_app_secret,
-            folder_token=feishu_folder_token,
-            wiki_space_id=feishu_wiki_space_id,
-            wiki_root_node=bili_timeline_node,
-            wiki_domain=bili_timeline_domain,
-        )
+        mgr = _feishu_doc_manager()
         doc_title = f"{date_label}【{clean_name}】直播时间轴"
         url, doc_token = mgr.create_article_docx(tmp_path, author=clean_name, doc_title=doc_title)
         return url, doc_token, ""
@@ -1014,6 +1007,22 @@ def build_bili_timeline_doc(meta: dict, record_name: str, clean_name: str,
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+def _feishu_doc_manager():
+    """建一個指向「直播時間軸」知識庫節點的 FeishuDocManager。
+
+    時間軸建立、追加新增分段、回填 BV 號三條路徑都要同一組參數，
+    之前各抄一份，改設定時容易漏改其中一條。
+    """
+    from src.feishu_uploader import FeishuDocManager
+    return FeishuDocManager(
+        feishu_app_id, feishu_app_secret,
+        folder_token=feishu_folder_token,
+        wiki_space_id=feishu_wiki_space_id,
+        wiki_root_node=bili_timeline_node,
+        wiki_domain=bili_timeline_domain,
+    )
 
 
 TIMELINE_DOC_MAP = os.path.join(script_path, "downloads", "bili_timeline_docs.json")
@@ -1066,25 +1075,38 @@ def _remember_timeline_doc(session_dir: str, doc_token: str, url: str,
         _save_timeline_map(data)
 
 
-def _claim_unpublished_bvids(session_dir: str, chunks: list) -> list:
-    """記下這次已回填的分稿，回傳本次真正需要補寫的那些。
+def _unpublished_bvids(session_dir: str, chunks: list) -> tuple:
+    """回傳 (尚未補寫的分稿, 映射條目)；只讀，不落盤。
 
-    拆稿 + 風控重投時，同一場會分好幾輪投稿；用 bvid 去重才不會重複補寫，
-    也不會因為第一輪就刪掉記錄而讓後續分稿的 BV 永遠補不上。
+    先算後寫：append 成功才呼叫 _mark_published 記帳，否則一次飛書逾時
+    就會把這些 BV 永久標成「已補寫」，之後再也不會重試。
     """
     if not session_dir or not chunks:
-        return []
+        return [], None
+    with _timeline_map_lock:
+        entry = _load_timeline_map().get(session_dir)
+    if not entry:
+        return [], None
+    done = set(entry.get("published") or [])
+    fresh = [c for c in chunks if c.get("bvid") and c["bvid"] not in done]
+    return fresh, entry
+
+
+def _mark_published(session_dir: str, bvids: list) -> None:
+    """把已成功寫進文檔的 BV 號記下來，避免重複補寫。"""
+    bvids = [b for b in bvids if b]
+    if not session_dir or not bvids:
+        return
     with _timeline_map_lock:
         data = _load_timeline_map()
         entry = data.get(session_dir)
         if not entry:
-            return []
+            return
         done = entry.setdefault("published", [])
-        fresh = [c for c in chunks if c.get("bvid") and c["bvid"] not in done]
-        if fresh:
-            done.extend(c["bvid"] for c in fresh)
+        new = [b for b in bvids if b not in done]
+        if new:
+            done.extend(new)
             _save_timeline_map(data)
-        return fresh
 
 
 def _drop_timeline_doc(session_dir: str) -> None:
@@ -1175,18 +1197,11 @@ def schedule_session_timeline(session_dir: str, record_name: str, clean_name: st
             entry = _peek_timeline_doc(session_dir)
             if entry and entry.get("doc_token"):
                 # 同一場次又錄了一段：追加到既有文檔，不再建第二篇
-                lines = [f"本场新增 {len(parts)} 段（{_fmt_hms(seg_starts[0]) if seg_starts else '--'} 起）："]
+                lines = [f"本场新增 {len(parts)} 段（{format_timestamp(seg_starts[0]) if seg_starts else '--'} 起）："]
                 for part, start in zip(parts, seg_starts):
-                    lines.append(f"· {_fmt_hms(start)} {part.get('title', '')}")
-                from src.feishu_uploader import FeishuDocManager
-                mgr = FeishuDocManager(
-                    feishu_app_id, feishu_app_secret,
-                    folder_token=feishu_folder_token,
-                    wiki_space_id=feishu_wiki_space_id,
-                    wiki_root_node=bili_timeline_node,
-                    wiki_domain=bili_timeline_domain,
-                )
-                if mgr.append_text_block(entry["doc_token"], chr(10).join(lines)):
+                    lines.append(f"· {format_timestamp(start)} {part.get('title', '')}")
+                if _feishu_doc_manager().append_text_block(entry["doc_token"],
+                                                           chr(10).join(lines)):
                     logger.info(f"已把新增分段追加到既有时间轴 ({session_dir})")
                 return
 
@@ -1215,12 +1230,6 @@ def schedule_session_timeline(session_dir: str, record_name: str, clean_name: st
             logger.error(f"收播生成时间轴异常 ({record_name}): {e}")
 
     threading.Thread(target=_worker, daemon=True, name="bili-timeline").start()
-
-
-def _fmt_hms(seconds: float) -> str:
-    """秒數轉 HH:MM:SS，用於文檔內的段落時刻。"""
-    seconds = max(0, int(seconds))
-    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
 def run_bili_single_job(job: dict) -> None:
@@ -1404,8 +1413,7 @@ def run_bili_session_job(job: dict) -> None:
 
     clean_name, streamer_type = _resolve_streamer_type(record_name)
     # 收播生成時間軸時已算過 meta，優先重用，不再重打大模型
-    meta = (job.get("timeline_meta")
-            or (_peek_timeline_doc(session_dir) or {}).get("meta")
+    meta = ((_peek_timeline_doc(session_dir) or {}).get("meta")
             or extract_session_bili_metadata(
                 session_dir=session_dir,
                 record_name=record_name,
@@ -1428,7 +1436,6 @@ def run_bili_session_job(job: dict) -> None:
             f"{bili_max_chunk_bytes / 1024 ** 3:.1f}GB，拆成 {len(chunks)} 份稿件 ({record_name})"
         )
 
-    published_chunks = []
     for chunk in chunks:
         if chunk["index"] > 1:
             _wait_for_split_slot(record_name, chunk)
@@ -1450,13 +1457,7 @@ def run_bili_session_job(job: dict) -> None:
         if success:
             bvid_match = re.search(r'BV[a-zA-Z0-9]+', output)
             bvid = bvid_match.group(0) if bvid_match else "已提交"
-            published_chunks.append({
-                "bvid": bvid,
-                "title": chunk.get("title", ""),
-                "parts": len(chunk["ts_paths"]),
-                "index": chunk["index"],
-                "total": chunk["total"],
-            })
+            chunk["bvid"] = bvid
             # 立即推送：拆稿之間要 sleep 90 分鐘以上，累積到最後才推會因重啟而全數丟失
             _push_bili_notice(
                 record_name,
@@ -1496,26 +1497,22 @@ def run_bili_session_job(job: dict) -> None:
             _push_bili_notice(record_name, content)
 
     # 把 BV 號補回收播時建好的時間軸文檔，讓文檔自帶發布資訊
-    if published_chunks:
-        # 只補「這輪新增」的分稿：拆稿遇風控重投時，後續成功的分稿才不会被漏掉
-        fresh = _claim_unpublished_bvids(session_dir, published_chunks)
-        entry = _peek_timeline_doc(session_dir)
+    uploaded_chunks = [c for c in chunks if c.get("uploaded") and c.get("bvid")]
+    if uploaded_chunks:
+        # 只補「還沒補過」的分稿：拆稿遇風控重投時，後續成功的分稿才不会被漏掉
+        fresh, entry = _unpublished_bvids(session_dir, uploaded_chunks)
         if fresh and entry and entry.get("doc_token"):
             try:
-                from src.feishu_uploader import FeishuDocManager
-                mgr = FeishuDocManager(
-                    feishu_app_id, feishu_app_secret,
-                    folder_token=feishu_folder_token,
-                    wiki_space_id=feishu_wiki_space_id,
-                    wiki_root_node=bili_timeline_node,
-                    wiki_domain=bili_timeline_domain,
-                )
+                mgr = _feishu_doc_manager()
                 lines = [f"已发布到 B 站（{record_name}）："]
                 for c in fresh:
                     tag = (f"第 {c['index']}/{c['total']} 份"
                            if c.get("total", 1) > 1 else "全集")
-                    lines.append(f"· {tag} {c['bvid']}（{c['parts']}P）{c['title']}")
+                    lines.append(f"· {tag} {c['bvid']}（{len(c['ts_paths'])}P）"
+                                 f"{c.get('title', '')}")
+                # 先寫成功才記帳：append 失敗要留著下次重試，否則永久漏補
                 if mgr.append_text_block(entry["doc_token"], chr(10).join(lines)):
+                    _mark_published(session_dir, [c["bvid"] for c in fresh])
                     logger.info(f"已把 BV 号补进时间轴文档 ({session_dir})")
             except Exception as e:
                 logger.warning(f"回填时间轴文档失败（不影响投稿）: {e}")
@@ -3941,7 +3938,10 @@ while True:
     extra_enable_proxy_platform_list = extra_enable_proxy.replace('，', ',').split(',') if extra_enable_proxy else None
     live_status_push = read_config_value(config, '推送配置', '直播状态推送渠道', "")
     dingtalk_api_url = read_config_value(config, '推送配置', '钉钉推送接口链接', "")
-    dingtalk_routes = notify_route.load(config)
+    # 分群鍵寫在 local_secrets.ini，而 config 只讀了 config.ini，
+    # 必須合併讀取，否則四個路由都為空、全部靜默回退到通用群。
+    dingtalk_routes = notify_route.load(notify_route.merge_config_files(
+        config_file, os.path.join(script_path, "config", "local_secrets.ini")))
     xizhi_api_url = read_config_value(config, '推送配置', '微信推送接口链接', "")
     bark_msg_api = read_config_value(config, '推送配置', 'bark推送接口链接', "")
     bark_msg_level = read_config_value(config, '推送配置', 'bark推送中断级别', "active")
