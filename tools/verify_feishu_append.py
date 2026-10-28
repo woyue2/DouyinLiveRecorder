@@ -8,6 +8,7 @@
 
 會建一篇臨時文檔 → 追加一行 → 讀回確認 → 刪除，不會留下垃圾。
 """
+import os
 import sys
 
 sys.path.insert(0, ".")
