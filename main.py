@@ -576,6 +576,11 @@ bili_min_interval_seconds = 360 * 60
 bili_cooldown_minutes = 360
 bili_cooldown_until = 0.0
 bili_last_submit_time = 0.0
+# B 站對新號的限制是「滾動 24 小時最多 5 篇」，不是單純的間隔。
+# 只看間隔會剛好卡在邊界（288×5 = 24h），一點抖動就變成 6 篇而被 21566 擋。
+bili_submit_history: list[float] = []
+BILI_DAILY_LIMIT = 5
+BILI_DAILY_WINDOW = 24 * 3600
 bili_submit_lock = threading.Lock()
 # B站看点时间轴：投稿成功后生成飞书文档归档（不再发 B 站评论）
 # 飞书知识库中「直播时间轴」页面的 node_token（从 config.ini 读取）
@@ -615,6 +620,7 @@ def _save_bili_queue() -> None:
             "queue": bili_pending_queue,
             "last_submit_time": bili_last_submit_time,
             "cooldown_until": bili_cooldown_until,
+            "submit_history": bili_submit_history[-20:],
         }
         with open(bili_queue_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -632,6 +638,10 @@ def _load_bili_queue() -> None:
             data = json.load(f)
         bili_last_submit_time = data.get("last_submit_time", 0.0)
         bili_cooldown_until = data.get("cooldown_until", 0.0)
+        history = data.get("submit_history") or []
+        with bili_submit_lock:
+            bili_submit_history.clear()
+            bili_submit_history.extend(float(x) for x in history if x)
         loaded = data.get("queue", [])
         with bili_queue_lock:
             bili_pending_queue.clear()
@@ -812,14 +822,25 @@ def bili_slot_status() -> tuple[bool, str, int]:
         elapsed = now - bili_last_submit_time
         if elapsed < bili_min_interval_seconds:
             return False, "最小投稿间隔", int(bili_min_interval_seconds - elapsed)
+
+    # 滾動 24 小時最多 BILI_DAILY_LIMIT 篇：滿了就等最早那篇滑出窗口
+    with bili_submit_lock:
+        recent = [t for t in bili_submit_history if now - t < BILI_DAILY_WINDOW]
+    if len(recent) >= BILI_DAILY_LIMIT:
+        wait = int(min(recent) + BILI_DAILY_WINDOW - now)
+        return False, f"今日配额已满({len(recent)}/{BILI_DAILY_LIMIT}篇)", max(1, wait)
     return True, "", 0
 
 
 def mark_bili_submitted() -> None:
-    """记录一次投稿发起时间，用于计算下一次的最小间隔。"""
+    """记录一次投稿发起时间，用于计算最小间隔与滚动 24 小时配额。"""
     global bili_last_submit_time
+    now = time.time()
     with bili_submit_lock:
-        bili_last_submit_time = time.time()
+        bili_last_submit_time = now
+        bili_submit_history.append(now)
+        cutoff = now - 2 * BILI_DAILY_WINDOW
+        bili_submit_history[:] = [t for t in bili_submit_history if t >= cutoff]
     _save_bili_queue()
 
 
