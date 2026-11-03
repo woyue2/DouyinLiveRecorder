@@ -478,13 +478,22 @@ def adjust_max_request() -> None:
 def _ensure_bracket_keyword(text: str) -> str:
     """釘釘群機器人多把「【」設為自定義關鍵詞，缺了就整條被拒。
 
-    專案裡的訊息有的用 [B站投稿成功] 有的用 【直播时间轴】，這裡在發送邊界
-    統一開頭那組方括號，避免逐條模板各改一次、日後新增模板又漏。
+    在發送邊界統一補，避免逐條模板各改一次、日後新增模板又漏：
+      1. 已含「【」→ 不動
+      2. 開頭是 [xxx] → 換成 【xxx】
+      3. 開頭有「xxx：」→ 前綴包成 【xxx】
+      4. 都沒有 → 前面補一個通用標記
     """
+    if "【" in text:
+        return text
     if text.startswith("[") and "]" in text:
         end = text.index("]")
         return "【" + text[1:end] + "】" + text[end + 1:]
-    return text
+    head = text.split(chr(10), 1)[0]
+    if "：" in head and head.index("：") <= 20:
+        idx = head.index("：")
+        return "【" + head[:idx] + "】" + text[idx + 1:]
+    return "【通知】" + text
 
 
 def _dingtalk_webhook(category: str) -> str:
