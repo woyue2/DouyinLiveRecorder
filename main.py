@@ -1953,11 +1953,22 @@ def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "")
 
 
 _TRANSCRIBE_AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus")
+# 只保存视频的场次（MP4/MKV/FLV）没有独立音轨文件，直接用视频档送转写：
+# transcribe_one.sh 交给 sherpa-onnx 前是 `ffmpeg -i <输入>` 流式解码，
+# 任何容器都能播，所以视频档可原样传入，不必先抽一遍 mp3。
+# TS 不在此列——TS 场次会逐段转码成 MP4 并删掉 TS，两个都送会重复转写。
+_TRANSCRIBE_VIDEO_EXTS = (".mp4", ".mkv", ".flv")
 
 
-def is_transcribable_audio(file_path: str) -> bool:
-    """判断文件是否为可转写音频（mp3/wav/m4a 等纯音频格式）。"""
-    return Path(file_path).suffix.lower() in _TRANSCRIBE_AUDIO_EXTS
+def is_transcribable_audio(file_path: str, allow_video: bool = False) -> bool:
+    """判断文件是否为可转写音频（mp3/wav/m4a 等纯音频格式）。
+
+    allow_video=True 时也接受 MP4/MKV/FLV，供只保存视频的场次使用。
+    """
+    suffix = Path(file_path).suffix.lower()
+    if allow_video and suffix in _TRANSCRIBE_VIDEO_EXTS:
+        return True
+    return suffix in _TRANSCRIBE_AUDIO_EXTS
 
 
 def save_type_produces_audio(save_type: str) -> bool:
@@ -1965,11 +1976,26 @@ def save_type_produces_audio(save_type: str) -> bool:
     return any(record_format.audio_only for record_format in RecordFormat.parse_multiple(save_type))
 
 
-def submit_transcribe(published_files: list, record_name: str, record_url: str = "") -> None:
+def transcribe_media_kind(save_type: str) -> str:
+    """该保存格式该用哪类文件触发转写：audio / video / ''（不转写）。
+
+    TS|MP3 这类双输出必须走 audio：转码出来的 MP4 和 MP3 是同一段内容，
+    两个都送会重复转写、重复占用 LLM 额度。
+    """
+    formats = RecordFormat.parse_multiple(save_type)
+    if any(record_format.audio_only for record_format in formats):
+        return "audio"
+    if formats and all(record_format.name in ("MP4", "MKV", "FLV") for record_format in formats):
+        return "video"
+    return ""
+
+
+def submit_transcribe(published_files: list, record_name: str, record_url: str = "",
+                      allow_video: bool = False) -> None:
     """将已发布的音频文件逐个提交转写。submit 前同步创建 .transcribing 占位，
     防止 upload_baidu.sh 在转写排队时抢先上传删除音频。"""
     for published in published_files:
-        if not is_transcribable_audio(published):
+        if not is_transcribable_audio(published, allow_video):
             continue
         try:
             if os.path.exists(published) and os.path.getsize(published) < 500 * 1024:
@@ -2159,8 +2185,10 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
     )
     ffmpeg_output_thread.start()
     should_convert_to_mp4 = converts_to_mp4 and save_type in {"TS", "FLV"}
-    # 该 URL 登记了"转MD"且保存格式含纯音频输出(MP3/M4A/WAV 等)→ 每个分段完成后即触发转写
-    should_transcribe = record_url in transcribe_urls and save_type_produces_audio(save_type)
+    # 该 URL 登记了"转MD"时的触发依据：双输出取 mp3，只存视频的场次取 mp4
+    transcribe_kind = transcribe_media_kind(save_type) if record_url in transcribe_urls else ""
+    should_transcribe = bool(transcribe_kind)
+    transcribe_allow_video = transcribe_kind == "video"
 
     subs_file_path = save_file_path.rsplit('.', maxsplit=1)[0]
     subs_thread_name = f'subs_{Path(subs_file_path).name}'
@@ -2191,7 +2219,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                 if should_live_transcode(record_name):
                     submit_live_transcode(completed_segments)
                 if should_transcribe:
-                    submit_transcribe(completed_segments, record_name, record_url)
+                    submit_transcribe(completed_segments, record_name, record_url,
+                                      allow_video=transcribe_allow_video)
             if record_url in url_comments or exit_recording or (stop_event and stop_event.is_set()):
                 color_obj.print_colored(f"[{record_name}]录制时已被注释,本条线程将会退出", color_obj.YELLOW)
                 clear_record_info(record_name, record_url)
@@ -2283,7 +2312,8 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                         raise
         # 转写触发：录制结束时最后一段(.part)发布后统一提交转写
         if should_transcribe:
-            submit_transcribe(published_files, record_name, record_url)
+            submit_transcribe(published_files, record_name, record_url,
+                              allow_video=transcribe_allow_video)
 # 原自带是否执行脚本命令
         if script_command:
             logger.debug("开始执行脚本命令!")
