@@ -84,6 +84,7 @@ from msg_push import (
 )
 import brief
 import notify_route
+from src import highlights
 from ffmpeg_install import (
     check_ffmpeg, ffmpeg_path, current_env_path
 )
@@ -1454,9 +1455,28 @@ def run_bili_session_job(job: dict) -> None:
         logger.info(f"整场多P投稿：视频文件已不存在，跳过 ({session_dir})")
         return
 
+    # 精彩片段筛选（按 [精彩片段] 的主播名单启用，默认关闭）。
+    # 筛选失败一律沿用全量路径，不能因为挑片段把整场投稿搞丢。
+    highlight_meta = None
+    highlight_originals: list[str] = []
+    highlight_cfg = highlights.load_config(config)
+    if highlight_cfg.allows(record_name):
+        picked = highlights.maybe_apply(
+            session_dir, valid_ts_paths, record_name, highlight_cfg,
+            api_key=bili_llm_api_key or None,
+            api_base=bili_llm_api_base or None,
+            model=bili_llm_model or "deepseek-chat",
+        )
+        if picked:
+            valid_ts_paths = picked["ts_paths"]
+            highlight_meta = picked["meta"]
+            highlight_originals = picked.get("originals") or []
+
     clean_name, streamer_type = _resolve_streamer_type(record_name)
-    # 收播生成時間軸時已算過 meta，優先重用，不再重打大模型
-    meta = ((_peek_timeline_doc(session_dir) or {}).get("meta")
+    # 收播生成时间轴时已算过 meta，优先重用，不再重打大模型；
+    # 精彩片段筛选给的是剪辑后的分P，必须优先于收播时那份（那次还没剪）
+    meta = (highlight_meta
+            or (_peek_timeline_doc(session_dir) or {}).get("meta")
             or extract_session_bili_metadata(
                 session_dir=session_dir,
                 record_name=record_name,
@@ -1538,6 +1558,12 @@ def run_bili_session_job(job: dict) -> None:
                 )
                 break
             _push_bili_notice(record_name, content)
+
+    # 精彩片段：整场都投成功才删原片。中途吃风控会重投剩下的分片，
+    # 那時还得从原片重新剪辑，先删就找不回来了。
+    if highlight_originals and all(c.get("uploaded") for c in chunks):
+        removed = highlights.delete_originals(highlight_originals)
+        logger.info(f"精彩片段：已删除 {removed} 个原片文件 ({record_name})")
 
     # 把 BV 號補回收播時建好的時間軸文檔，讓文檔自帶發布資訊
     uploaded_chunks = [c for c in chunks if c.get("uploaded") and c.get("bvid")]
