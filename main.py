@@ -1457,20 +1457,27 @@ def run_bili_session_job(job: dict) -> None:
 
     # 精彩片段筛选（按 [精彩片段] 的主播名单启用，默认关闭）。
     # 筛选失败一律沿用全量路径，不能因为挑片段把整场投稿搞丢。
+    # 这里必须整段包起来：任务已经被队列 pop 掉，任何异常冒出去都会让它永久消失。
     highlight_meta = None
     highlight_originals: list[str] = []
-    highlight_cfg = highlights.load_config(config)
-    if highlight_cfg.allows(record_name):
-        picked = highlights.maybe_apply(
-            session_dir, valid_ts_paths, record_name, highlight_cfg,
-            api_key=bili_llm_api_key or None,
-            api_base=bili_llm_api_base or None,
-            model=bili_llm_model or "deepseek-chat",
-        )
-        if picked:
-            valid_ts_paths = picked["ts_paths"]
-            highlight_meta = picked["meta"]
-            highlight_originals = picked.get("originals") or []
+    highlight_applied = bool(job.get("highlighted"))
+    if not highlight_applied:
+        try:
+            highlight_cfg = highlights.load_config(config)
+            if highlight_cfg.allows(record_name):
+                picked = highlights.maybe_apply(
+                    session_dir, valid_ts_paths, record_name, highlight_cfg,
+                    api_key=bili_llm_api_key or None,
+                    api_base=bili_llm_api_base or None,
+                    model=bili_llm_model or "deepseek-chat",
+                )
+                if picked:
+                    valid_ts_paths = picked["ts_paths"]
+                    highlight_meta = picked["meta"]
+                    highlight_originals = picked.get("originals") or []
+                    highlight_applied = True
+        except Exception as e:
+            logger.warning(f"精彩片段筛选异常，按全量上传继续: {type(e).__name__}: {e}")
 
     clean_name, streamer_type = _resolve_streamer_type(record_name)
     # 收播生成时间轴时已算过 meta，优先重用，不再重打大模型；
@@ -1549,6 +1556,9 @@ def run_bili_session_job(job: dict) -> None:
                         "ts_paths": remaining,
                         "record_name": record_name,
                         "record_url": record_url,
+                        # 已經剪過的片段不能再篩一次：那會用更少的段再挑一次，
+                        # 並把這次沒挑中的片段連同原片一起刪掉
+                        "highlighted": highlight_applied,
                     })
                 _save_bili_queue()
                 _push_bili_notice(
@@ -1704,8 +1714,16 @@ def _try_upload_live_batch() -> None:
         with live_sessions_lock:
             sessions = list(live_sessions.items())
         now = time.time()
+        # 启用精彩片段筛选的主播不进「录制中提前上传」：那條路徑整段直傳，
+        # 等於繞過篩選，收播後只剩殘段可篩，配額照樣被完整場次吃掉。
+        try:
+            highlight_cfg = highlights.load_config(config)
+        except Exception:
+            highlight_cfg = highlights.HighlightConfig()
         for session_dir, info in sessions:
             if live_batch_backoff.get(session_dir, 0) > now:
+                continue
+            if highlight_cfg.allows(info.get("record_name", "")):
                 continue
             batch = pick_live_batch(
                 session_dir,

@@ -349,6 +349,9 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
     for i, existing in enumerate(queue):
         if existing.get("session_dir") == session_dir:
             existing["ts_paths"] = job.get("ts_paths", existing.get("ts_paths", []))
+            # 篩選過與否要跟著最新一次入隊更新，否則風控重投時會再篩一遍
+            if "highlighted" in job:
+                existing["highlighted"] = job["highlighted"]
             existing.pop("wait_seconds", None)
             existing.pop("reason", None)
             return i + 1, True

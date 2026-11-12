@@ -139,3 +139,64 @@ def test_collect_parts_skips_too_short(tmp_path):
         '{"duration": 12.0, "segments": [{"start": 0, "end": 5, "text": "嗨"}]}',
         encoding="utf-8")
     assert hl.collect_parts([str(video)]) == []
+
+
+def test_normalize_merge_respects_max_seconds():
+    """兩個合法區間重疊合併後不能超過最長上限。"""
+    clips = hl.normalize_ranges(
+        [{"start": 0, "end": 200}, {"start": 150, "end": 350}],
+        duration=600, min_seconds=45, max_seconds=240, limit=5)
+    assert len(clips) == 1
+    assert clips[0]["end"] - clips[0]["start"] <= 240
+
+
+def test_pick_parts_accepts_string_indices(monkeypatch):
+    """模型把索引寫成 "1" 或 3.0 時也要能用，不能整批丟掉退回全量。"""
+    parts = [{"index": i, "stem": f"p{i}", "title": "t", "bullets": []} for i in range(5)]
+    cfg = hl.load_config(_cp({"启用": "是", "启用主播": "x"}))
+    monkeypatch.setattr(hl.llm_client, "chat",
+                        lambda *a, **k: '{"title":"T","desc":"D","keep":["1",2,3.0,99]}')
+    res = hl.pick_parts(parts, cfg, "key", None, "model")
+    assert res["keep"] == [1, 2, 3]
+
+
+def test_read_summary_keeps_numeric_prefix(tmp_path):
+    """去掉序號不能連正常數字一起吃掉。"""
+    video = tmp_path / "p.mp4"
+    video.write_bytes(b"x")
+    (tmp_path / "p.md").write_text(
+        "# 標題\n\n<!--SUMMARY_START-->\n> 1. 1.5 亿人同时在线，礼物刷到卡顿\n<!--SUMMARY_END-->\n",
+        encoding="utf-8")
+    _title, bullets = hl._read_summary(video)
+    assert bullets and bullets[0].startswith("1.5 亿")
+
+
+def test_delete_originals_keeps_backup_and_drops_marker(tmp_path):
+    """刪原片要清掉 .bili_uploading 佔位，但保留 mp3（百度雲備份來源）。"""
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    (tmp_path / "a.mp4.bili_uploading").write_text("", encoding="utf-8")
+    mp3 = tmp_path / "a.mp3"
+    mp3.write_bytes(b"x")
+
+    removed = hl.delete_originals([str(video)])
+    assert removed == 1
+    assert not video.exists()
+    assert not (tmp_path / "a.mp4.bili_uploading").exists()
+    assert mp3.exists(), "mp3 是百度雲歸檔來源，不能跟著刪"
+
+
+def test_merge_queue_job_carries_highlight_flag():
+    """風控重投時要把「已篩選」旗標帶回去，否則會對已剪片段再篩一次。"""
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("bili_uploader", SRC / "bili_uploader.py")
+    bu = _iu.module_from_spec(spec)
+    sys.modules["bili_uploader"] = bu
+    spec.loader.exec_module(bu)
+
+    queue = [{"session_dir": "/s", "ts_paths": ["a"], "highlighted": False}]
+    pos, deduped = bu.merge_queue_job(
+        queue, {"session_dir": "/s", "ts_paths": ["b"], "highlighted": True})
+    assert deduped is True and pos == 1
+    assert queue[0]["ts_paths"] == ["b"]
+    assert queue[0]["highlighted"] is True

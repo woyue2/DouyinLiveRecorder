@@ -147,7 +147,10 @@ def _read_summary(video_path: Path) -> tuple:
         if "SUMMARY_END" in line:
             break
         if in_block:
-            clean = line.lstrip("> ").strip().lstrip("0123456789.、) ").strip()
+            # 只去掉「1.」「2、」這種序號；用 lstrip(數字字元集) 會把
+            # 「1.5 亿人同时在线」削成「亿人同时在线」，摘要把數值吃光。
+            clean = re.sub(r"^\d+\s*[.、)）]\s*", "",
+                           line.lstrip("> ").strip()).strip()
             if clean and len(clean) > 4 and not clean.startswith("**精彩看點") \
                     and not clean.startswith("💡"):
                 bullets.append(clean)
@@ -223,8 +226,9 @@ def normalize_ranges(raw, duration: float, min_seconds: int, max_seconds: int,
     merged = []
     for clip in clips:
         if merged and clip["start"] < merged[-1]["end"]:
-            if clip["end"] > merged[-1]["end"]:
-                merged[-1]["end"] = clip["end"]
+            # 合併重疊也要守住最長上限，否則 0–200 + 150–350 會變成 350 秒
+            merged[-1]["end"] = max(merged[-1]["end"],
+                                    min(clip["end"], merged[-1]["start"] + max_seconds))
         else:
             merged.append(dict(clip))
     return merged[:limit]
@@ -296,7 +300,15 @@ def pick_parts(parts: list, cfg: HighlightConfig, api_key: str,
         logger.warning("精彩片段 Stage1 解析失敗，退回全量上傳")
         return None
     valid = {p["index"] for p in parts}
-    keep = [k for k in (data.get("keep") or []) if isinstance(k, int) and k in valid]
+    # 模型偶爾把索引寫成 "5" 或 5.0，容忍這兩種；否則整批被丟掉會靜默退回全量
+    keep = []
+    for k in (data.get("keep") or []):
+        try:
+            idx = int(k)
+        except (TypeError, ValueError):
+            continue
+        if idx in valid and idx not in keep:
+            keep.append(idx)
     if not keep:
         logger.warning("精彩片段 Stage1 沒有給出有效段號，退回全量上傳")
         return None
@@ -449,14 +461,22 @@ def build_meta(stage1: dict, clips: list, clip_titles: list, part_labels: list,
 
 
 def delete_originals(paths: list, log=logger) -> int:
-    """篩選成功且投完後刪掉原片（連同同名 mp3/md 旁檔），避免磁碟只增不減。"""
+    """篩選成功且整場投完後刪掉原影片，避免磁碟只增不減。
+
+    刻意保留同名 .mp3 與 .md：影片交給 B 站，而 mp3/md 是百度雲的歸檔來源
+    （upload_baidu.sh 每 10 分鐘備份一次），跟著刪就再也備不到。
+    同時清掉 hold_videos_for_bili 留下的 .bili_uploading 佔位，否則會變成
+    「有佔位、沒檔案」的孤兒，讓後續掃描一直碰到。
+    """
     removed = 0
     for raw in paths or []:
-        for candidate in (raw, str(Path(raw).with_suffix(".mp3"))):
+        for candidate in (raw, raw + ".bili_uploading"):
             try:
-                if os.path.exists(candidate):
-                    os.remove(candidate)
+                if not os.path.exists(candidate):
+                    continue
+                os.remove(candidate)
+                if not candidate.endswith(".bili_uploading"):
                     removed += 1
             except OSError as e:
-                log.warning(f"刪除原片失敗 {candidate}: {e}")
+                log.warning(f"刪除檔案失敗 {candidate}: {e}")
     return removed

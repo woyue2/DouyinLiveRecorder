@@ -38,5 +38,9 @@ if busy; then
 fi
 
 echo "$(date '+%F %T') 已安靜 ${QUIET_CHECKS} 分鐘，開始重啟"
+# 重啟的幾秒內先讓看門狗閉嘴，否則兩邊同時呼叫 restart_main.sh 可能起出兩個實例
+touch tools/watchdog.pause
 bash tools/restart_main.sh
-echo "$(date '+%F %T') 重啟結束，退出碼 $?"
+rc=$?
+rm -f tools/watchdog.pause
+echo "$(date '+%F %T') 重啟結束，退出碼 $rc"

@@ -10,6 +10,12 @@ cd /home/ubuntu/DouyinLiveRecorder-main || exit 1
 pattern='^python3 -u main\.py$'
 pgrep -f "$pattern" >/dev/null 2>&1 && exit 0
 
+# 人工暫停：要手動停 main.py 排查時先 touch tools/watchdog.pause，
+# 否則 10 分鐘內它會被拉起來，打斷診斷或蓋掉剛改的檔案。
+if [ -e tools/watchdog.pause ]; then
+    exit 0
+fi
+
 avail_kb=$(df --output=avail / | tail -1 | tr -d ' ')
 if [ -z "${avail_kb:-}" ] || [ "$avail_kb" -lt 1500000 ]; then
     echo "$(date '+%F %T') 磁碟不足（${avail_kb:-未知}KB），暫不啟動 main.py" >> watchdog.log
