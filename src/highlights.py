@@ -28,7 +28,12 @@ try:  # main.py 以 src.highlights 匯入
 except ImportError:  # 直接以檔案載入（測試）或獨立執行
     import llm_client
 
-logger = logging.getLogger("highlights")
+try:
+    # 主程式用 loguru；標準 logging 沒有掛 handler，訊息會直接消失
+    from loguru import logger
+except ImportError:  # 測試環境不一定裝了 loguru
+    import logging
+    logger = logging.getLogger("highlights")
 
 _HIGHLIGHT_DIR = "highlights"
 _MAX_PROMPT_CHARS = 12000       # 單次呼叫塞給模型的文字上限

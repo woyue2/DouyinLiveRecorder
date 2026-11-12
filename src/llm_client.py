@@ -6,12 +6,16 @@
 以及從回覆裡撈 JSON 兩個小工具，兩邊互不影響。
 """
 import json
-import logging
 import re
 import urllib.request
 from typing import Optional
 
-logger = logging.getLogger("llm_client")
+try:
+    # 主程式用 loguru；標準 logging 沒有掛 handler，訊息會直接消失
+    from loguru import logger
+except ImportError:  # 測試環境不一定裝了 loguru
+    import logging
+    logger = logging.getLogger("llm_client")
 
 
 def chat(system_prompt: str, user_content: str, api_key: str,
