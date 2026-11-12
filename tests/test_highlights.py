@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 SRC = ROOT / "src"
+MAIN_SRC = (ROOT / "main.py").read_text(encoding="utf-8")
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -198,3 +199,31 @@ def test_merge_queue_job_carries_highlight_flag():
     assert deduped is True and pos == 1
     assert queue[0]["ts_paths"] == ["b"]
     assert queue[0]["highlighted"] is True
+
+
+def test_requeue_carries_highlight_meta():
+    """重投要帶上剪輯版 meta，否則分P標題會錯用整場時間軸那份。"""
+    assert 'job.get("highlight_meta")' in MAIN_SRC, "重投任務應讀取上次的 highlight_meta"
+    assert '"highlight_meta": highlight_meta' in MAIN_SRC, "重新入隊時應帶上 highlight_meta"
+
+
+def test_merge_clears_stale_highlight_state_when_paths_change():
+    """斷流重連往同一 session_dir 補新分段時，舊的篩選狀態必須作廢。"""
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location("bili_uploader2", SRC / "bili_uploader.py")
+    bu = _iu.module_from_spec(spec)
+    sys.modules["bili_uploader2"] = bu
+    spec.loader.exec_module(bu)
+
+    queue = [{"session_dir": "/s", "ts_paths": ["a.mp4"], "highlighted": True,
+              "highlight_originals": ["a.mp4"], "highlight_meta": {"title": "x"}}]
+    bu.merge_queue_job(queue, {"session_dir": "/s", "ts_paths": ["a.mp4", "b.mp4"]})
+    assert queue[0]["ts_paths"] == ["a.mp4", "b.mp4"]
+    assert "highlighted" not in queue[0]
+    assert "highlight_meta" not in queue[0]
+
+    # 風控重投自己帶著狀態時，以帶進來的為準
+    queue2 = [{"session_dir": "/s2", "ts_paths": ["a.mp4"], "highlighted": True}]
+    bu.merge_queue_job(queue2, {"session_dir": "/s2", "ts_paths": ["b.mp4"],
+                                "highlighted": True})
+    assert queue2[0]["highlighted"] is True

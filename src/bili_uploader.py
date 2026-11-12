@@ -348,10 +348,19 @@ def merge_queue_job(queue: list, job: dict) -> tuple:
     session_dir = job.get("session_dir", "")
     for i, existing in enumerate(queue):
         if existing.get("session_dir") == session_dir:
-            existing["ts_paths"] = job.get("ts_paths", existing.get("ts_paths", []))
-            # 篩選狀態與原片清單要跟著最新一次入隊更新，
-            # 否則風控重投時會再篩一遍，或整場投完後刪不掉原片
-            for key in ("highlighted", "highlight_originals"):
+            new_paths = job.get("ts_paths")
+            if new_paths is not None and new_paths != existing.get("ts_paths"):
+                existing["ts_paths"] = new_paths
+                # 內容換了，上一輪的篩選結果就不再對應這批檔案（斷流重連會往同一個
+                # session_dir 補新分段）。除非這次入隊自己帶了狀態，否則一律清掉重篩，
+                # 不然新分段會頂著剪輯版的 meta 直接傳出去。
+                for key in ("highlighted", "highlight_originals", "highlight_meta"):
+                    if key not in job:
+                        existing.pop(key, None)
+            elif new_paths is not None:
+                existing["ts_paths"] = new_paths
+            # 風控重投會帶著這些鍵入隊，此時以帶進來的為準
+            for key in ("highlighted", "highlight_originals", "highlight_meta"):
                 if key in job:
                     existing[key] = job[key]
             existing.pop("wait_seconds", None)

@@ -1464,7 +1464,9 @@ def run_bili_session_job(job: dict) -> None:
         logger.warning(f"精彩片段设定读取失败，按停用处理: {type(e).__name__}: {e}")
         highlight_cfg = highlights.HighlightConfig()
 
-    highlight_meta = None
+    # 重投时复用上次为剪辑片段生成的 meta：收播那份时间轴 meta 是按整场原始分段
+    # 生成的，跟剩下的片段对不上，会把分P标题和简介错配到别的段
+    highlight_meta = job.get("highlight_meta") or None
     highlight_applied = bool(job.get("highlighted"))
     # 重投时沿用上次记下的原片清单，否则整场投完后永远删不掉
     highlight_originals: list[str] = list(job.get("highlight_originals") or [])
@@ -1486,19 +1488,25 @@ def run_bili_session_job(job: dict) -> None:
 
     clean_name, streamer_type = _resolve_streamer_type(record_name)
     # 收播生成时间轴时已算过 meta，优先重用，不再重打大模型；
-    # 精彩片段筛选给的是剪辑后的分P，必须优先于收播时那份（那次还没剪）
-    meta = (highlight_meta
-            or (_peek_timeline_doc(session_dir) or {}).get("meta")
-            or extract_session_bili_metadata(
-                session_dir=session_dir,
-                record_name=record_name,
-                streamer_type=streamer_type,
-                default_tags=bili_default_tags,
-                llm_api_key=bili_llm_api_key or None,
-                llm_api_base=bili_llm_api_base or None,
-                llm_model=bili_llm_model or "deepseek-chat",
-                ts_paths=valid_ts_paths
-            ))
+    # 精彩片段筛选给的是剪辑后的分P，必须优先于收播时那份（那次还没剪）。
+    # 但两份都得对得上实际要传的档案数：风控重投时 ts_paths 只是剩余子集，
+    # 直接套用会把分P标题错配到别的段，宁可按现存档案重新生成。
+    meta = None
+    for cached in (highlight_meta, (_peek_timeline_doc(session_dir) or {}).get("meta")):
+        if cached and len(cached.get("parts") or []) == len(valid_ts_paths):
+            meta = cached
+            break
+    if meta is None:
+        meta = extract_session_bili_metadata(
+            session_dir=session_dir,
+            record_name=record_name,
+            streamer_type=streamer_type,
+            default_tags=bili_default_tags,
+            llm_api_key=bili_llm_api_key or None,
+            llm_api_base=bili_llm_api_base or None,
+            llm_model=bili_llm_model or "deepseek-chat",
+            ts_paths=valid_ts_paths
+        )
     is_only_self = _is_only_self(record_name, record_url, clean_name)
     vis_label = " (仅自己可见)" if is_only_self else ""
 
@@ -1566,6 +1574,8 @@ def run_bili_session_job(job: dict) -> None:
                         "highlighted": highlight_applied,
                         # 原片清單也要帶著，否則整場投完後永遠刪不掉
                         "highlight_originals": highlight_originals,
+                        # 剪輯版的 meta 也要帶著，否則重投會錯用整場的 meta
+                        "highlight_meta": highlight_meta,
                     })
                 _save_bili_queue()
                 _push_bili_notice(
