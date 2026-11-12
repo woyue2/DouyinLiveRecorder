@@ -19,13 +19,15 @@ import logging
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 try:  # main.py 以 src.highlights 匯入
-    from . import llm_client
+    from . import bili_uploader, llm_client
 except ImportError:  # 直接以檔案載入（測試）或獨立執行
+    import bili_uploader
     import llm_client
 
 try:
@@ -149,24 +151,12 @@ def _read_summary(video_path: Path) -> tuple:
         if in_block:
             # 只去掉「1.」「2、」這種序號；用 lstrip(數字字元集) 會把
             # 「1.5 亿人同时在线」削成「亿人同时在线」，摘要把數值吃光。
-            clean = re.sub(r"^\d+\s*[.、)）]\s*", "",
+            clean = re.sub(r"^\d+[.、)）]\s+", "",
                            line.lstrip("> ").strip()).strip()
             if clean and len(clean) > 4 and not clean.startswith("**精彩看點") \
                     and not clean.startswith("💡"):
                 bullets.append(clean)
     return title, bullets[:3]
-
-
-def _probe_duration(video_path: Path) -> float:
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", str(video_path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        return float(out.stdout.strip() or 0)
-    except (subprocess.SubprocessError, ValueError, OSError):
-        return 0.0
 
 
 def collect_parts(video_paths: list) -> list:
@@ -178,7 +168,7 @@ def collect_parts(video_paths: list) -> list:
             continue
         title, bullets = _read_summary(path)
         segments = _read_segments(path)
-        duration = (segments or {}).get("duration") or _probe_duration(path)
+        duration = (segments or {}).get("duration") or bili_uploader.probe_duration_seconds(str(path))
         if duration < _MIN_PART_SECONDS:
             continue
         parts.append({
@@ -280,6 +270,15 @@ _STAGE2_SYSTEM = (
 )
 
 
+def _ask_json(system: str, user: str, fail_msg: str, **chat_kw) -> Optional[dict]:
+    """呼叫模型並解析 JSON；兩段式筛选共用同一套「失敗就回 None + 記一筆」的形狀。"""
+    data = llm_client.extract_json(llm_client.chat(system, user, **chat_kw) or "")
+    if not isinstance(data, dict):
+        logger.warning(fail_msg)
+        return None
+    return data
+
+
 def pick_parts(parts: list, cfg: HighlightConfig, api_key: str,
                api_base: Optional[str], model: str) -> Optional[dict]:
     """Stage 1：挑段並生成合集標題。失敗回 None（呼叫方全量上傳）。"""
@@ -292,12 +291,11 @@ def pick_parts(parts: list, cfg: HighlightConfig, api_key: str,
         lines.append(f"[{p['index']}] {head}" + (f"\n    - {bullets}" if bullets else ""))
     user = (f"共 {len(parts)} 段，最多保留 {cfg.max_parts} 段，"
             f"目標總時長約 {cfg.target_minutes} 分鐘。\n\n" + "\n".join(lines))
-    reply = llm_client.chat(_STAGE1_SYSTEM, user[: _MAX_PROMPT_CHARS],
-                            api_key=api_key, api_base=api_base, model=model,
-                            max_tokens=800, temperature=0.4)
-    data = llm_client.extract_json(reply or "", expect="object")
-    if not isinstance(data, dict):
-        logger.warning("精彩片段 Stage1 解析失敗，退回全量上傳")
+    data = _ask_json(_STAGE1_SYSTEM, user[: _MAX_PROMPT_CHARS],
+                     "精彩片段 Stage1 解析失敗，退回全量上傳",
+                     api_key=api_key, api_base=api_base, model=model,
+                     max_tokens=800, temperature=0.4)
+    if not data:
         return None
     valid = {p["index"] for p in parts}
     # 模型偶爾把索引寫成 "5" 或 5.0，容忍這兩種；否則整批被丟掉會靜默退回全量
@@ -329,15 +327,34 @@ def pick_ranges(part: dict, cfg: HighlightConfig, api_key: str,
               .replace("{max_s}", str(cfg.max_clip_seconds))
               .replace("{limit}", str(cfg.max_clips_per_part))
               .replace("{duration}", str(int(part["duration"]))))
-    reply = llm_client.chat(system, timeline, api_key=api_key, api_base=api_base,
-                            model=model, max_tokens=600, temperature=0.3)
-    data = llm_client.extract_json(reply or "", expect="object")
-    if not isinstance(data, dict):
-        logger.warning(f"精彩片段 Stage2 解析失敗，整段保留: {part['stem']}")
+    data = _ask_json(system, timeline,
+                     f"精彩片段 Stage2 解析失敗，整段保留: {part['stem']}",
+                     api_key=api_key, api_base=api_base, model=model,
+                     max_tokens=600, temperature=0.3)
+    if not data:
         return []
     return normalize_ranges(data.get("clips"), part["duration"],
                             cfg.min_clip_seconds, cfg.max_clip_seconds,
                             cfg.max_clips_per_part)
+
+
+def _pick_all_ranges(parts: list, cfg: HighlightConfig, api_key: str,
+                     api_base: Optional[str], model: str) -> dict:
+    """並行挑區間：每段一次 LLM 呼叫、彼此獨立，串行會把投稿閘門卡住十幾分鐘。"""
+    if cfg.mode != "clip" or not parts:
+        return {}
+    result = {}
+    with ThreadPoolExecutor(max_workers=min(3, len(parts)),
+                            thread_name_prefix="hl-ranges") as pool:
+        futures = {pool.submit(pick_ranges, p, cfg, api_key, api_base, model): p["index"]
+                   for p in parts}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                result[idx] = fut.result()
+            except Exception as e:  # 單段失敗只影響該段
+                logger.warning(f"精彩片段挑區間失敗，該段整段保留: {e}")
+    return result
 
 
 # ---------------------------- 剪切與組裝 ----------------------------
@@ -378,43 +395,46 @@ def maybe_apply(session_dir: str, video_paths: list, record_name: str,
     if not api_key:
         logger.info("精彩片段：未配置 LLM Key，跳過篩選")
         return None
+    if len(video_paths) < 2:
+        # 先看檔案數再看內容：單段場次不必白讀一堆 .md / .segments.json
+        logger.info("精彩片段：分段不足 2 段，不做篩選")
+        return None
 
     try:
         parts = collect_parts(video_paths)
         if len(parts) < 2:
-            logger.info("精彩片段：分段不足 2 段，不做篩選")
+            logger.info("精彩片段：可用分段不足 2 段，不做篩選")
             return None
 
-        stage1 = pick_parts(parts, cfg, api_key, api_base, cfg.model or model)
+        stage1 = pick_parts(parts, cfg, api_key, api_base, model)
         if not stage1:
             return None
 
         by_index = {p["index"]: p for p in parts}
         selected = [by_index[i] for i in stage1["keep"] if i in by_index]
+        # 沒入選的分段不會再被讀，先把時間軸釋放掉（53 段全留在記憶體不划算）
+        keep_idx = {p["index"] for p in selected}
+        for part in parts:
+            if part["index"] not in keep_idx:
+                part["segments"] = None
+
+        ranges_by_part = _pick_all_ranges(selected, cfg, api_key, api_base, model)
+
         out_dir = Path(session_dir) / _HIGHLIGHT_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        clips, clip_titles, part_labels = [], [], []
-        for order, part in enumerate(selected, start=1):
-            ranges = []
-            if cfg.mode == "clip" and part.get("segments"):
-                ranges = pick_ranges(part, cfg, api_key, api_base, cfg.model or model)
-
-            if ranges:
-                made = []
-                for n, clip in enumerate(ranges, start=1):
-                    out = out_dir / f"{part['stem']}_h{n:02d}.mp4"
-                    if cut_clip(part["path"], clip["start"], clip["end"], str(out)):
-                        made.append((str(out), clip.get("title") or f"片段{n}"))
-                if not made:
-                    made = [(part["path"], part.get("title") or "")]
-            else:
+        clips, clip_titles = [], []
+        for part in selected:
+            made = []
+            for n, clip in enumerate(ranges_by_part.get(part["index"], []), start=1):
+                out = out_dir / f"{part['stem']}_h{n:02d}.mp4"
+                if cut_clip(part["path"], clip["start"], clip["end"], str(out)):
+                    made.append((str(out), clip.get("title") or f"片段{n}"))
+            if not made:  # 沒挑出區間或全切失敗 → 整段保留
                 made = [(part["path"], part.get("title") or "")]
-
             for path, title in made:
                 clips.append(path)
                 clip_titles.append(title)
-                part_labels.append(order)
 
         if not clips:
             return None
@@ -424,23 +444,21 @@ def maybe_apply(session_dir: str, video_paths: list, record_name: str,
         )
         return {
             "ts_paths": clips,
-            "meta": build_meta(stage1, clips, clip_titles, part_labels, record_name),
+            "meta": build_meta(stage1, clip_titles, record_name),
             "originals": [p["path"] for p in parts],
-            "selected_parts": [p["path"] for p in selected],
         }
     except Exception as e:  # 篩選壞了不能拖垮投稿
         logger.warning(f"精彩片段篩選異常，退回全量上傳: {type(e).__name__}: {e}")
         return None
 
 
-def build_meta(stage1: dict, clips: list, clip_titles: list, part_labels: list,
-               record_name: str) -> dict:
+def build_meta(stage1: dict, clip_titles: list, record_name: str) -> dict:
     """組出與 extract_session_bili_metadata 相同的結構，後續拆稿/上傳不用改。"""
     clean_name = str(record_name).split(" ", maxsplit=1)[-1].strip()
     parts, descs = [], []
-    for i, (title, src) in enumerate(zip(clip_titles, part_labels), start=1):
+    for i, raw in enumerate(clip_titles, start=1):
         label = f"【P{i}】"
-        seed = title.strip()
+        seed = str(raw or "").strip()
         parts.append({
             "label": label,
             "lines": [seed] if seed else [],
@@ -460,7 +478,7 @@ def build_meta(stage1: dict, clips: list, clip_titles: list, part_labels: list,
     }
 
 
-def delete_originals(paths: list, log=logger) -> int:
+def delete_originals(paths: list) -> int:
     """篩選成功且整場投完後刪掉原影片，避免磁碟只增不減。
 
     刻意保留同名 .mp3 與 .md：影片交給 B 站，而 mp3/md 是百度雲的歸檔來源
@@ -478,5 +496,5 @@ def delete_originals(paths: list, log=logger) -> int:
                 if not candidate.endswith(".bili_uploading"):
                     removed += 1
             except OSError as e:
-                log.warning(f"刪除檔案失敗 {candidate}: {e}")
+                logger.warning(f"刪除檔案失敗 {candidate}: {e}")
     return removed

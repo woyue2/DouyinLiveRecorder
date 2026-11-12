@@ -7,6 +7,8 @@
 """
 import json
 import re
+import time
+import urllib.error
 import urllib.request
 from typing import Optional
 
@@ -74,25 +76,33 @@ def chat(system_prompt: str, user_content: str, api_key: str,
             if is_anthropic:
                 return data["content"][0]["text"]
             return data["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}"
+            # 401/403（Key 錯）、400（模型名錯）重試一百次也不會好；
+            # 429/408 與 5xx 才是暫時性的，值得再試
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                logger.warning(f"LLM 呼叫失敗（HTTP {e.code}，不重試）: {e.reason}")
+                break
+            logger.warning(f"LLM 呼叫失敗（第 {attempt + 1} 次）: {e}")
         except Exception as e:  # 網路、超時、格式都可能失敗
             last_error = str(e)
             logger.warning(f"LLM 呼叫失敗（第 {attempt + 1} 次）: {e}")
+        if attempt < retries:
+            time.sleep(2)
     logger.warning(f"LLM 呼叫最終失敗: {last_error}")
     return None
 
 
-def extract_json(text: str, expect: str = "object"):
-    """從可能帶 markdown 圍欄或前後雜訊的回覆裡撈出 JSON。
+def extract_json(text: str):
+    """從可能帶 markdown 圍欄或前後雜訊的回覆裡撈出 JSON 物件。
 
-    expect="object" 找 {...}，expect="array" 找 [...]；解析失敗返回 None。
-    模型偶爾會在字串裡塞未轉義換行，這裡用 strict=False 容錯。
+    模型偶爾會在字串裡塞未轉義換行，這裡用 strict=False 容錯；解析失敗回 None。
     """
     if not text:
         return None
     cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r'\s*```$', '', cleaned.strip())
-    pattern = r'\{[\s\S]*\}' if expect == "object" else r'\[[\s\S]*\]'
-    match = re.search(pattern, cleaned)
+    match = re.search(r'\{[\s\S]*\}', cleaned)
     candidate = match.group(0) if match else cleaned
     try:
         return json.loads(candidate, strict=False)

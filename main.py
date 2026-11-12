@@ -1458,24 +1458,29 @@ def run_bili_session_job(job: dict) -> None:
     # 精彩片段筛选（按 [精彩片段] 的主播名单启用，默认关闭）。
     # 筛选失败一律沿用全量路径，不能因为挑片段把整场投稿搞丢。
     # 这里必须整段包起来：任务已经被队列 pop 掉，任何异常冒出去都会让它永久消失。
+    try:
+        highlight_cfg = highlights.load_config(config)
+    except Exception as e:  # 配置读不出来就当作停用，不影响投稿
+        logger.warning(f"精彩片段设定读取失败，按停用处理: {type(e).__name__}: {e}")
+        highlight_cfg = highlights.HighlightConfig()
+
     highlight_meta = None
-    highlight_originals: list[str] = []
     highlight_applied = bool(job.get("highlighted"))
+    # 重投时沿用上次记下的原片清单，否则整场投完后永远删不掉
+    highlight_originals: list[str] = list(job.get("highlight_originals") or [])
     if not highlight_applied:
         try:
-            highlight_cfg = highlights.load_config(config)
-            if highlight_cfg.allows(record_name):
-                picked = highlights.maybe_apply(
-                    session_dir, valid_ts_paths, record_name, highlight_cfg,
-                    api_key=bili_llm_api_key or None,
-                    api_base=bili_llm_api_base or None,
-                    model=bili_llm_model or "deepseek-chat",
-                )
-                if picked:
-                    valid_ts_paths = picked["ts_paths"]
-                    highlight_meta = picked["meta"]
-                    highlight_originals = picked.get("originals") or []
-                    highlight_applied = True
+            picked = highlights.maybe_apply(
+                session_dir, valid_ts_paths, record_name, highlight_cfg,
+                api_key=bili_llm_api_key or None,
+                api_base=bili_llm_api_base or None,
+                model=bili_llm_model or "deepseek-chat",
+            )
+            if picked:
+                valid_ts_paths = picked["ts_paths"]
+                highlight_meta = picked["meta"]
+                highlight_originals = picked.get("originals") or []
+                highlight_applied = True
         except Exception as e:
             logger.warning(f"精彩片段筛选异常，按全量上传继续: {type(e).__name__}: {e}")
 
@@ -1559,6 +1564,8 @@ def run_bili_session_job(job: dict) -> None:
                         # 已經剪過的片段不能再篩一次：那會用更少的段再挑一次，
                         # 並把這次沒挑中的片段連同原片一起刪掉
                         "highlighted": highlight_applied,
+                        # 原片清單也要帶著，否則整場投完後永遠刪不掉
+                        "highlight_originals": highlight_originals,
                     })
                 _save_bili_queue()
                 _push_bili_notice(
@@ -1571,7 +1578,8 @@ def run_bili_session_job(job: dict) -> None:
 
     # 精彩片段：整场都投成功才删原片。中途吃风控会重投剩下的分片，
     # 那時还得从原片重新剪辑，先删就找不回来了。
-    if highlight_originals and all(c.get("uploaded") for c in chunks):
+    if (highlight_originals and highlight_cfg.delete_originals
+            and all(c.get("uploaded") for c in chunks)):
         removed = highlights.delete_originals(highlight_originals)
         logger.info(f"精彩片段：已删除 {removed} 个原片文件 ({record_name})")
 

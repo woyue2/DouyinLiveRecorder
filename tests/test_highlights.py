@@ -101,9 +101,7 @@ def test_normalize_drops_garbage_and_applies_limit():
 def test_build_meta_matches_upload_shape():
     meta = hl.build_meta(
         {"title": "露娜五杀合集", "desc": ""},
-        clips=["/a/1.mp4", "/a/2.mp4"],
         clip_titles=["极限反杀", "团战收割"],
-        part_labels=[1, 1],
         record_name="序号11 王者荣耀有痕",
     )
     assert meta["title"] == "露娜五杀合集"
