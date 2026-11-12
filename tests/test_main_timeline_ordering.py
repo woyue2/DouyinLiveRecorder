@@ -115,7 +115,7 @@ def test_final_segments_get_transcoded_when_queued():
     i_fn = MAIN_SRC.index("def process_session_multi_p_upload")
     body = MAIN_SRC[i_fn:MAIN_SRC.index("def transcribe_and_notify")]
     i_enqueue = body.index("enqueue_bili_job(job)")
-    i_transcode = body.index("submit_live_transcode(valid_ts_paths)")
+    i_transcode = body.index("submit_live_transcode(valid_ts_paths, record_name, record_url)")
     assert i_enqueue < i_transcode
 
 

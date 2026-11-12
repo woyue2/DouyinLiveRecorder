@@ -78,6 +78,7 @@ def test_should_transcribe_uses_media_kind():
     assert "should_transcribe = bool(transcribe_kind)" in MAIN_SRC[i:i + 300]
     assert "transcribe_allow_video = transcribe_kind ==" in MAIN_SRC[i:i + 400]
 
-    calls = MAIN_SRC.count("submit_transcribe(")
-    assert calls == 3, f"應為定義 1 處 + 呼叫 2 處，實際 {calls}"
+    # 定義 1 + 錄製中/收播 2 + 轉碼後用 mp4 轉寫 1
+    assert MAIN_SRC.count("submit_transcribe(") == 4
     assert MAIN_SRC.count("allow_video=transcribe_allow_video") == 2
+    assert MAIN_SRC.count(", allow_video=True)") == 1  # 轉碼後用 mp4 轉寫那處

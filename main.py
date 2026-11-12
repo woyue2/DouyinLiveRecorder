@@ -685,14 +685,15 @@ def hold_videos_for_bili(files: list) -> None:
                     logger.warning(f"创建B站占位失败 {marker}: {e}")
 
 
-def _transcode_segment_to_mp4(seg_path: str) -> bool:
+def _transcode_segment_to_mp4(seg_path: str) -> Optional[str]:
     """把一個已完成的 TS 分段轉成低碼率 MP4，成功後刪除原 TS。
 
-    失敗時保留原 TS（不影響後續投稿），只是沒省到空間。
+    回傳輸出路徑（成功）或 None（失敗；失敗時保留原 TS，不影響後續投稿）。
+    音軌是 -c:a copy 直接搬過去的，所以轉出來的 MP4 也適合當轉寫來源。
     """
     src = Path(seg_path)
     if src.suffix.lower() != ".ts" or not src.exists():
-        return False
+        return None
     dst = src.with_suffix(".mp4")
     tmp = str(dst) + ".part"
     cmd = [
@@ -717,7 +718,7 @@ def _transcode_segment_to_mp4(seg_path: str) -> bool:
                 os.remove(tmp)
             except OSError:
                 pass
-        return False
+        return None
 
     # 佔位從 TS 移到 MP4，讓百度雲繼續跳過它。
     # 先建新的再刪舊的：反過來的話，新建失敗時檔案會在刪掉 TS 前出現無保護的空窗。
@@ -751,18 +752,32 @@ def _transcode_segment_to_mp4(seg_path: str) -> bool:
                 os.remove(small_marker)
         except OSError as e:
             logger.warning(f"解除碎片占位失败 {small_marker}: {e}")
-    return True
+    return str(dst)
 
 
-def _transcode_worker(seg_path: str) -> None:
+def _should_transcribe_transcoded(seg_path: str, record_url: str) -> bool:
+    """TS-only 场次（没开 mp3）要靠转码后的 mp4 触发转写。
+
+    TS|MP3 场次有同名的 mp3，转写已经由 mp3 触发；再拿 mp4 转一遍就是重复转写。
+    """
+    if not record_url or record_url not in transcribe_urls:
+        return False
+    return not Path(seg_path).with_suffix(".mp3").exists()
+
+
+def _transcode_worker(seg_path: str, record_name: str = "", record_url: str = "") -> None:
+    out = None
     try:
-        _transcode_segment_to_mp4(seg_path)
+        out = _transcode_segment_to_mp4(seg_path)
     finally:
         with _transcoding_lock:
             _transcoding_inflight.discard(seg_path)
+    # TS-only 场次没有 mp3 音轨，用转码后的 mp4 触发转写（音轨是 copy 过去的，质量不变）
+    if out and _should_transcribe_transcoded(seg_path, record_url):
+        submit_transcribe([out], record_name, record_url, allow_video=True)
 
 
-def submit_live_transcode(files: list) -> None:
+def submit_live_transcode(files: list, record_name: str = "", record_url: str = "") -> None:
     """把剛完成的 TS 分段排進逐段轉碼佇列（單執行緒，避免與錄製爭 CPU）。"""
     if not live_transcode_enabled:
         return
@@ -776,7 +791,7 @@ def submit_live_transcode(files: list) -> None:
                 continue
             _transcoding_inflight.add(f)
         try:
-            transcode_executor.submit(_transcode_worker, f)
+            transcode_executor.submit(_transcode_worker, f, record_name, record_url)
         except RuntimeError:
             with _transcoding_lock:
                 _transcoding_inflight.discard(f)
@@ -1863,7 +1878,7 @@ def process_session_multi_p_upload(save_file_path: str, record_name: str, record
         # 转码；而队列里的任务要等几十分钟以上，转码后由
         # _resolve_session_video_paths 重新解析路径，不会失效。
         if should_live_transcode(record_name):
-            submit_live_transcode(valid_ts_paths)
+            submit_live_transcode(valid_ts_paths, record_name, record_url)
 
 
 def transcribe_and_notify(mp3_path: str, record_name: str, record_url: str = "") -> None:
@@ -2279,7 +2294,7 @@ def check_subprocess(record_name: str, record_url: str, ffmpeg_command: list, sa
                     hold_videos_for_bili(completed_segments)
                 # 逐段转码压缩：先把佔位建好，轉碼成功後換成 MP4 並刪掉 TS
                 if should_live_transcode(record_name):
-                    submit_live_transcode(completed_segments)
+                    submit_live_transcode(completed_segments, record_name, record_url)
                 if should_transcribe:
                     submit_transcribe(completed_segments, record_name, record_url,
                                       allow_video=transcribe_allow_video)
