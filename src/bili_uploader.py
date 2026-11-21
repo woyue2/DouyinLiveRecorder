@@ -751,6 +751,7 @@ def upload_video_biliup(
             is_rate_limited = any(k in output for k in ("21566", "过于频繁", "601"))
             if is_rate_limited:
                 logger.warning("B 站投稿触发风控限制 (code 21566/601)")
+                logger.warning(f"biliup 原始输出: {output.strip()[-400:]}")
                 return False, f"RATE_LIMITED_21566: {output.strip()[-300:]}"
             logger.error(f"B 站上传失败 (退出码 {result.returncode}): {output[:500]}")
             return False, output

@@ -1013,6 +1013,9 @@ def _is_only_self(record_name: str, record_url: str, clean_name: str) -> bool:
 def _handle_bili_failure(output: str, record_name: str, extra: str, vis_label: str) -> str | None:
     """处理投稿失败输出；若为风控限制返回 None，交由调用方设置冷却。"""
     if "RATE_LIMITED_21566" in output:
+        # 把 B 站原始回覆留下來：只有看得到它，才能分辨是「投稿過於頻繁」
+        # 還是「帳號受限」或別的原因，不然永遠只能猜
+        logger.warning(f"B站风控原始回覆: {output.strip()[-400:]}")
         return None
     lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
     err_lines = [l for l in lines if any(k in l.lower() for k in ("error", "fail", "exception", "code", "warn", "panicked"))]
