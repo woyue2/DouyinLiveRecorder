@@ -84,7 +84,7 @@ from msg_push import (
 )
 import brief
 import notify_route
-from src import highlights
+from src import content_filter, highlights
 from ffmpeg_install import (
     check_ffmpeg, ffmpeg_path, current_env_path
 )
@@ -1472,6 +1472,30 @@ def run_bili_session_job(job: dict) -> None:
     if not valid_ts_paths:
         logger.info(f"整场多P投稿：视频文件已不存在，跳过 ({session_dir})")
         return
+
+    # 内容闸门：带货直播整场不投，直接清掉（只对 [内容过滤] 名单内的主播）。
+    # 判定失败一律当作「不是带货」，宁可多传一场也不误丢。
+    try:
+        content_cfg = content_filter.load_config(config)
+        if content_cfg.allows(record_name):
+            selling, reason = content_filter.judge(
+                session_dir, valid_ts_paths, record_name, content_cfg,
+                api_key=bili_llm_api_key or None,
+                api_base=bili_llm_api_base or None,
+                model=bili_llm_model or "deepseek-chat",
+            )
+            if selling:
+                dropped = content_filter.discard_media(session_dir, valid_ts_paths, content_cfg)
+                logger.info(
+                    f"内容过滤：跳過帶貨場 {record_name}（{reason}），已刪 {dropped} 個檔案")
+                _push_bili_notice(
+                    record_name,
+                    f"[跳過帶貨直播] {record_name}\n判定: {reason}\n"
+                    f"已刪除本地影片與音檔，不上傳 B 站")
+                _drop_timeline_doc(session_dir)
+                return
+    except Exception as e:
+        logger.warning(f"内容过滤异常，照常上传: {type(e).__name__}: {e}")
 
     # 精彩片段筛选（按 [精彩片段] 的主播名单启用，默认关闭）。
     # 筛选失败一律沿用全量路径，不能因为挑片段把整场投稿搞丢。
