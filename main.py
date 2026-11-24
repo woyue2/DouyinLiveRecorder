@@ -849,11 +849,22 @@ def bili_slot_status() -> tuple[bool, str, int]:
 
 
 def mark_bili_submitted() -> None:
-    """记录一次投稿发起时间，用于计算最小间隔与滚动 24 小时配额。"""
+    """记录一次投稿「尝试」时间，只用于计算最小间隔。
+
+    刻意不计入滚动 24 小时配额：B 站那边失败的上传不算次数，我们记了反而会
+    自己把自己锁死（2026-11-24 就出现过只成功 1 篇却显示 6/5 被挡）。
+    """
     global bili_last_submit_time
     now = time.time()
     with bili_submit_lock:
         bili_last_submit_time = now
+    _save_bili_queue()
+
+
+def record_bili_success() -> None:
+    """记一次「真正投出去」的稿件，用于滚动 24 小时配额。"""
+    now = time.time()
+    with bili_submit_lock:
         bili_submit_history.append(now)
         cutoff = now - 2 * BILI_DAILY_WINDOW
         bili_submit_history[:] = [t for t in bili_submit_history if t >= cutoff]
@@ -1340,6 +1351,8 @@ def run_bili_single_job(job: dict) -> None:
         biliup_bin=biliup_bin,
         is_only_self=is_only_self
     )
+    if success:
+        record_bili_success()
 
     video_name = Path(video_path).name
     if success:
@@ -1375,7 +1388,7 @@ def _upload_one_chunk(chunk: dict, is_only_self: bool) -> tuple[bool, str]:
     upload_targets = link_paths or chunk["ts_paths"]
     mark_bili_submitted()
     try:
-        return upload_video_biliup(
+        success, output = upload_video_biliup(
             video_path=upload_targets,
             title=chunk["title"],
             desc=chunk["desc"],
@@ -1387,6 +1400,10 @@ def _upload_one_chunk(chunk: dict, is_only_self: bool) -> tuple[bool, str]:
             biliup_bin=biliup_bin,
             is_only_self=is_only_self
         )
+        if success:
+            # 只有真的投出去才占用 24 小时配额
+            record_bili_success()
+        return success, output
     finally:
         cleanup_part_links(link_dir)
 

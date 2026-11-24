@@ -88,8 +88,25 @@ def test_submit_history_is_persisted_and_restored():
     assert "bili_submit_history" in load
 
 
-def test_mark_bili_submitted_records_each_submission():
+def test_mark_bili_submitted_only_updates_interval():
+    """嘗試只更新間隔時間；配額改由 record_bili_success 記。"""
     i = MAIN_SRC.index("def mark_bili_submitted")
-    body = MAIN_SRC[i:MAIN_SRC.index("def enqueue_bili_job")]
-    assert "bili_submit_history.append(" in body
+    body = MAIN_SRC[i:MAIN_SRC.index("def record_bili_success")]
+    assert "bili_last_submit_time" in body
+    assert "bili_submit_history.append(" not in body
     assert "_save_bili_queue()" in body
+
+
+def test_failed_attempts_do_not_consume_quota():
+    """失敗的上傳不該計入 24 小時配額（B 站那邊也不算），只更新間隔時間。"""
+    sub = MAIN_SRC[MAIN_SRC.index("def mark_bili_submitted"):]
+    sub = sub[:sub.index("\ndef ")]
+    assert "bili_submit_history.append" not in sub, "嘗試不該寫入配額歷史"
+    assert "bili_last_submit_time" in sub, "仍要更新間隔時間"
+
+    ok = MAIN_SRC[MAIN_SRC.index("def record_bili_success"):]
+    ok = ok[:ok.index("\ndef ")]
+    assert "bili_submit_history.append" in ok
+
+    # 兩條上傳路徑都要在成功後才記配額
+    assert MAIN_SRC.count("record_bili_success()") == 3  # 定義 1 + 呼叫 2
