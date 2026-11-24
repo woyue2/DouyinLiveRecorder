@@ -1627,6 +1627,30 @@ def run_bili_session_job(job: dict) -> None:
                 )
                 break
             _push_bili_notice(record_name, content)
+            # 一般失敗（非風控）以前只發通知就繼續下一份，但任務早已被佇列 pop 掉，
+            # 剩下的分片就永遠留在磁碟、不會再被投——實測會累積成孤兒場次
+            # （2026-11-24：初戀小娜 11-22_01-40 失敗兩次後 1.4GB 卡在磁碟）。
+            # 改成跟風控一樣重新入隊，只是不冷卻，等下一個 288 分鐘窗口再試。
+            remaining = [
+                p for c in chunks[chunk["index"] - 1:]
+                for p in c["ts_paths"] if os.path.exists(p)
+            ]
+            if remaining:
+                enqueue_bili_job({
+                    "kind": "session",
+                    "session_dir": session_dir,
+                    "ts_paths": remaining,
+                    "record_name": record_name,
+                    "record_url": record_url,
+                    "highlighted": highlight_applied,
+                    "highlight_originals": highlight_originals,
+                    "highlight_meta": highlight_meta,
+                })
+                logger.info(
+                    f"投稿失败（非风控），剩余 {len(remaining)}P 已重新排队 ({record_name})")
+            else:
+                logger.info(f"投稿失败（非风控），无剩余分片，跳过 ({record_name})")
+            break
 
     # 精彩片段：整场都投成功才删原片。中途吃风控会重投剩下的分片，
     # 那時还得从原片重新剪辑，先删就找不回来了。
