@@ -733,7 +733,11 @@ def upload_video_biliup(
     if line:
         cmd.extend(["--line", line])
 
+    # 記錄完整命令與檔案大小：上次失敗時輸出只有一行「user:」，連參數都無從比對
     logger.info(f"开始执行 B 站上传: 标题={title}, 视频数={len(valid_paths)}")
+    logger.debug("biliup 命令: " + " ".join(repr(a) for a in cmd))
+    logger.debug("biliup 檔案: " + ", ".join(
+        f"{Path(p).name}({os.path.getsize(p) // 1024 // 1024}MB)" for p in valid_paths if os.path.exists(p)))
     try:
         result = subprocess.run(
             cmd,
@@ -748,10 +752,15 @@ def upload_video_biliup(
             logger.info(f"B 站上传成功: {title}")
             return True, output
         else:
-            is_rate_limited = any(k in output for k in ("21566", "过于频繁", "601"))
+            # 只認真的風控碼：裸的 "601" 太容易在 traceback、位元組數、檔名裡誤中，
+            # 之前就是因為它把不相關的失敗也標成 21566，查了半天查不到原因。
+            is_rate_limited = ("21566" in output or "过于频繁" in output
+                               or re.search(r"(?:^|\D)601(?:\D|$)", output) is not None)
             if is_rate_limited:
-                logger.warning("B 站投稿触发风控限制 (code 21566/601)")
-                logger.warning(f"biliup 原始输出: {output.strip()[-400:]}")
+                logger.warning(
+                    f"B 站投稿触发风控限制 (code 21566/601)，退出碼 {result.returncode}")
+                logger.warning(f"biliup 原始输出(前 2000 字): {output[:2000]}")
+                logger.warning(f"biliup 原始输出(末 800 字): {output[-800:]}")
                 return False, f"RATE_LIMITED_21566: {output.strip()[-300:]}"
             logger.error(f"B 站上传失败 (退出码 {result.returncode}): {output[:500]}")
             return False, output

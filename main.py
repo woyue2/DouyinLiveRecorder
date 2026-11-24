@@ -755,25 +755,29 @@ def _transcode_segment_to_mp4(seg_path: str) -> Optional[str]:
     return str(dst)
 
 
-def _should_transcribe_transcoded(seg_path: str, record_url: str) -> bool:
-    """TS-only 场次（没开 mp3）要靠转码后的 mp4 触发转写。
+def _needs_transcribe_after_transcode(seg_path: str, want: bool) -> bool:
+    """转码完成后是否还要拿 mp4 去转写。
 
-    TS|MP3 场次有同名的 mp3，转写已经由 mp3 触发；再拿 mp4 转一遍就是重复转写。
+    - want 由提交转码时（主线程、配置最新）算好传进来，避免 worker 去读
+      主迴圈每轮 clear() 的 transcribe_urls，撞上清空瞬间就会漏转。
+    - 同名 .md 已存在说明这场已经拿到过转写（TS|MP3 由 mp3 触发），
+      不再重复打一次 ASR；没有 md（TS-only 或上次转写失败）才补。
     """
-    if not record_url or record_url not in transcribe_urls:
+    if not want:
         return False
-    return not Path(seg_path).with_suffix(".mp3").exists()
+    return not Path(seg_path).with_suffix(".md").exists()
 
 
-def _transcode_worker(seg_path: str, record_name: str = "", record_url: str = "") -> None:
+def _transcode_worker(seg_path: str, record_name: str = "", record_url: str = "",
+                      want_transcribe: bool = False) -> None:
     out = None
     try:
         out = _transcode_segment_to_mp4(seg_path)
     finally:
         with _transcoding_lock:
             _transcoding_inflight.discard(seg_path)
-    # TS-only 场次没有 mp3 音轨，用转码后的 mp4 触发转写（音轨是 copy 过去的，质量不变）
-    if out and _should_transcribe_transcoded(seg_path, record_url):
+    # 音轨是 -c:a copy 过去的，用转码后的 mp4 转写与用原始音轨等价
+    if out and _needs_transcribe_after_transcode(seg_path, want_transcribe):
         submit_transcribe([out], record_name, record_url, allow_video=True)
 
 
@@ -781,6 +785,8 @@ def submit_live_transcode(files: list, record_name: str = "", record_url: str = 
     """把剛完成的 TS 分段排進逐段轉碼佇列（單執行緒，避免與錄製爭 CPU）。"""
     if not live_transcode_enabled:
         return
+    # 在這裡（主執行緒）就把「要不要補轉寫」決定好，worker 不再讀共享集合
+    want_transcribe = bool(record_url and record_url in transcribe_urls)
     for f in files:
         if not f.lower().endswith(".ts"):
             continue
@@ -791,7 +797,7 @@ def submit_live_transcode(files: list, record_name: str = "", record_url: str = 
                 continue
             _transcoding_inflight.add(f)
         try:
-            transcode_executor.submit(_transcode_worker, f, record_name, record_url)
+            transcode_executor.submit(_transcode_worker, f, record_name, record_url, want_transcribe)
         except RuntimeError:
             with _transcoding_lock:
                 _transcoding_inflight.discard(f)

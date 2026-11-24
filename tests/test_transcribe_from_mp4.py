@@ -14,40 +14,43 @@ ROOT = Path(__file__).parents[1]
 MAIN_SRC = (ROOT / "main.py").read_text(encoding="utf-8")
 
 
-def _load_gate(urls):
+def _load_gate():
     tree = ast.parse(MAIN_SRC)
     fn = next(n for n in tree.body
-              if isinstance(n, ast.FunctionDef) and n.name == "_should_transcribe_transcoded")
-    ns = {"Path": Path, "transcribe_urls": set(urls)}
+              if isinstance(n, ast.FunctionDef) and n.name == "_needs_transcribe_after_transcode")
+    ns = {"Path": Path}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "<gate>", "exec"), ns)
-    return ns["_should_transcribe_transcoded"]
+    return ns["_needs_transcribe_after_transcode"]
 
 
 def test_ts_only_session_transcribes_from_mp4(tmp_path):
+    """没有 md（TS-only 或上次转写失败）才补转写。"""
     seg = tmp_path / "a.ts"
     seg.write_bytes(b"x")
-    gate = _load_gate({"https://live.douyin.com/1"})
-    assert gate(str(seg), "https://live.douyin.com/1") is True
+    gate = _load_gate()
+    assert gate(str(seg), True) is True
 
 
-def test_dual_output_session_does_not_double_transcribe(tmp_path):
+def test_existing_md_means_already_transcribed(tmp_path):
+    """TS|MP3 由 mp3 转写过后已存在同名 md，不再拿 mp4 重复转。"""
     seg = tmp_path / "a.ts"
     seg.write_bytes(b"x")
-    (tmp_path / "a.mp3").write_bytes(b"x")  # TS|MP3 场次的音轨还在
-    gate = _load_gate({"https://live.douyin.com/1"})
-    assert gate(str(seg), "https://live.douyin.com/1") is False
+    (tmp_path / "a.md").write_text("# x", encoding="utf-8")
+    gate = _load_gate()
+    assert gate(str(seg), True) is False
 
 
 def test_streamer_without_transcribe_flag_is_skipped(tmp_path):
     seg = tmp_path / "a.ts"
     seg.write_bytes(b"x")
-    gate = _load_gate({"https://live.douyin.com/1"})
-    assert gate(str(seg), "https://live.douyin.com/2") is False
-    assert gate(str(seg), "") is False
+    gate = _load_gate()
+    assert gate(str(seg), False) is False
 
 
 def test_transcode_worker_is_given_record_info():
     """轉碼任務要拿到主播資訊，否則鉤子不知道該不該轉寫。"""
-    assert "transcode_executor.submit(_transcode_worker, f, record_name, record_url)" in MAIN_SRC
+    assert ("transcode_executor.submit(_transcode_worker, f, record_name, record_url, "
+            "want_transcribe)") in MAIN_SRC
+    assert "want_transcribe = bool(record_url and record_url in transcribe_urls)" in MAIN_SRC
     assert MAIN_SRC.count("submit_live_transcode(valid_ts_paths, record_name, record_url)") == 1
     assert MAIN_SRC.count("submit_live_transcode(completed_segments, record_name, record_url)") == 1

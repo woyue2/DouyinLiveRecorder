@@ -193,7 +193,8 @@ def discard_media(session_dir: str, video_paths: list,
     for raw in video_paths or []:
         targets.extend([raw, str(Path(raw).with_suffix(".mp3")),
                         raw + ".bili_uploading"])
-    targets.extend(glob.glob(os.path.join(session_dir, "*.part")))
+    # 刻意不掃 session_dir 下的 *.part：斷流重連會讓同一目錄同時有「舊場次待投、
+    # 新場次錄製中」，把 .part 刪掉等於把正在寫的那一段抹掉。
     for path in targets:
         try:
             if os.path.exists(path):
